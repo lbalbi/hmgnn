@@ -48,7 +48,7 @@ class BiGAT(torch.nn.module):
 
 
 class BiGAT_origin(torch.nn.module):
-    def __init__(self, g, relations, in_channels=128, hidden_channels=256, out_channels=1, num_heads=1):
+    def __init__(self, g_pos, g_neg, relations, in_channels=128, hidden_channels=256, out_channels=1, num_heads=1):
         super(BiGAT_origin, self).__init__()
 
         self.in_channels = in_channels
@@ -57,17 +57,14 @@ class BiGAT_origin(torch.nn.module):
         self.relations = relations
         self.num_heads = num_heads
 
-        self.hg = dglnn.HeteroGraphConv({rel: GATLayer(g, self.in_channels, self.hidden_channels, self.num_heads, 'mean')
+        self.hg = dglnn.HeteroGraphConv({rel: GATLayer(g_pos, self.in_channels, self.hidden_channels, self.num_heads, 'mean')
                                                    for rel in self.relations}, aggregate='mean')
-        self.hg2 = dglnn.HeteroGraphConv({rel: GATLayer(g, self.hidden_channels, self.hidden_channels//2, self.num_heads, 'mean')
+        self.hg2 = dglnn.HeteroGraphConv({rel: GATLayer(g_neg, self.hidden_channels, self.hidden_channels//2, self.num_heads, 'mean')
                                                    for rel in self.relations}, aggregate='mean')
         self.linear = torch.nn.Linear(self.hidden_channels, self.out_channels)
 
 
-    def forward(self, pos_graph, neg_graph):
-        pos_out = self.hg_pos(pos_graph, pos_graph.ndata['feat'])
-        neg_out = self.hg_neg(neg_graph, neg_graph.ndata['feat'])
-
-        out = torch.cat([pos_out, neg_out], dim=0)
+    def forward(self):
+        out = torch.cat([self.hg["positive"], self.hg["negative"]], dim=0)
         out = self.linear(out)
-        return out
+        return torch.sigmoid(out)

@@ -1,5 +1,6 @@
 import dgl.nn as dglnn
 import torch
+import GCNLayer
 
 class BiGCN:
 
@@ -24,9 +25,9 @@ class BiGCN:
         
     def layer_makeup(self):
         self.relations = [rel for rel in self.relations if not None]
-        self.hg_pos = dglnn.HeteroGraphConv({rel: dglnn.GraphConv(self.in_channels, self.hidden_channels,'mean') 
+        self.hg_pos = dglnn.HeteroGraphConv({rel: GCNLayer(self.in_channels, self.hidden_channels,'mean') 
                                                    for rel in self.relations}, aggregate='mean')
-        self.hg_neg = dglnn.HeteroGraphConv({rel: dglnn.GraphConv(self.hidden_channels, self.in_channels,'mean') 
+        self.hg_neg = dglnn.HeteroGraphConv({rel: GCNLayer(self.hidden_channels, self.in_channels,'mean') 
                                              for rel in self.relations}, aggregate='mean')
         self.linear = torch.nn.Linear(self.hidden_channels, self.out_channels)
 
@@ -35,12 +36,9 @@ class BiGCN:
         self.hg.reset_parameters()
         self.hg2.reset_parameters()
         self.linear.reset_parameters()
-        pass
+        
 
-    def forward(self, pos_graph, neg_graph):
-        pos_out = self.hg_pos(pos_graph, pos_graph.ndata['feat'])
-        neg_out = self.hg_neg(neg_graph, neg_graph.ndata['feat'])
-
-        out = torch.cat([pos_out, neg_out], dim=0)
+    def forward(self):
+        out = torch.cat([self.hg_pos, self.hg_neg], dim=0)
         out = self.linear(out)
-        return out
+        return torch.sigmoid(out)
