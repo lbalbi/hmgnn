@@ -4,7 +4,7 @@ import dgl
 from dgl import DGLHeteroGraph
 from typing import Optional, Iterator, Tuple, List
 
-class Loader:
+class Dglloader:
     """
     Splits a DGLHeteroGraph into train/validation/test subgraphs based on the source nodes
     of a given edge type (e.g. "PPI"). Allows iteration over mini-batch subgraphs by PPI-edge batches.

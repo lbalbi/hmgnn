@@ -1,12 +1,13 @@
 import torch
 
 class Train:
-    def __init__(self, model, optimizer, loss_fn, train_loader, val_loader, device):
+    def __init__(self, model, optimizer, loss_fn, train_loader, val_loader, log, device):
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.log = log
         self.device = device
 
     def train_epoch(self):
@@ -24,9 +25,10 @@ class Train:
     
 
 class Test:
-    def __init__(self, model, test_loader, device):
+    def __init__(self, model, test_loader, log, device):
         self.model = model
         self.test_loader = test_loader
+        self.log = log
         self.device = device
 
     def test_epoch(self):
