@@ -1,5 +1,8 @@
 import argparse, torch
 from models import gnn
+from trainer import Train, Test
+from utils import Logger
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run HMGNN pipeline for composite positive and negative ~" \
@@ -13,4 +16,9 @@ def main():
     args.model = eval(args.model)
     model = args.model().to(device)
     optim = torch.optim.Adam(model.parameters())
+
+    log = Logger(args.model.__name__)
+
+    loss = train(model, optim, args.epochs, train_load, val_load, device)
+    test_loss = test(model, test_load, device)
     
