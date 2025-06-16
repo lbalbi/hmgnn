@@ -8,7 +8,7 @@ from layers import GATLayer
 from typing import List, Tuple, Dict
 
 
-class HeteroGCN(nn.Module):
+class HeteroGAT(nn.Module):
     """
     Heterogeneous GCN model for link classification on a specific edge relation (e.g. PPI).
 

@@ -1,3 +1,4 @@
+import torch
 
 class ContrastiveLoss():
     """
@@ -14,7 +15,6 @@ class ContrastiveLoss():
               negative (torch.Tensor) - Negative sample embeddings.
         Returns: torch.Tensor - Contrastive loss score
         """
-        import torch
         pos_dist = torch.sum((positive - negative) ** 2, dim=1) # Euclidean distance between positives and negatives
         loss = torch.mean(pos_dist) + self.margin * torch.mean(torch.clamp(self.margin - pos_dist, min=0)) # mean of the distances
         # between pos + neg with margin value
