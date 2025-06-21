@@ -8,7 +8,7 @@ from layers import GCNLayer
 from typing import List, Tuple, Dict
 
 
-class HeteroGCN(nn.Module):
+class HGCN(nn.Module):
     """
     Heterogeneous GCN model for link classification on a specific edge relation (e.g. PPI).
 
@@ -27,7 +27,7 @@ class HeteroGCN(nn.Module):
         n_layers: int = 2,
         ppi_etype: Tuple[str, str, str] = None
     ):
-        super().__init__()
+        super(HGCN).__init__()
         self.ppi_etype = ppi_etype
 
         self.layers = nn.ModuleList()
