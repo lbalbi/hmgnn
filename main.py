@@ -16,9 +16,9 @@ def main():
     args.model = eval(args.model.upper())
     config = load_config()
     print(f"Using model: {args.model.__name__}")
-    model = args.model(config.get("models",args.model.__name__,"in_feats"),
-                       config.get("models",args.model.__name__,"hidden_dim"),
-                       config.get("models",args.model.__name__,"out_dim")).to(device)
+    model = args.model(config["models"][args.model.__name__].get("in_feats"),
+                       config["models"][args.model.__name__].get("hidden_dim"),
+                       config["models"][args.model.__name__].get("out_dim")).to(device)
     optim = torch.optim.Adam(model.parameters())
     log = Logger(args.model.__name__)
     print(f"Using optimizer: {optim.__class__.__name__}")

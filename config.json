@@ -3,27 +3,38 @@
   "epochs": 300,
   "batch_size": 32,
   "models": {
-    "hgcn": {
+    "HGCN": {
       "in_feats": 128,
       "hidden_dim": 256,
       "out_dim": 1
     },
-    "hgat": {
+    "HGAT": {
       "in_feats": 128,
       "hidden_dim": 256,
       "out_dim": 1,
       "num_heads": 1
     },
-    "gcn": {
+    "GCN": {
       "in_feats": 128,
       "hidden_dim": 256,
       "out_dim": 1
     },
-    "gat": {
+    "GAT": {
       "in_feats": 128,
       "hidden_dim": 256,
       "out_dim": 1,
       "num_heads": 1
-    }
+    },
+    "BIGAT": {
+      "in_feats": 128,
+      "hidden_dim": 256,
+      "out_dim": 1,
+      "num_heads": 1
+    }, 
+    "BIGCN": {
+      "in_feats": 128,
+      "hidden_dim": 256,
+      "out_dim": 1
+    }   
   }
 }
