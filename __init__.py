@@ -4,8 +4,9 @@ from losses import *
 from samplers import *
 from parser import *
 from data_loader import *
-from utils import *
-from main import main
+from .utils import *
+from .trainer import *
+from .main import main
 
 
 if __name__ == "__main__":

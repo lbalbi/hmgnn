@@ -1,2 +1,2 @@
-from contrastive import ContrastiveLoss
-from triplet_margin import TripletLoss
+from .contrastive import ContrastiveLoss
+from .triplet_margin import TripletLoss
