@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class GATLayer(nn.Module):
+class GCNLayer(nn.Module):
     def __init__(self, g, in_dim, out_dim):
-        super(GATLayer, self).__init__()
+        super(GCNLayer, self).__init__()
         self.g = g
         self.fc = nn.Linear(in_dim, out_dim, bias=False)
         self.attn_fc = nn.Linear(2 * out_dim, 1, bias=False)
@@ -36,9 +36,9 @@ class GATLayer(nn.Module):
         self.g.update_all(self.message_func, self.reduce_func)
         return self.g.ndata.pop("h")
 
-class GCNLayer(nn.Module):
+class GCNLayer_(nn.Module):
     def __init__(self, in_dim, out_dim):
-        super(GCNLayer, self).__init__()
+        super(GCNLayer_, self).__init__()
         self.linear = nn.Linear(in_dim, out_dim)
         self.reset_parameters()
     

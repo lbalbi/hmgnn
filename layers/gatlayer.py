@@ -36,9 +36,9 @@ class GATLayer(nn.Module):
         self.g.update_all(self.message_func, self.reduce_func)
         return self.g.ndata.pop("h")
 
-class GCNLayer(nn.Module):
+class GATLayer_(nn.Module):
     def __init__(self, in_dim, out_dim):
-        super(GCNLayer, self).__init__()
+        super(GATLayer, self).__init__()
         self.linear = nn.Linear(in_dim, out_dim)
         self.reset_parameters()
     
