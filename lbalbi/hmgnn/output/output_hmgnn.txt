@@ -1,0 +1,7 @@
+Job running on node: opel
+Traceback (most recent call last):
+  File "/mnt/storage/admindi/home/lbalbi/hmgnn/main.py", line 2, in <module>
+    from models import *
+  File "/mnt/storage/admindi/home/lbalbi/hmgnn/models/__init__.py", line 1, in <module>
+    from gcn import GCN
+ModuleNotFoundError: No module named 'gcn'
