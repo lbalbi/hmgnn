@@ -1,4 +1,4 @@
 from .gcn import GCN
 from .gat import GAT
-from .hgat import HeteroGAT
-from .hgcn import HeteroGCN
+from .hgat import HGAT
+from .hgcn import HGCN
