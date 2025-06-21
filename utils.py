@@ -95,3 +95,8 @@ class metrics:
     def roc_auc_score(preds, labels):
         from sklearn.metrics import roc_auc_score
         return roc_auc_score(labels.cpu().numpy(), preds.cpu().numpy())
+    
+import json
+def load_config(path="config.json"):
+    with open(path, "r") as f:
+        return json.load(f)

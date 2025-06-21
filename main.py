@@ -3,7 +3,7 @@ from models import *
 from trainer import Train, Test
 from utils import Logger
 from data_loader import DataLoader, Dglloader
-
+from utils import load_config
 def main():
     parser = argparse.ArgumentParser(description="Run HMGNN pipeline for composite positive and negative ~" \
     "representation learning over heterogeneous graphs with negation -based contradictions.")
@@ -12,10 +12,9 @@ def main():
     parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     args = parser.parse_args()
-    print(args)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
     args.model = eval(args.model.upper())
+    config = load_config()
     print(f"Using model: {args.model.__name__}")
     model = args.model().to(device)
     optim = torch.optim.Adam(model.parameters())

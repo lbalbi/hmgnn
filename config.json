@@ -1,0 +1,29 @@
+{
+  "approach": "hmgnn",
+  "epochs": 300,
+  "batch_size": 32,
+  "models": {
+    "hgcn": {
+      "in_feats": 128,
+      "hidden_dim": 256,
+      "out_dim": 1
+    },
+    "hgat": {
+      "in_feats": 128,
+      "hidden_dim": 256,
+      "out_dim": 1,
+      "num_heads": 1
+    },
+    "gcn": {
+      "in_feats": 128,
+      "hidden_dim": 256,
+      "out_dim": 1
+    },
+    "gat": {
+      "in_feats": 128,
+      "hidden_dim": 256,
+      "out_dim": 1,
+      "num_heads": 1
+    }
+  }
+}
