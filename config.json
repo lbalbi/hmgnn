@@ -4,37 +4,45 @@
   "batch_size": 32,
   "models": {
     "HGCN": {
-      "in_feats": 128,
+      "in_feats": {"PPI": 128,
+                   "GO": 128,
+                   "pos_statement": 128,
+                   "neg_statement": 128},
       "hidden_dim": 256,
       "out_dim": 1
     },
     "HGAT": {
-      "in_feats": 128,
+      "in_feats": {"PPI": 128,
+                   "GO": 128,
+                   "pos_statement": 128,
+                   "neg_statement": 128},
       "hidden_dim": 256,
       "out_dim": 1,
       "num_heads": 1
     },
     "GCN": {
-      "in_feats": 128,
+      "in_feats": {"link": 128},
       "hidden_dim": 256,
       "out_dim": 1
     },
     "GAT": {
-      "in_feats": 128,
+      "in_feats":  {"link": 128},
       "hidden_dim": 256,
       "out_dim": 1,
       "num_heads": 1
     },
     "BIGAT": {
-      "in_feats": 128,
+      "in_feats": {"pos_link": 128,
+                   "neg_link": 128},
       "hidden_dim": 256,
       "out_dim": 1,
       "num_heads": 1
     }, 
     "BIGCN": {
-      "in_feats": 128,
+      "in_feats": {
+                   "pos_link": 128,
+                   "neg_link": 128},
       "hidden_dim": 256,
-      "out_dim": 1
-    }   
+      "out_dim": 1}   
   }
 }
