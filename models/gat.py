@@ -2,7 +2,7 @@ import torch.nn as nn
 
 class GAT(nn.Module):
     def __init__(self, in_channels, out_channels, heads=1, dropout=0.0):
-        super(GAT).__init__()
+        super(GAT, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.heads = heads

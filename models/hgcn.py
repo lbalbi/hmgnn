@@ -27,9 +27,8 @@ class HGCN(nn.Module):
         n_layers: int = 2,
         ppi_etype: Tuple[str, str, str] = None
     ):
-        super().__init__()
+        super(HGCN, self).__init__()
         self.ppi_etype = ppi_etype
-
         self.layers = nn.ModuleList()
         self.layers.append(
             HeteroGraphConv({ntype: GCNLayer(in_feats[ntype], hidden_dim) for ntype in in_feats

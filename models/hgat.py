@@ -27,7 +27,7 @@ class HGAT(nn.Module):
         n_layers: int = 2,
         ppi_etype: Tuple[str, str, str] = None
     ):
-        super(HGAT).__init__()
+        super(HGAT, self).__init__()
         self.ppi_etype = ppi_etype
 
         self.layers = nn.ModuleList()
