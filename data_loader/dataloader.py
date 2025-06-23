@@ -9,7 +9,14 @@ class DataLoader:
     
     def __init__(self, file_path):
         self.file_path = file_path
-        self.data = self.load_data()
+        edge_files = self.path_files(file_path)
+        self.data = self.load_data(edge_files)
+
+    @staticmethod
+    def path_files(path):
+        import os
+        return [os.path.join(path, f) for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+
 
     def load_data(self, edge_files: List[str]) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         """
