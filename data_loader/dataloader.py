@@ -11,7 +11,7 @@ class DataLoader:
         self.file_path = file_path
         self.data = self.load_data()
 
-    def _load_edge_data(self, edge_files: List[str]) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    def load_data(self, edge_files: List[str]) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args: edge_files: list of CSV filenames to read.
         Returns: Dict where keys are edge_type strings and values are (src_tensor, tgt_tensor).
