@@ -1,21 +1,18 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-class ContrastiveLoss():
-    """
-    Euclidian distance-based contrastive loss function.
-    This loss function is used to train models to differentiate between similar and dissimilar pairs of samples.
-    """
 
-    def __init__(self, margin=1.0):
-        self.margin = margin
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin: float = 1.0):
+        super().__init__()
+        self.margin = margin # margin-based losses use hard cut-off value to separate positive and negative pairs
 
-    def __call__(self, positive, negative):
-        """
-        Args: positive (torch.Tensor) - Positive sample embeddings
-              negative (torch.Tensor) - Negative sample embeddings.
-        Returns: torch.Tensor - Contrastive loss score
-        """
-        pos_dist = torch.sum((positive - negative) ** 2, dim=1) # Euclidean distance between positives and negatives
-        loss = torch.mean(pos_dist) + self.margin * torch.mean(torch.clamp(self.margin - pos_dist, min=0)) # mean of the distances
-        # between pos + neg with margin value
+    def forward(self, z1, z2, labels):
+
+        distances = F.pairwise_distance(z1, z2, p=2)
+
+        positive_loss = labels * distances.pow(2)
+        negative_loss = (1 - labels) * F.relu(self.margin - distances).pow(2)
+        loss = 0.5 * (positive_loss + negative_loss).mean()
         return loss

@@ -43,6 +43,7 @@ class GCNLayer_(nn.Module):
     
     def reset_parameters(self):
         """Reinitialize learnable parameters."""
+        self.linear.reset_parameters()
         gain = nn.init.calculate_gain("relu")
         nn.init.xavier_normal_(self.linear.weight, gain=gain)
 
