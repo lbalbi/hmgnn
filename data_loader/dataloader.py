@@ -39,9 +39,11 @@ class DataLoader:
 
     def make_data_graph(self, data: Dict[str, Tuple[torch.Tensor, torch.Tensor]]) -> dgl.DGLGraph:
         """Create a DGLGraph from the data dictionary."""
-        g = dgl.heterograph()
-        for edge_type, (src, tgt) in data.items():
-            g.add_edges(src, tgt, etype=edge_type)
+        g = dgl.heterograph({
+            ("node",edge_type, "node"): (src.tolist(), tgt.tolist())
+            for edge_type, (src, tgt) in data.items()
+        })
+        
         for ntype in g.ntypes:
             num_nodes = g.num_nodes(ntype)
             g.nodes[ntype].data['feat'] = torch.randn(num_nodes, 128)

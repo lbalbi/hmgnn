@@ -53,7 +53,7 @@ class EarlyStopping:
         return self.counter
     
 
-class metrics:
+class Metrics:
     @staticmethod
     def accuracy(preds, labels):
         correct = (preds == labels).sum().item()
@@ -95,6 +95,18 @@ class metrics:
     def roc_auc_score(preds, labels):
         from sklearn.metrics import roc_auc_score
         return roc_auc_score(labels.cpu().numpy(), preds.cpu().numpy())
+    
+    def update(self, preds, labels):
+        self.accuracy_value = self.accuracy(preds, labels)
+        self.f1_value = self.f1_score(preds, labels)
+        self.precision_value = self.precision(preds, labels)
+        self.recall_value = self.recall(preds, labels)
+        self.roc_auc_value = self.roc_auc_score(preds, labels)
+        return self.accuracy_value, self.f1_value, self.precision_value, self.recall_value, self.roc_auc_value
+    
+    def get_names(self):
+        return ["accuracy, f1 score, precision, recall, roc auc"]
+
     
 import json
 def load_config(path="config.json"):
