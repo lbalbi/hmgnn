@@ -1,7 +1,7 @@
 
 import torch
 import dgl
-from dgl import DGLHeteroGraph
+from dgl import heterograph
 from typing import Optional, Iterator, Tuple, List
 
 class Dglloader:
@@ -20,7 +20,7 @@ class Dglloader:
     """
     def __init__(
         self,
-        graph: DGLHeteroGraph,
+        graph: heterograph,
         ppi_rel: str = "PPI",
         batch_size: int = 32,
         val_split: float = 0.1,

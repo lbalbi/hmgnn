@@ -24,8 +24,8 @@ def main():
     print(f"Using optimizer: {optim.__class__.__name__}")
 
     data_loader = DataLoader(args.path + "/")
-    print("here")
-    dgl_loader = Dglloader(data_loader, batch_size=args.batch_size if args.batch_size else config.get("batch_size"), device=device)
+    data = data_loader.make_data_graph(data_loader.get_data())
+    dgl_loader = Dglloader(data, batch_size=args.batch_size if args.batch_size else config.get("batch_size"), device=device)
     train_load, val_load, test_load = dgl_loader.get_split_graphs()
 
     Train(model, optim, args.epochs if args.epochs else config.get("epochs"), train_load, val_load, log, device)

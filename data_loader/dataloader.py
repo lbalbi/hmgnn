@@ -1,5 +1,5 @@
 import pandas as pd
-import torch
+import torch, dgl
 from typing import List, Dict, Tuple
 
 class DataLoader:
@@ -36,8 +36,23 @@ class DataLoader:
             data_dict[edge_type] = (src_nodes, tgt_nodes)
         return data_dict
     
+
+    def make_data_graph(self, data: Dict[str, Tuple[torch.Tensor, torch.Tensor]]) -> dgl.DGLGraph:
+        """Create a DGLGraph from the data dictionary."""
+        g = dgl.heterograph()
+        for edge_type, (src, tgt) in data.items():
+            g.add_edges(src, tgt, etype=edge_type)
+        for ntype in g.ntypes:
+            num_nodes = g.num_nodes(ntype)
+            g.nodes[ntype].data['feat'] = torch.randn(num_nodes, 128)
+        return g
+    
+    
     def get_data(self):
         return self.data
+    
+    def get_edge_types(self):
+        return list(self.data.keys())
 
     def __len__(self):
         return len(self.data)
