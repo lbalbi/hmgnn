@@ -25,6 +25,7 @@ class Dglloader:
         batch_size: int = 32,
         val_split: float = 0.1,
         test_split: float = 0.1,
+        device : Optional[torch.device] = "cpu",
         shuffle: bool = True,
         seed: Optional[int] = None,
     ):
