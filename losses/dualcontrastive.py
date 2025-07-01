@@ -9,15 +9,7 @@ class DualContrastiveLoss(torch.nn.Module):
         self.temperature = temperature
         
     def forward(
-        self, 
-        z_pos,  # positive representations of anchor nodes
-        z_pos_pos,  # positive neighbors for pos rep.
-        z_pos_neg,  # negative samples for pos rep.
-        z_neg,  # negative representations of anchor nodes
-        z_neg_pos,  # negative neighbors for neg rep.
-        z_neg_neg   # positive samples for neg rep.
-    ) -> torch.Tensor:
-
+        self, z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) -> torch.Tensor:
         B, D = z_pos.shape
         z_pos = F.normalize(z_pos, dim=1)
         z_pos_pos = F.normalize(z_pos_pos, dim=1)

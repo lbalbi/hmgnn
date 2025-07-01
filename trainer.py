@@ -1,9 +1,10 @@
 import torch
 from utils import Metrics
 from samplers import NegativeSampler
+from losses import DualContrastiveLoss
 
 class Train:
-    def __init__(self, model, optimizer, epochs, train_loader, val_loader, log, device):
+    def __init__(self, model, optimizer, epochs, train_loader, val_loader, log, device, contrastive_weight=0.1):
         self.model = model
         self.optimizer = optimizer
         self.train_loader = train_loader
@@ -12,6 +13,9 @@ class Train:
         self.log = log
         self.device = device
         self.epochs = epochs
+        self.loss_fn = torch.nn.BCEWithLogitsLoss()
+        self.contrastive = DualContrastiveLoss(temperature=0.5)
+        self.alpha = contrastive_weight
         self.metrics = Metrics()
         self.log.log("Setting, Epoch, " + "".join(name + ", " for name in self.metrics.get_names())[:-2])
 
@@ -20,7 +24,6 @@ class Train:
         self.model.train()
         total_loss = 0
         for batch in self.train_loader:
-            print(batch)
             batch = batch.to(self.device)
             self.optimizer.zero_grad()
             src, dst  = batch.edges()
@@ -29,11 +32,14 @@ class Train:
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
             labels = torch.cat([torch.ones(src.size(0), device=self.device),
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
-            out = self.model(batch, edge_index)
+            z, out = self.model(batch, edge_index)
+            (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_sampler.get_contrastive_samples(batch, z)
+            loss_contrast = self.contrastive_loss(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
             loss = self.loss_fn(out, labels)
-            loss.backward()
+            loss_ = self.alpha * loss_contrast + loss
+            loss_.backward()
             self.optimizer.step()
-            total_loss += loss.item()
+            total_loss += loss_.item()
         return total_loss / len(self.train_loader)
     
 
@@ -49,9 +55,12 @@ class Train:
                 edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
                 labels = torch.cat([torch.ones(src.size(0), device=self.device),
                     torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
-                out = self.model(batch, edge_index)
+                z, out = self.model(batch, edge_index)
+                (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_sampler.get_contrastive_samples(batch, z)
+                loss_contrast = self.contrastive_loss(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
                 loss = self.loss_fn(out, labels)
-                total_loss += loss.item()
+                loss_ = self.alpha * loss_contrast + loss
+                total_loss += loss_.item()
         return (total_loss / len(self.val_loader)), out
 
     def run(self):
@@ -68,12 +77,14 @@ class Train:
 
 
 class Test:
-    def __init__(self, model, loss, test_loader, log, device):
+    def __init__(self, model, test_loader, log, device):
         self.model = model
         self.test_loader = test_loader
         self.log = log
         self.device = device
-        self.loss_fn = loss
+        self.loss_fn = torch.nn.BCEWithLogitsLoss()
+        self.contrastive = DualContrastiveLoss(temperature=0.5)
+        self.neg_sampler = NegativeSampler()
         self.metrics = Metrics()
 
     def test_epoch(self):
@@ -87,12 +98,14 @@ class Test:
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
             labels = torch.cat([torch.ones(src.size(0), device=self.device),
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
-            
             with torch.no_grad():
-                out = self.model(batch, edge_index)
+                z, out = self.model(batch, edge_index)
+                (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_sampler.get_contrastive_samples(batch, z)
+                loss_contrast = self.contrastive_loss(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
                 loss = self.loss_fn(out, labels)
-                total_loss += loss.item()
-        self.metrics.update(loss, out)
+                loss_ = self.alpha * loss_contrast + loss
+                total_loss += loss_.item()
+        self.metrics.update(loss_, out)
         return (total_loss / len(self.test_loader)), out
     
     

@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
-class ContrastiveLoss(nn.Module):
+class MultiContrastiveLoss(nn.Module):
 
     def __init__(self, temperature: float = 0.5):
         super().__init__()
