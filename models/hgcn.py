@@ -42,26 +42,19 @@ class HGCN(nn.Module):
 
     def forward(self, graph: DGLHeteroGraph, pairs: List[Tuple[int, int]]) -> torch.Tensor:
 
-        h_dict = {ntype: graph.nodes[ntype].data['feat']
-            for ntype in graph.ntypes}
-        
+        h_dict = {ntype: graph.nodes[ntype].data['feat'] for ntype in graph.ntypes}
         for layer in self.layers:
             h_dict = layer(graph, h_dict)
             h_dict = {k: F.relu(v) for k, v in h_dict.items()}
 
-        if len(pairs) == 0:
-            return torch.empty(0, self.classify.out_features, device=next(self.parameters()).device)
-        src_ids = torch.tensor([u for u, _ in pairs], dtype=torch.long,
-                               device=next(self.parameters()).device)
-        dst_ids = torch.tensor([v for _, v in pairs], dtype=torch.long,
-                               device=next(self.parameters()).device)
+        if len(pairs) == 0: return torch.empty(0, self.classify.out_features, device=next(self.parameters()).device)
+        src_ids = torch.tensor([u for u, _ in pairs], dtype=torch.long, device=next(self.parameters()).device)
+        dst_ids = torch.tensor([v for _, v in pairs], dtype=torch.long, device=next(self.parameters()).device)
 
         mask = graph.has_edges_between(src_ids, dst_ids, etype=self.ppi_etype)
         valid_src = src_ids[mask]
         valid_dst = dst_ids[mask]
-        if valid_src.numel() == 0:
-            return torch.empty(0, self.classify.out_features, device=valid_src.device)
-
+        if valid_src.numel() == 0: return torch.empty(0, self.classify.out_features, device=valid_src.device)
         src_ntype, _, dst_ntype = self.ppi_etype
         hs = h_dict[src_ntype][valid_src]
         hd = h_dict[dst_ntype][valid_dst]

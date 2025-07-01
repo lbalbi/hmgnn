@@ -116,6 +116,12 @@ class Dglloader:
         """Return the full train/val/test heterographs."""
         return self.train_graph, self.val_graph, self.test_graph
 
+    def get_relation(self) -> str:
+        """
+        Return the relation name used for PPI edges.
+        """
+        return self.ppi_rel
+
     def __iter__(self) -> Iterator[dgl.DGLGraph]:
         """
         Iterate over mini-batch subgraphs for training.

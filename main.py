@@ -31,9 +31,9 @@ def main():
     train_load, val_load, test_load = dgl_loader.get_split_graphs()
     train_batches, val_batches, test_batches = dgl_loader.train_batches(), dgl_loader.validation_batches(), dgl_loader.test_batches()
     train = Train(model, optim, args.epochs if args.epochs else config.get("epochs"), train_loader = train_batches, 
-          val_loader = val_batches, log = log, device = device)
+          val_loader = val_batches, e_type=dgl_loader.get_relation(), log = log, device = device)
     train.run()
-    test = Test(model = model, test_loader = test_batches, log = log, device = device, loss = torch.nn.CrossEntropyLoss())
+    test = Test(model = model, test_loader = test_batches, e_type=dgl_loader.get_relation(), log = log, device = device, loss = torch.nn.CrossEntropyLoss())
     test.run()
 
 
