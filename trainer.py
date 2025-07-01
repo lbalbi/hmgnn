@@ -30,13 +30,13 @@ class Train:
             src, dst  = batch.edges(etype=self.e_type)
             edge_index = torch.stack([src, dst], dim=0)
             neg_edge_index  = self.neg_sampler.sample(batch)
-            edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
-            labels = torch.cat([torch.ones(src.size(0), device=self.device),
+            labels = torch.cat([torch.ones(edge_index.size(1), device=self.device),
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
+            edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
             z, out = self.model(batch, edge_index)
             (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_sampler.get_contrastive_samples(batch, z)
-            loss_contrast = self.contrastive_loss(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
-            loss = self.loss_fn(out, labels)
+            loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
+            loss = self.loss_fn(out.squeeze(-1), labels)
             loss_ = self.alpha * loss_contrast + loss
             loss_.backward()
             self.optimizer.step()
@@ -57,9 +57,10 @@ class Train:
                 labels = torch.cat([torch.ones(src.size(0), device=self.device),
                     torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
                 z, out = self.model(batch, edge_index)
+                print(out.shape, z.shape, labels.shape)
                 (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_sampler.get_contrastive_samples(batch, z)
-                loss_contrast = self.contrastive_loss(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
-                loss = self.loss_fn(out, labels)
+                loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
+                loss = self.loss_fn(out.squeeze(-1), labels)
                 loss_ = self.alpha * loss_contrast + loss
                 total_loss += loss_.item()
         return (total_loss / len(self.val_loader)), out
@@ -103,8 +104,9 @@ class Test:
             with torch.no_grad():
                 z, out = self.model(batch, edge_index)
                 (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_sampler.get_contrastive_samples(batch, z)
-                loss_contrast = self.contrastive_loss(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
-                loss = self.loss_fn(out, labels)
+                loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
+                print(out.shape, z.shape, labels.shape)
+                loss = self.loss_fn(out.squeeze(-1), labels)
                 loss_ = self.alpha * loss_contrast + loss
                 total_loss += loss_.item()
         self.metrics.update(loss_, out)

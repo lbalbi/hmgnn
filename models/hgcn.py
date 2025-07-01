@@ -25,39 +25,40 @@ class HGCN(nn.Module):
         hidden_dim: int,
         out_dim: int,
         n_layers: int = 2,
-        ppi_etype: Tuple[str, str, str] = None
+        ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"),
+        e_etypes: List[Tuple[str, str, str]] = None,
     ):
         super(HGCN, self).__init__()
         self.ppi_etype = ppi_etype
+        self.e_types = e_etypes
         self.layers = nn.ModuleList()
-        self.layers.append(
-            HeteroGraphConv({ntype: GCNLayer(in_feats[ntype], hidden_dim) for ntype in in_feats
-            }, aggregate='mean'))
-
-        for _ in range(n_layers - 1):
-            self.layers.append(
-                HeteroGraphConv({ ntype: GCNLayer(hidden_dim, hidden_dim) for ntype in in_feats
-                }, aggregate='mean'))
+        in_dim_maps = [in_feats] + [{etype: hidden_dim for etype in in_feats} for _ in range(n_layers - 1)]
+        self.layers = nn.ModuleList([HeteroGraphConv({rel: GCNLayer(in_dim_maps[layer_idx][rel], hidden_dim)
+                    for src, rel, dst in e_etypes}, aggregate="mean") for layer_idx in range(n_layers)])
+        # for _ in range(n_layers):
+        #     rel2conv = {etype: GCNLayer(in_dim = in_feats[etype],
+        #         out_dim = hidden_dim) for (src_type, etype, dst_type) in e_etypes}
+        #     self.layers.append(HeteroGraphConv(rel2conv, aggregate="mean"))
         self.classify = nn.Linear(2 * hidden_dim, out_dim)
 
-    def forward(self, graph: DGLHeteroGraph, pairs: List[Tuple[int, int]]) -> torch.Tensor:
 
-        h_dict = {ntype: graph.nodes[ntype].data['feat'] for ntype in graph.ntypes}
+
+    def forward(self, graph: DGLHeteroGraph, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        h_dict = {ntype: graph.nodes[ntype].data["feat"] for ntype in graph.ntypes}
+
         for layer in self.layers:
             h_dict = layer(graph, h_dict)
-            h_dict = {k: F.relu(v) for k, v in h_dict.items()}
+            h_dict = {nt: F.relu(h) for nt, h in h_dict.items()}
 
-        if len(pairs) == 0: return torch.empty(0, self.classify.out_features, device=next(self.parameters()).device)
-        src_ids = torch.tensor([u for u, _ in pairs], dtype=torch.long, device=next(self.parameters()).device)
-        dst_ids = torch.tensor([v for _, v in pairs], dtype=torch.long, device=next(self.parameters()).device)
-
-        mask = graph.has_edges_between(src_ids, dst_ids, etype=self.ppi_etype)
-        valid_src = src_ids[mask]
-        valid_dst = dst_ids[mask]
-        if valid_src.numel() == 0: return torch.empty(0, self.classify.out_features, device=valid_src.device)
-        src_ntype, _, dst_ntype = self.ppi_etype
-        hs = h_dict[src_ntype][valid_src]
-        hd = h_dict[dst_ntype][valid_dst]
+        src_ids, dst_ids = edge_index
+        # _, rel_type, _ = self.ppi_etype
+        # mask = graph.has_edges_between(src_ids, dst_ids, etype=rel_type)
+        # src_ids, dst_ids = src_ids[mask], dst_ids[mask]
+        src_nt, _, dst_nt = self.ppi_etype
+        hs = h_dict[src_nt][src_ids]
+        hd = h_dict[dst_nt][dst_ids]
         h_pair = torch.cat([hs, hd], dim=1)
-        out = self.classify(h_pair)
-        return torch.sigmoid(out)
+        logits = self.classify(h_pair)
+        z = h_dict[src_nt]
+        return z, logits

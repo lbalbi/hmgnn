@@ -10,15 +10,17 @@ def main():
 
     parser.add_argument('--model', type=str, choices= ["gcn","gat", "hgcn", "hgat", "bigcn", "bigat"], default="hgcn")
     parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+    parser.add_argument('--batch_size', type=int, default=256*6, help='Batch size for training')
     parser.add_argument('--path', type=str, default="data", help='Folder with data files, defaults to data/ directory')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     args.model = eval(args.model.upper())
     config = load_config()
-    model = args.model(config["models"][args.model.__name__].get("in_feats"),
-        config["models"][args.model.__name__].get("hidden_dim"), config["models"][args.model.__name__].get("out_dim")).to(device)
+    model = args.model(in_feats = config["models"][args.model.__name__].get("in_feats"),
+        hidden_dim = config["models"][args.model.__name__].get("hidden_dim"), 
+        out_dim = config["models"][args.model.__name__].get("out_dim"),
+        e_etypes = [tuple(i) for i in config["models"][args.model.__name__].get("edge_types")]).to(device)
     optim = torch.optim.Adam(model.parameters())
     log = Logger(args.model.__name__)
 
