@@ -1,5 +1,6 @@
 import torch
 from utils import Metrics
+from samplers import NegativeSampler
 
 class Train:
     def __init__(self, model, optimizer, epochs, train_loader, val_loader, log, device):
@@ -7,6 +8,7 @@ class Train:
         self.optimizer = optimizer
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.neg_sampler = NegativeSampler()
         self.log = log
         self.device = device
         self.epochs = epochs
@@ -18,10 +20,17 @@ class Train:
         self.model.train()
         total_loss = 0
         for batch in self.train_loader:
+            print(batch)
             batch = batch.to(self.device)
             self.optimizer.zero_grad()
-            out = self.model(batch)
-            loss = self.loss_fn(out, batch.y)
+            src, dst  = batch.edges()
+            edge_index = torch.stack([src, dst], dim=0)
+            neg_edge_index  = self.neg_sampler.sample(batch)
+            edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
+            labels = torch.cat([torch.ones(src.size(0), device=self.device),
+                torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
+            out = self.model(batch, edge_index)
+            loss = self.loss_fn(out, labels)
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
@@ -34,13 +43,19 @@ class Train:
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = batch.to(self.device)
-                out = self.model(batch)
-                loss = self.loss_fn(out, batch.y)
+                src, dst  = batch.edges()
+                edge_index = torch.stack([src, dst], dim=0)
+                neg_edge_index  = self.neg_sampler.sample(batch)
+                edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
+                labels = torch.cat([torch.ones(src.size(0), device=self.device),
+                    torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
+                out = self.model(batch, edge_index)
+                loss = self.loss_fn(out, labels)
                 total_loss += loss.item()
         return (total_loss / len(self.val_loader)), out
-    
 
     def run(self):
+
         for epoch in range(self.epochs):
             train_loss = self.train_epoch()
             if epoch % 5 == 0:
@@ -66,9 +81,16 @@ class Test:
         total_loss = 0
         for batch in self.test_loader:
             batch = batch.to(self.device)
+            src, dst  = batch.edges()
+            edge_index = torch.stack([src, dst], dim=0)
+            neg_edge_index  = self.neg_sampler.sample(batch)
+            edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
+            labels = torch.cat([torch.ones(src.size(0), device=self.device),
+                torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
+            
             with torch.no_grad():
-                out = self.model(batch)
-                loss = self.loss_fn(out, batch.y)
+                out = self.model(batch, edge_index)
+                loss = self.loss_fn(out, labels)
                 total_loss += loss.item()
         self.metrics.update(loss, out)
         return (total_loss / len(self.test_loader)), out

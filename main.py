@@ -29,11 +29,11 @@ def main():
     data = data_loader.make_data_graph(data_loader.get_data())
     dgl_loader = Dglloader(data, batch_size=args.batch_size if args.batch_size else config.get("batch_size"), device=device)
     train_load, val_load, test_load = dgl_loader.get_split_graphs()
-
-    train = Train(model, optim, args.epochs if args.epochs else config.get("epochs"), train_loader = train_load, 
-          val_loader = val_load, log = log, device = device)
+    train_batches, val_batches, test_batches = dgl_loader.train_batches(), dgl_loader.validation_batches(), dgl_loader.test_batches()
+    train = Train(model, optim, args.epochs if args.epochs else config.get("epochs"), train_loader = train_batches, 
+          val_loader = val_batches, log = log, device = device)
     train.run()
-    test = Test(model = model, test_loader = test_load, log = log, device = device, loss = torch.nn.CrossEntropyLoss())
+    test = Test(model = model, test_loader = test_batches, log = log, device = device, loss = torch.nn.CrossEntropyLoss())
     test.run()
 
 
