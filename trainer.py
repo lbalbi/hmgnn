@@ -1,21 +1,22 @@
 import torch
 from utils import Metrics
-from samplers import NegativeSampler
+from samplers import NegativeStatementSampler
 from losses import DualContrastiveLoss
 
 class Train:
-    def __init__(self, model, optimizer, epochs, train_loader, val_loader, log, device, contrastive_weight=0.1):
+    def __init__(self, model, optimizer, epochs, train_loader, val_loader, e_type, log, device, contrastive_weight=0.1):
         self.model = model
         self.optimizer = optimizer
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.neg_sampler = NegativeSampler()
-        self.log = log
-        self.device = device
-        self.epochs = epochs
+        self.e_type = e_type
+        self.neg_sampler = NegativeStatementSampler()
         self.loss_fn = torch.nn.BCEWithLogitsLoss()
         self.contrastive = DualContrastiveLoss(temperature=0.5)
         self.alpha = contrastive_weight
+        self.log = log
+        self.device = device
+        self.epochs = epochs
         self.metrics = Metrics()
         self.log.log("Setting, Epoch, " + "".join(name + ", " for name in self.metrics.get_names())[:-2])
 
@@ -26,7 +27,7 @@ class Train:
         for batch in self.train_loader:
             batch = batch.to(self.device)
             self.optimizer.zero_grad()
-            src, dst  = batch.edges()
+            src, dst  = batch.edges(etype=self.e_type)
             edge_index = torch.stack([src, dst], dim=0)
             neg_edge_index  = self.neg_sampler.sample(batch)
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
@@ -49,7 +50,7 @@ class Train:
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = batch.to(self.device)
-                src, dst  = batch.edges()
+                src, dst  = batch.edges(etype=self.e_type)
                 edge_index = torch.stack([src, dst], dim=0)
                 neg_edge_index  = self.neg_sampler.sample(batch)
                 edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
@@ -77,14 +78,15 @@ class Train:
 
 
 class Test:
-    def __init__(self, model, test_loader, log, device):
+    def __init__(self, model, test_loader, e_type, log, device):
         self.model = model
         self.test_loader = test_loader
+        self.e_type = e_type
         self.log = log
         self.device = device
         self.loss_fn = torch.nn.BCEWithLogitsLoss()
         self.contrastive = DualContrastiveLoss(temperature=0.5)
-        self.neg_sampler = NegativeSampler()
+        self.neg_sampler = NegativeStatementSampler()
         self.metrics = Metrics()
 
     def test_epoch(self):
@@ -92,7 +94,7 @@ class Test:
         total_loss = 0
         for batch in self.test_loader:
             batch = batch.to(self.device)
-            src, dst  = batch.edges()
+            src, dst  = batch.edges(etype=self.e_type)
             edge_index = torch.stack([src, dst], dim=0)
             neg_edge_index  = self.neg_sampler.sample(batch)
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
