@@ -3,7 +3,7 @@ class Logger:
     def __init__(self, name):
         self.name = name
         self.log_file = f"{name}.log"
-        self.file = open(self.log_file, 'w')
+        self.file = open(self.log_file, 'a')
         self.file.write(f"Results for {name}\n")
         self.file.write("=" * 50 + "\n")
 
@@ -52,8 +52,10 @@ class EarlyStopping:
     def get_counter(self):
         return self.counter
     
-
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, accuracy_score
+import torch
 class Metrics:
+
     @staticmethod
     def accuracy(preds, labels):
         correct = (preds == labels).sum().item()
@@ -61,7 +63,7 @@ class Metrics:
         return correct / total if total > 0 else 0
 
     @staticmethod
-    def f1_score(preds, labels):
+    def f1score(preds, labels):
         tp = ((preds == 1) & (labels == 1)).sum().item()
         fp = ((preds == 1) & (labels == 0)).sum().item()
         fn = ((preds == 0) & (labels == 1)).sum().item()
@@ -92,16 +94,16 @@ class Metrics:
         return {'TP': tp, 'TN': tn, 'FP': fp, 'FN': fn}
     
     @staticmethod
-    def roc_auc_score(preds, labels):
-        from sklearn.metrics import roc_auc_score
+    def rocauc_score(preds, labels):
         return roc_auc_score(labels.cpu().numpy(), preds.cpu().numpy())
     
     def update(self, preds, labels):
-        self.accuracy_value = self.accuracy(preds, labels)
-        self.f1_value = self.f1_score(preds, labels)
-        self.precision_value = self.precision(preds, labels)
-        self.recall_value = self.recall(preds, labels)
-        self.roc_auc_value = self.roc_auc_score(preds, labels)
+        preds = torch.round(preds)
+        self.accuracy_value = accuracy_score(labels, preds)
+        self.f1_value = f1_score(labels, preds, average='weighted', zero_division=0)
+        self.precision_value = precision_score(labels, preds, zero_division=0)
+        self.recall_value = recall_score(labels, preds, zero_division=0)
+        self.roc_auc_value = roc_auc_score(labels, preds, average='weighted')
         return self.accuracy_value, self.f1_value, self.precision_value, self.recall_value, self.roc_auc_value
     
     def get_names(self):

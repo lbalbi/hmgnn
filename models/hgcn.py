@@ -26,19 +26,18 @@ class HGCN(nn.Module):
         out_dim: int,
         n_layers: int = 2,
         ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"),
+        n_type: str = "node",
         e_etypes: List[Tuple[str, str, str]] = None,
     ):
         super(HGCN, self).__init__()
         self.ppi_etype = ppi_etype
         self.e_types = e_etypes
+        self.n_type = n_type
         self.layers = nn.ModuleList()
         in_dim_maps = [in_feats] + [{etype: hidden_dim for etype in in_feats} for _ in range(n_layers - 1)]
         self.layers = nn.ModuleList([HeteroGraphConv({rel: GCNLayer(in_dim_maps[layer_idx][rel], hidden_dim)
                     for src, rel, dst in e_etypes}, aggregate="mean") for layer_idx in range(n_layers)])
-        # for _ in range(n_layers):
-        #     rel2conv = {etype: GCNLayer(in_dim = in_feats[etype],
-        #         out_dim = hidden_dim) for (src_type, etype, dst_type) in e_etypes}
-        #     self.layers.append(HeteroGraphConv(rel2conv, aggregate="mean"))
+
         self.classify = nn.Linear(2 * hidden_dim, out_dim)
 
 
@@ -52,13 +51,10 @@ class HGCN(nn.Module):
             h_dict = {nt: F.relu(h) for nt, h in h_dict.items()}
 
         src_ids, dst_ids = edge_index
-        # _, rel_type, _ = self.ppi_etype
-        # mask = graph.has_edges_between(src_ids, dst_ids, etype=rel_type)
-        # src_ids, dst_ids = src_ids[mask], dst_ids[mask]
-        src_nt, _, dst_nt = self.ppi_etype
-        hs = h_dict[src_nt][src_ids]
-        hd = h_dict[dst_nt][dst_ids]
+        hs = h_dict[self.n_type][src_ids]
+        hd = h_dict[self.n_type][dst_ids]
         h_pair = torch.cat([hs, hd], dim=1)
         logits = self.classify(h_pair)
-        z = h_dict[src_nt]
-        return z, logits
+        z = h_dict[self.n_type]
+        
+        return z, torch.sigmoid(logits)

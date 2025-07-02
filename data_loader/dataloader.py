@@ -40,7 +40,7 @@ class DataLoader:
     def make_data_graph(self, data: Dict[str, Tuple[torch.Tensor, torch.Tensor]]) -> dgl.DGLGraph:
         """Create a DGLGraph from the data dictionary."""
         g = dgl.heterograph({
-            ("node",edge_type, "node"): (src.tolist(), tgt.tolist())
+            ("node", edge_type, "node"): (src.tolist(), tgt.tolist())
             for edge_type, (src, tgt) in data.items()
         })
         

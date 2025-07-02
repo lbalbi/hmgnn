@@ -2,6 +2,9 @@
   "approach": "hmgnn",
   "epochs": 300,
   "batch_size": 32,
+  "lr": 0.001,
+  "k_folds": 5,
+  "contrastive_weight": 0.1,
   "models": {
     "HGCN": {
       "in_feats": {"PPI": 128,
@@ -13,7 +16,8 @@
       "edge_types": [["node", "PPI", "node"],
                       ["node", "GO", "node"],
                       ["node", "pos_statement", "node"],
-                      ["node", "neg_statement", "node"]]
+                      ["node", "neg_statement", "node"]],
+      "ppi_etype": "PPI"
     },
     "HGAT": {
       "in_feats": {"PPI": 128,

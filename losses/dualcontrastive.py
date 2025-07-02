@@ -10,6 +10,7 @@ class DualContrastiveLoss(torch.nn.Module):
         
     def forward(
         self, z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) -> torch.Tensor:
+
         B, D = z_pos.shape
         z_pos = F.normalize(z_pos, dim=1)
         z_pos_pos = F.normalize(z_pos_pos, dim=1)
