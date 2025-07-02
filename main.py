@@ -10,8 +10,9 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, choices= ["gcn","gat", "hgcn", "hgat", "bigcn", "bigat"], default="hgcn")
-    parser.add_argument('--epochs', type=int, default=2, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=256*350, help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
+    parser.add_argument('--CV_epochs', type=int, default=200, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=256*512, help='Batch size for training')
     parser.add_argument('--path', type=str, default="data", help='Folder with data files, defaults to data/ directory')
     args = parser.parse_args()
 
@@ -24,9 +25,9 @@ def main():
     ppi_etype  = mcfg["ppi_etype"]
     src_all, dst_all = full_graph.edges(etype=ppi_etype)
     pairs = list(zip(src_all.tolist(), dst_all.tolist()))
-    n_splits = min(5, len(pairs))
+    n_splits = min(10, len(pairs))
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-    best_auc = -1.0
+    best_f1 = -1.0
     best_state = None
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(pairs), 1):
@@ -66,18 +67,18 @@ def main():
         ppi_etype  = ppi_etype).to(device)
         optim = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
         log   = Logger(f"{ModelCls.__name__}_fold{fold}")
-        trainer = Train(model, optim, args.epochs, train_loader, val_loader,
+        trainer = Train(model, optim, args.CV_epochs, train_loader, val_loader,
                         e_type=ppi_etype, log=log, device=device, full_cvgraph=train_graph,
                         contrastive_weight=cfg["contrastive_weight"])
         t_loss, (out, labels) = trainer.run()
         val_loss, (logits, labels) = trainer.validate_epoch()
-        print(logits, labels, flush=True)
-        _, _, _, _, auc = trainer.metrics.update(logits.detach().to("cpu"), labels.to("cpu"))
-        print(f"Fold {fold} AUC: {auc:.4f}", flush=True)
-        if auc > best_auc:
-            best_auc   = auc
+        acc, f1, prec, rec, rocauc = trainer.metrics.update(logits.detach().to("cpu"), labels.to("cpu"))
+        log.log("Valid, Final epoch,"+ str(acc) + ","+ str(f1) + ","+str(prec) + ","+str(rec) + ","+str(rocauc))
+        print(f"Fold {fold} AUC: {rocauc:.4f}", flush=True)
+        if f1 > best_f1:
+            best_f1   = f1
             best_state = model.state_dict()
-    print(f"\nBest fold AUC = {best_auc:.4f} – saving model\n", flush=True)
+    print(f"\nBest fold Weighted F1 = {best_f1:.4f} – saving model\n", flush=True)
 
     final_model = ModelCls(in_feats = mcfg["in_feats"], hidden_dim = mcfg["hidden_dim"], out_dim = mcfg["out_dim"],
         e_etypes = [tuple(e) for e in mcfg["edge_types"]], ppi_etype  = ppi_etype).to(device)

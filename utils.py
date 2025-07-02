@@ -6,51 +6,47 @@ class Logger:
         self.file = open(self.log_file, 'a')
         self.file.write(f"Results for {name}\n")
         self.file.write("=" * 50 + "\n")
+        self.file.close()
 
     def log(self, message):
         print(message)
+        self.file = open(self.log_file, 'a')
         self.file.write(message + "\n")
         self.file.flush()
+        self.file.close()
 
     def close(self):
         self.file.close()
 
-
+import torch, copy
 class EarlyStopping:
-    def __init__(self, patience=10, delta=0):
-        self.patience = patience
+    """
+    Args:
+        patience (int): how many epochs to wait after last time validation metric improved.
+        mode (str): 'min' to stop when metric stops decreasing, 'max' for increasing.
+        delta (float): minimum change in the monitored metric to qualify as an improvement.
+    """
+    def __init__(self, patience: int = 5, mode: str = 'min', delta: float = 0.0):
+        self.patience   = patience
+        self.mode = mode
         self.delta = delta
-        self.best_score = None
-        self.early_stop = False
-        self.counter = 0
+        self.best_score = float('inf') if mode == 'min' else -float('inf')
+        self.num_bad = 0
+        self.best_state = None
+        self._is_better = (lambda a, b: a < b - delta) if mode == 'min' else (lambda a, b: a > b + delta)
 
-    def __call__(self, score):
-        if self.best_score is None:
-            self.best_score = score
-        elif score < self.best_score + self.delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.counter = 0
-    
-    def reset(self):
-        self.best_score = None
-        self.early_stop = False
-        self.counter = 0
+    def step(self, metric: float, model: torch.nn.Module) -> bool:
+        if self._is_better(metric, self.best_score):
+            self.best_score = metric
+            self.best_state = copy.deepcopy(model.state_dict())
+            self.num_bad = 0
+        else: self.num_bad += 1
+        return self.num_bad > self.patience
 
-    def is_early_stop(self):
-        return self.early_stop
+    def best_state_dict(self):
+        return self.best_state
     
-    def get_patience(self):
-        return self.patience
-    
-    def get_best_score(self):
-        return self.best_score
-    
-    def get_counter(self):
-        return self.counter
+
     
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, accuracy_score
 import torch
