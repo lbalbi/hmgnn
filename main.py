@@ -9,7 +9,7 @@ from sklearn.model_selection import KFold
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, choices= ["gcn","gat", "hgcn", "hgat", "bigcn", "bigat"], default="hgcn")
+    parser.add_argument('--model', type=str, choices= ["gcn","gat", "hgcn", "hpgcn", "hgat", "bigcn", "bigat"], default="hgcn")
     parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
     parser.add_argument('--CV_epochs', type=int, default=200, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=256*512, help='Batch size for training')
@@ -84,53 +84,17 @@ def main():
         e_etypes = [tuple(e) for e in mcfg["edge_types"]], ppi_etype  = ppi_etype).to(device)
     final_model.load_state_dict(best_state)
     final_optim = torch.optim.Adam(final_model.parameters(), lr=cfg["lr"])
-    final_log = Logger("final_train")
-
     full_train_loader = Dglloader(full_graph, batch_size = args.batch_size, device = device).train_batches()
-    final_trainer = Train(final_model, final_optim, args.epochs, full_train_loader, [], full_cvgraph=train_graph,
-                          e_type=ppi_etype, log=final_log, device=device, contrastive_weight=cfg["contrastive_weight"])
+    final_trainer = Train(final_model, final_optim, args.epochs, full_train_loader, [], full_cvgraph=full_graph,
+                          e_type=ppi_etype, log=log, device=device, contrastive_weight=cfg["contrastive_weight"])
     loss, (out, labels) = final_trainer.run()
     print(f"Final training loss: {loss:.4f}", flush=True)
 
+    final_log = Logger("final_test")
     test_loader = Dglloader(full_graph, batch_size = args.batch_size, device = device).test_batches()
-    tester = Test(final_model, loss=torch.nn.BCEWithLogitsLoss(), test_loader=test_loader, log=Logger("final_test"),
+    tester = Test(final_model, loss=torch.nn.BCEWithLogitsLoss(), test_loader=test_loader, log=final_log,
                   full_graph=full_graph, device=device)
     tester.run()
-
-    # parser = argparse.ArgumentParser(description="Run HMGNN pipeline for composite positive and negative ~" \
-    # "representation learning over heterogeneous graphs with negation -based contradictions.")
-
-    # parser.add_argument('--model', type=str, choices= ["gcn","gat", "hgcn", "hgat", "bigcn", "bigat"], default="hgcn")
-    # parser.add_argument('--epochs', type=int, default=200, help='Number of training epochs')
-    # parser.add_argument('--batch_size', type=int, default=256*500, help='Batch size for training')
-    # parser.add_argument('--path', type=str, default="data", help='Folder with data files, defaults to data/ directory')
-    # args = parser.parse_args()
-
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # args.model = eval(args.model.upper())
-    # config = load_config()
-    # model = args.model(in_feats = config["models"][args.model.__name__].get("in_feats"),
-    #     hidden_dim = config["models"][args.model.__name__].get("hidden_dim"), 
-    #     out_dim = config["models"][args.model.__name__].get("out_dim"),
-    #     e_etypes = [tuple(i) for i in config["models"][args.model.__name__].get("edge_types")]).to(device)
-    # optim = torch.optim.Adam(model.parameters())
-    # log = Logger(args.model.__name__)
-
-    # print(f"Using model: {args.model.__name__}", flush=True)
-    # print(f"Using optimizer: {optim.__class__.__name__}", flush=True)
-
-    # data_loader = DataLoader(args.path + "/")
-    # data = data_loader.make_data_graph(data_loader.get_data())
-    # dgl_loader = Dglloader(data, batch_size=args.batch_size if args.batch_size else config.get("batch_size"), device=device)
-    # train_load, val_load, test_load = dgl_loader.get_split_graphs()
-    # train_batches, val_batches, test_batches = dgl_loader.train_batches(), dgl_loader.validation_batches(), dgl_loader.test_batches()
-    # train = Train(model, optim, args.epochs if args.epochs else config.get("epochs"), train_loader = train_batches, 
-    #       val_loader = val_batches, e_type=dgl_loader.get_relation(), log = log, device = device)
-    # train.run()
-    # test = Test(model = model, test_loader = test_batches, e_type=dgl_loader.get_relation(), log = log, device = device, loss = torch.nn.CrossEntropyLoss())
-    # test.run()
-
-
 
 if __name__ == "__main__":
     main()
