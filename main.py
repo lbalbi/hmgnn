@@ -9,7 +9,7 @@ from sklearn.model_selection import KFold
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, choices= ["gcn","gat", "hgcn", "hpgcn", "hgat", "bigcn", "bigat"], default="hgcn")
+    parser.add_argument('--model', type=str, choices= ["hgcn", "hpgcn", "hgat", "bigcn", "bigat"], default="hgcn")
     parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
     parser.add_argument('--CV_epochs', type=int, default=200, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=256*512, help='Batch size for training')
@@ -92,8 +92,7 @@ def main():
 
     final_log = Logger("final_test")
     test_loader = Dglloader(full_graph, batch_size = args.batch_size, device = device).test_batches()
-    tester = Test(final_model, loss=torch.nn.BCEWithLogitsLoss(), test_loader=test_loader, log=final_log,
-                  full_graph=full_graph, device=device)
+    tester = Test(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=full_graph, device=device)
     tester.run()
 
 if __name__ == "__main__":

@@ -115,14 +115,13 @@ class Test:
                 z, out = self.model(batch, edge_index)
             self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
 
-        return (total_loss / total_examples), out
+        return labels, out
     
     
     def run(self):
-        test_loss, out = self.test_epoch()
-        acc, f1, precision, recall, roc_auc = self.metrics.update(test_loss, out)
+        labels, out = self.test_epoch()
+        acc, f1, precision, recall, roc_auc = self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
         print('Test Results:', flush=True)
-        print(f'Loss: {test_loss:.4f}', flush=True)
         print(f'Accuracy: {acc:.4f}, F1 Score: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, Roc Auc: {roc_auc:.4f}', flush=True)
         self.log.log("Test, final" + str(acc) + "," + str(f1)+ "," + str(precision)+ "," + str(recall)+ ","+ str(roc_auc))
         
