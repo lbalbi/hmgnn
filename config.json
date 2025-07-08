@@ -28,6 +28,20 @@
       "out_dim": 1,
       "num_heads": 1
     },
+    "HPGCN": {
+      "in_feats": {"PPI": 128,
+                   "GO": 128,
+                   "pos_statement": 128,
+                   "neg_statement": 128},
+      "hidden_dim": 256,
+      "out_dim": 1,
+      "edge_types": [["node", "PPI", "node"],
+                      ["node", "GO", "node"],
+                      ["node", "pos_statement", "node"],
+                      ["node", "neg_statement", "node"]],
+      "ppi_etype": "PPI"
+    },
+
     "GCN": {
       "in_feats": {"link": 128},
       "hidden_dim": 256,

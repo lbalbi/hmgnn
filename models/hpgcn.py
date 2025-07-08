@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dgl import DGLHeteroGraph
-from dgl.nn.pytorch import HeteroGraphConv, GraphConv
+from layers import HeteroGraphConv
+from dgl.nn.pytorch import GraphConv
 from typing import List, Tuple, Dict
 
 
