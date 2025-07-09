@@ -22,7 +22,6 @@ class Dglloader:
         ppi_rel: str = "PPI",
         batch_size: int = 32,
         val_split: float = 0.1,
-        test_split: float = 0.18,
         device : Optional[torch.device] = "cpu",
         shuffle: bool = True,
         seed: Optional[int] = None,
@@ -32,7 +31,6 @@ class Dglloader:
         self.ppi_rel = ppi_rel
         self.batch_size = batch_size
         self.val_split = val_split
-        self.test_split = test_split
         self.shuffle = shuffle
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         if seed is not None: torch.manual_seed(seed)
@@ -48,7 +46,6 @@ class Dglloader:
         self._split_by_source_nodes()
         self.train_graph = self._create_split_graph(self.train_eids)
         self.val_graph = self._create_split_graph(self.val_eids)
-        self.test_graph = self._create_split_graph(self.test_eids)
 
 
     def _split_by_source_nodes(self): # Get all PPI edges' source nodes and corresponding edge IDs
@@ -59,21 +56,17 @@ class Dglloader:
 
         if self.shuffle:  unique_src = unique_src[torch.randperm(len(unique_src))]
 
-        n_test = int(len(unique_src) * self.test_split)
         n_val = int(len(unique_src) * self.val_split)
-        n_train = len(unique_src) - n_val - n_test
+        n_train = len(unique_src) - n_val
 
         train_src = unique_src[:n_train]
         val_src = unique_src[n_train:n_train + n_val]
-        test_src = unique_src[n_train + n_val:]
 
         mask_train = torch.isin(src, train_src)
         mask_val = torch.isin(src, val_src)
-        mask_test = torch.isin(src, test_src)
 
         self.train_eids = edge_ids[mask_train]
         self.val_eids = edge_ids[mask_val]
-        self.test_eids = edge_ids[mask_test]
 
 
     def _create_split_graph(self, ppi_eids: torch.Tensor) -> dgl.DGLGraph:
@@ -107,13 +100,9 @@ class Dglloader:
         """Iterate mini-batch validation subgraphs."""
         return self._batch_graphs(self.val_eids)
 
-    def test_batches(self) -> Iterator[dgl.DGLGraph]:
-        """Iterate mini-batch test subgraphs."""
-        return self._batch_graphs(self.test_eids)
-
     def get_split_graphs(self) -> Tuple[dgl.DGLGraph, dgl.DGLGraph, dgl.DGLGraph]:
         """Return the full train/val/test heterographs."""
-        return self.train_graph, self.val_graph, self.test_graph
+        return self.train_graph, self.val_graph
 
     def get_relation(self) -> str:
         """
@@ -138,6 +127,5 @@ class Dglloader:
             f"Loader(ppi_rel='{self.ppi_rel}', "
             f"train_ppi={len(self.train_eids)}, "
             f"val_ppi={len(self.val_eids)}, "
-            f"test_ppi={len(self.test_eids)}, "
             f"batch_size={self.batch_size})"
         )
