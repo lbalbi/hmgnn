@@ -53,18 +53,7 @@ class NegativeStatementSampler:
                         if g_pp in mapping:
                             sup.add(mapping[g_pp])
                 self.two_hop[i] = list(sup)
-
-    # def sample(self) -> torch.Tensor:
-    #     neg_src, neg_dst = [], []
-    #     for u in range(self.N):
-    #         cands = self.direct[u]
-    #         if len(cands) < self.k: cands = list({*cands, *self.two_hop.get(u, [])})
-    #         if len(cands) >= self.k:  picks = random.sample(cands, self.k)
-    #         else: picks = random.choices([v for v in range(self.N) if v != u], k=self.k)
-    #         neg_src.extend([u] * self.k)
-    #         neg_dst.extend(picks)
-    #     return torch.tensor([neg_src, neg_dst], dtype=torch.long, device=self.device)
-
+                
 
     def sample(self) -> torch.Tensor:
         N, k = self.N, self.k

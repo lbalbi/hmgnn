@@ -1,17 +1,24 @@
 import torch
 from utils import Metrics, EarlyStopping
-from samplers import NegativeStatementSampler
+from samplers import NegativeStatementSampler, PartialStatementSampler
 from losses import DualContrastiveLoss
 
 class Train:
-    def __init__(self, model, optimizer, epochs, train_loader, val_loader, full_cvgraph, e_type, log, device, contrastive_weight=0.1):
+    def __init__(self, model, optimizer, epochs, train_loader, val_loader, full_cvgraph, e_type, log, device, 
+                 pstatement_sampler=False, nstatement_sampler=False, contrastive_weight=0.1, state_list=None):
         self.model = model
         self.optimizer = optimizer
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
         self.e_type = e_type
-        self.neg_sampler = NegativeStatementSampler()
-        self.neg_sampler.prepare_global(full_cvgraph)
+        if pstatement_sampler: self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
+        elif nstatement_sampler: 
+            self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
+            self.neg_sampler.prepare_global(full_cvgraph, pos_etype="neg_statement", neg_etype="pos_statement")
+        else: 
+            self.neg_sampler = NegativeStatementSampler()
+            self.neg_sampler.prepare_global(full_cvgraph)
+        
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = DualContrastiveLoss(temperature=0.5)
         self.alpha = contrastive_weight
@@ -88,13 +95,16 @@ class Train:
 
 
 class Test:
-    def __init__(self, model, test_loader, e_type, full_graph, log, device):
+    def __init__(self, model, test_loader, e_type, full_graph, log, device, pstatement_sampler=False, 
+                 nstatement_sampler=False, state_list=None):
         self.model = model
         self.test_loader = list(test_loader)
         self.e_type = e_type
         self.log = log
         self.device = device
-        self.neg_sampler = NegativeStatementSampler()
+        if pstatement_sampler: self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
+        elif nstatement_sampler: self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
+        else: self.neg_sampler = NegativeStatementSampler()
         self.neg_sampler.prepare_global(full_graph)
         self.metrics = Metrics()
 

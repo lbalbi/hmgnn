@@ -22,7 +22,7 @@ class Dglloader:
         ppi_rel: str = "PPI",
         batch_size: int = 32,
         val_split: float = 0.1,
-        test_split: float = 0.15,
+        test_split: float = 0.18,
         device : Optional[torch.device] = "cpu",
         shuffle: bool = True,
         seed: Optional[int] = None,
