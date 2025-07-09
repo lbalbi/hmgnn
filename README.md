@@ -10,5 +10,4 @@ If you wish to run a different architecture for the CHGNN you must pass it as a 
 
 ```
 python main.py --model hgat
-
-´´´
+```
