@@ -104,9 +104,7 @@ def main():
 
     final_log = Logger("final_test")
     test_loader = Dglloader(full_graph, batch_size = args.batch_size, device = device).test_batches()
-    tester = Test(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=full_graph, 
-                  device=device, pstatement_sampler=args.use_pstatement_sampler,
-                  nstatement_sampler=args.use_nstatement_sampler, state_list=state_list)
+    tester = Test(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=full_graph, device=device)
     tester.run()
 
 if __name__ == "__main__":

@@ -105,22 +105,12 @@ class Train:
 
 
 class Test:
-    def __init__(self, model, test_loader, e_type, full_graph, log, device, pstatement_sampler=False, 
-                 nstatement_sampler=False, state_list=None):
+    def __init__(self, model, test_loader, e_type, full_graph, log, device):
         self.model = model
         self.test_loader = list(test_loader)
         self.e_type = e_type
         self.log = log
         self.device = device
-        if pstatement_sampler: 
-            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_statement_sampler.prepare_global(full_graph)
-        elif nstatement_sampler: 
-            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_statement_sampler.prepare_global(full_graph, pos_etype="neg_statement", neg_etype="pos_statement")
-        else: 
-            self.neg_statement_sampler = NegativeStatementSampler()
-            self.neg_statement_sampler.prepare_global(full_graph)
         self.neg_sampler = NegativeSampler(full_graph, edge_type = ("node", e_type, "node"))
         self.metrics = Metrics()
 
@@ -130,8 +120,6 @@ class Test:
             batch = batch.to(self.device)
             src, dst  = batch.edges(etype=self.e_type)
             edge_index = torch.stack([src, dst], dim=0)
-            self.neg_statement_sampler.prepare_batch(batch)
-            neg_state_index  = self.neg_statement_sampler.sample()
             neg_edge_g = self.neg_sampler.sample()
             neg_edge_g = neg_edge_g.to(self.device)
             neg_src, neg_dst = neg_edge_g.edges(etype=("node", self.e_type, "node"))
