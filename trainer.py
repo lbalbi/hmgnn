@@ -138,7 +138,7 @@ class Test:
         acc, f1, precision, recall, roc_auc = self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
         print('Test Results:', flush=True)
         print(f'Accuracy: {acc:.4f}, F1 Score (W): {f1:.4f}, Precision (+): {precision:.4f}, Recall (+): {recall:.4f}, Roc Auc: {roc_auc:.4f}', flush=True)
-        self.log.log("Test, final" + str(acc) + "," + str(f1)+ "," + str(precision)+ "," + str(recall)+ ","+ str(roc_auc))
+        self.log.log("Test, final," + str(acc) + "," + str(f1)+ "," + str(precision)+ "," + str(recall)+ ","+ str(roc_auc))
         
         torch.save(self.model.state_dict(), 'model_'+ self.model.__class__.__name__ +'.pth')
         torch.save(out, "predictions_" + self.model.__class__.__name__ + ".pth")
