@@ -1,6 +1,6 @@
 import torch
 from utils import Metrics, EarlyStopping
-from samplers import NegativeStatementSampler, PartialStatementSampler
+from samplers import NegativeStatementSampler, PartialStatementSampler, NegativeSampler
 from losses import DualContrastiveLoss
 
 class Train:
@@ -12,15 +12,15 @@ class Train:
         self.val_loader = list(val_loader)
         self.e_type = e_type
         if pstatement_sampler: 
-            self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_sampler.prepare_global(full_cvgraph)
+            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
+            self.neg_statement_sampler.prepare_global(full_cvgraph)
         elif nstatement_sampler: 
-            self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_sampler.prepare_global(full_cvgraph, pos_etype="neg_statement", neg_etype="pos_statement")
+            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
+            self.neg_statement_sampler.prepare_global(full_cvgraph, pos_etype="neg_statement", neg_etype="pos_statement")
         else: 
-            self.neg_sampler = NegativeStatementSampler()
-            self.neg_sampler.prepare_global(full_cvgraph)
-        
+            self.neg_statement_sampler = NegativeStatementSampler()
+            self.neg_statement_sampler.prepare_global(full_cvgraph)
+        self.neg_sampler = NegativeSampler(full_cvgraph, edge_type = ("node", e_type, "node"))
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = DualContrastiveLoss(temperature=0.5)
         self.alpha = contrastive_weight
@@ -42,13 +42,17 @@ class Train:
             self.optimizer.zero_grad()
             src, dst  = batch.edges(etype=self.e_type)
             edge_index = torch.stack([src, dst], dim=0)
-            self.neg_sampler.prepare_batch(batch)
-            neg_edge_index = self.neg_sampler.sample()
+            self.neg_statement_sampler.prepare_batch(batch)
+            neg_statement_index = self.neg_statement_sampler.sample()
+            neg_edge_g = self.neg_sampler.sample()
+            neg_edge_g = neg_edge_g.to(self.device)
+            neg_src, neg_dst = neg_edge_g.edges(etype=("node", self.e_type, "node"))
+            neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
             labels = torch.cat([torch.ones(edge_index.size(1), device=self.device),
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
             z, out = self.model(batch, edge_index)
-            (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_sampler.get_contrastive_samples(z, neg_edge_index)
+            (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
             loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
             loss = self.loss_fn(out.squeeze(-1), labels)
             loss_ = self.alpha * loss_contrast + loss
@@ -70,13 +74,17 @@ class Train:
                 batch = batch.to(self.device)
                 src, dst  = batch.edges(etype=self.e_type)
                 edge_index = torch.stack([src, dst], dim=0)
-                self.neg_sampler.prepare_batch(batch)
-                neg_edge_index = self.neg_sampler.sample()
+                self.neg_statement_sampler.prepare_batch(batch)
+                neg_statement_index = self.neg_statement_sampler.sample()
+                neg_edge_g = self.neg_sampler.sample()
+                neg_edge_g = neg_edge_g.to(self.device)
+                neg_src, neg_dst = neg_edge_g.edges(etype=("node", self.e_type, "node"))
+                neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
                 edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
                 labels = torch.cat([torch.ones(src.size(0), device=self.device),
                     torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
                 z, out = self.model(batch, edge_index)
-                (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_sampler.get_contrastive_samples(z, neg_edge_index)
+                (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
                 loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
                 loss = self.loss_fn(out.squeeze(-1), labels)
                 loss_ = self.alpha * loss_contrast + loss
@@ -105,14 +113,15 @@ class Test:
         self.log = log
         self.device = device
         if pstatement_sampler: 
-            self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_sampler.prepare_global(full_graph)
+            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
+            self.neg_statement_sampler.prepare_global(full_graph)
         elif nstatement_sampler: 
-            self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_sampler.prepare_global(full_graph, pos_etype="neg_statement", neg_etype="pos_statement")
+            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
+            self.neg_statement_sampler.prepare_global(full_graph, pos_etype="neg_statement", neg_etype="pos_statement")
         else: 
-            self.neg_sampler = NegativeStatementSampler()
-            self.neg_sampler.prepare_global(full_graph)
+            self.neg_statement_sampler = NegativeStatementSampler()
+            self.neg_statement_sampler.prepare_global(full_graph)
+        self.neg_sampler = NegativeSampler(full_graph, edge_type = ("node", e_type, "node"))
         self.metrics = Metrics()
 
     def test_epoch(self):
@@ -121,15 +130,18 @@ class Test:
             batch = batch.to(self.device)
             src, dst  = batch.edges(etype=self.e_type)
             edge_index = torch.stack([src, dst], dim=0)
-            self.neg_sampler.prepare_batch(batch)
-            neg_edge_index  = self.neg_sampler.sample()
+            self.neg_statement_sampler.prepare_batch(batch)
+            neg_state_index  = self.neg_statement_sampler.sample()
+            neg_edge_g = self.neg_sampler.sample()
+            neg_edge_g = neg_edge_g.to(self.device)
+            neg_src, neg_dst = neg_edge_g.edges(etype=("node", self.e_type, "node"))
+            neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
             labels = torch.cat([torch.ones(src.size(0), device=self.device),
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
             with torch.no_grad():
                 z, out = self.model(batch, edge_index)
             self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
-
         return labels, out
     
     
@@ -137,9 +149,10 @@ class Test:
         labels, out = self.test_epoch()
         acc, f1, precision, recall, roc_auc = self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
         print('Test Results:', flush=True)
-        print(f'Accuracy: {acc:.4f}, F1 Score: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, Roc Auc: {roc_auc:.4f}', flush=True)
+        print(f'Accuracy: {acc:.4f}, F1 Score (W): {f1:.4f}, Precision (+): {precision:.4f}, Recall (+): {recall:.4f}, Roc Auc: {roc_auc:.4f}', flush=True)
         self.log.log("Test, final" + str(acc) + "," + str(f1)+ "," + str(precision)+ "," + str(recall)+ ","+ str(roc_auc))
         
         torch.save(self.model.state_dict(), 'model_'+ self.model.__class__.__name__ +'.pth')
         torch.save(out, "predictions_" + self.model.__class__.__name__ + ".pth")
+        torch.save(labels, "labels_" + self.model.__class__.__name__ + ".pth")
         self.log.close()
