@@ -7,6 +7,8 @@ sbatch run.sh
 ```
 
 If you wish to run a different architecture for the CHGNN you must pass it as a flag within the run.sh, e.g. for CHGAT:
+
 ```
 python main.py --model hgat
+
 ´´´
