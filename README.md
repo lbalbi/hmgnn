@@ -1,5 +1,8 @@
 Implementation of Hybrid Modeling GNN approach for training of positive and negative entity representations in tandem for negation-based conflict -aware KGRL.
 
+This implementation introduces a novel mechanism for sampling negatives from negative KG statements that builds dual entity representations to train a model in a contrastive setting. The contrastive loss pulls apart nodes from their negative neighbors (statement objects) and closens them to the positive neighbors.
+The model is trained on a final loss that results from combining the contrastive loss with a task-specific classification loss (BCELoss).
+
 To run the full pipeline for the Contrastive Heterophilic GNN execute the following in-line command:
 
 ```
