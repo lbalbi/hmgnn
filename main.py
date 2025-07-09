@@ -1,4 +1,4 @@
-import argparse, torch
+import argparse, torch, pandas
 from models import *
 from trainer import Train, Test
 from utils import Logger
@@ -13,6 +13,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
     parser.add_argument('--CV_epochs', type=int, default=200, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=256*512, help='Batch size for training')
+    parser.add_argument('--use_pstatement_sampler', action='store_true', help='Use PartialStatementSampler for positive statements')
+    parser.add_argument('--use_nstatement_sampler', action='store_true', help='Use PartialStatementSampler for negative statements')
     parser.add_argument('--path', type=str, default="data", help='Folder with data files, defaults to data/ directory')
     args = parser.parse_args()
 
@@ -20,7 +22,15 @@ def main():
     ModelCls = eval(args.model.upper())
     cfg = load_config()
     mcfg = cfg["models"][ModelCls.__name__]
-    dl = DataLoader(args.path + "/")
+
+    dl = DataLoader(args.path + "/",
+                    use_pstatement_sampler=args.use_pstatement_sampler,
+                    use_nstatement_sampler=args.use_nstatement_sampler)
+    state_list = None
+    if args.use_pstatement_sampler or args.use_nstatement_sampler: state_list = dl.get_state_list()
+    if args.use_pstatement_sampler: mcfg["edge_types"] = mcfg["edge_types"].remove(("pos_statement"))
+    elif args.use_nstatement_sampler: mcfg["edge_types"] = mcfg["edge_types"].remove(("neg_statement"))
+
     full_graph = dl.make_data_graph(dl.get_data())
     ppi_etype  = mcfg["ppi_etype"]
     src_all, dst_all = full_graph.edges(etype=ppi_etype)
@@ -69,7 +79,8 @@ def main():
         log   = Logger(f"{ModelCls.__name__}_fold{fold}")
         trainer = Train(model, optim, args.CV_epochs, train_loader, val_loader,
                         e_type=ppi_etype, log=log, device=device, full_cvgraph=train_graph,
-                        contrastive_weight=cfg["contrastive_weight"])
+                        contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+                        pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler)
         t_loss, (out, labels) = trainer.run()
         val_loss, (logits, labels) = trainer.validate_epoch()
         acc, f1, prec, rec, rocauc = trainer.metrics.update(logits.detach().to("cpu"), labels.to("cpu"))
@@ -86,13 +97,16 @@ def main():
     final_optim = torch.optim.Adam(final_model.parameters(), lr=cfg["lr"])
     full_train_loader = Dglloader(full_graph, batch_size = args.batch_size, device = device).train_batches()
     final_trainer = Train(final_model, final_optim, args.epochs, full_train_loader, [], full_cvgraph=full_graph,
-                          e_type=ppi_etype, log=log, device=device, contrastive_weight=cfg["contrastive_weight"])
+                          e_type=ppi_etype, log=log, device=device, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+                        pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler)
     loss, (out, labels) = final_trainer.run()
     print(f"Final training loss: {loss:.4f}", flush=True)
 
     final_log = Logger("final_test")
     test_loader = Dglloader(full_graph, batch_size = args.batch_size, device = device).test_batches()
-    tester = Test(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=full_graph, device=device)
+    tester = Test(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=full_graph, 
+                  device=device, pstatement_sampler=args.use_pstatement_sampler,
+                  nstatement_sampler=args.use_nstatement_sampler, state_list=state_list)
     tester.run()
 
 if __name__ == "__main__":

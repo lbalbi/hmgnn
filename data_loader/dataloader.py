@@ -7,10 +7,26 @@ class DataLoader:
     The output is a dictionary of torch tensors containing the edge types as keys 
     and the pairs of source and target nodes as values."""
     
-    def __init__(self, file_path):
+    def __init__(self, file_path: str,
+                 use_pstatement_sampler: bool = False,
+                 use_nstatement_sampler: bool = False):
+        
         self.file_path = file_path
+        self.use_pstatement_sampler = use_pstatement_sampler
+        self.use_nstatement_sampler = use_nstatement_sampler
         edge_files = self.path_files(file_path)
         self.data = self.load_data(edge_files)
+
+        # Extract state_list and remove statement edges from graph data
+        self.state_list: List[Tuple[int, int]] = []
+        if self.use_pstatement_sampler:
+            if 'pos_statement' in self.data:
+                src, tgt = self.data.pop('pos_statement')
+                self.state_list = list(zip(src.tolist(), tgt.tolist()))
+        elif self.use_nstatement_sampler:
+            if 'neg_statement' in self.data:
+                src, tgt = self.data.pop('neg_statement')
+                self.state_list = list(zip(src.tolist(), tgt.tolist()))
 
     @staticmethod
     def path_files(path):
@@ -48,6 +64,13 @@ class DataLoader:
             num_nodes = g.num_nodes(ntype)
             g.nodes[ntype].data['feat'] = torch.randn(num_nodes, 128)
         return g
+    
+    
+    def get_state_list(self) -> List[Tuple[int, int]]:
+        """
+        Return the list of statement edges removed from the graph data.
+        """
+        return self.state_list
     
     
     def get_data(self):

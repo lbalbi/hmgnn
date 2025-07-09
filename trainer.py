@@ -11,7 +11,9 @@ class Train:
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
         self.e_type = e_type
-        if pstatement_sampler: self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
+        if pstatement_sampler: 
+            self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
+            self.neg_sampler.prepare_global(full_cvgraph)
         elif nstatement_sampler: 
             self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
             self.neg_sampler.prepare_global(full_cvgraph, pos_etype="neg_statement", neg_etype="pos_statement")
@@ -102,16 +104,19 @@ class Test:
         self.e_type = e_type
         self.log = log
         self.device = device
-        if pstatement_sampler: self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
-        elif nstatement_sampler: self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
-        else: self.neg_sampler = NegativeStatementSampler()
-        self.neg_sampler.prepare_global(full_graph)
+        if pstatement_sampler: 
+            self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
+            self.neg_sampler.prepare_global(full_graph)
+        elif nstatement_sampler: 
+            self.neg_sampler = PartialStatementSampler(neg_edges=state_list)
+            self.neg_sampler.prepare_global(full_graph, pos_etype="neg_statement", neg_etype="pos_statement")
+        else: 
+            self.neg_sampler = NegativeStatementSampler()
+            self.neg_sampler.prepare_global(full_graph)
         self.metrics = Metrics()
 
     def test_epoch(self):
         self.model.eval()
-        total_loss = total_examples = 0
-
         for batch in self.test_loader:
             batch = batch.to(self.device)
             src, dst  = batch.edges(etype=self.e_type)
