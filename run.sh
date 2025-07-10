@@ -8,4 +8,4 @@
 
 echo "Job running on node: $(hostname)"
 
-python main.py --model hgcn
+python main.py --model hgcn --use_nstatement_sampler

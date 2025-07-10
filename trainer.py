@@ -11,10 +11,10 @@ class Train:
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
         self.e_type = e_type
-        if pstatement_sampler: 
+        if nstatement_sampler:
             self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
             self.neg_statement_sampler.prepare_global(full_cvgraph)
-        elif nstatement_sampler: 
+        elif pstatement_sampler:
             self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
             self.neg_statement_sampler.prepare_global(full_cvgraph, pos_etype="neg_statement", neg_etype="pos_statement")
         else: 

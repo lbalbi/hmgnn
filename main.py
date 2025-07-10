@@ -26,8 +26,8 @@ def main():
                     use_nstatement_sampler=args.use_nstatement_sampler)
     state_list = None
     if args.use_pstatement_sampler or args.use_nstatement_sampler: state_list = dl.get_state_list()
-    if args.use_pstatement_sampler: mcfg["edge_types"] = mcfg["edge_types"].remove(("pos_statement"))
-    elif args.use_nstatement_sampler: mcfg["edge_types"] = mcfg["edge_types"].remove(("neg_statement"))
+    if args.use_pstatement_sampler: mcfg["edge_types"].remove(["node","pos_statement","node"])
+    elif args.use_nstatement_sampler: mcfg["edge_types"].remove(["node","neg_statement","node"])
 
     full_graph = dl.make_data_graph(dl.get_data())
     ppi_etype = mcfg["ppi_etype"]
