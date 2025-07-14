@@ -4,35 +4,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DualContrastiveLoss(torch.nn.Module):
-    def __init__(self, temperature: float = 0.5):
+    def __init__(self, margin: float = 1.0):
         super().__init__()
-        self.temperature = temperature
+        self.margin = margin
         
     def forward(
         self, z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) -> torch.Tensor:
-
         B, D = z_pos.shape
-        z_pos = F.normalize(z_pos, dim=1)
-        z_pos_pos = F.normalize(z_pos_pos, dim=1)
-        z_pos_neg = F.normalize(z_pos_neg, dim=2)
-        z_neg = F.normalize(z_neg, dim=1)
-        z_neg_pos = F.normalize(z_neg_pos, dim=1)
-        z_neg_neg = F.normalize(z_neg_neg, dim=2)
 
-        # POSITIVE REPRESENTATION
-        # Similarity between anchor and positive
-        sim_pos = torch.sum(z_pos * z_pos_pos, dim=1, keepdim=True) / self.temperature
-        # Similarity between anchor and negative
-        sim_neg = torch.bmm(z_pos.unsqueeze(1), z_pos_neg.transpose(1, 2)).squeeze(1) / self.temperature
-        logits_pos = torch.cat([sim_pos, sim_neg], dim=1)
-        labels_pos = torch.zeros(B, dtype=torch.long, device=z_pos.device)
-        loss_pos = F.cross_entropy(logits_pos, labels_pos)
-        # NEGATIVE REPRESENTATION
-        sim_neg_pos = torch.sum(z_neg * z_neg_pos, dim=1, keepdim=True) / self.temperature
-        sim_neg_neg = torch.bmm(z_neg.unsqueeze(1), z_neg_neg.transpose(1, 2)).squeeze(1) / self.temperature
-        logits_neg = torch.cat([sim_neg_pos, sim_neg_neg], dim=1)
-        labels_neg = torch.zeros(B, dtype=torch.long, device=z_neg.device)
-        loss_neg = F.cross_entropy(logits_neg, labels_neg)
+        def branch_loss(anchor, positive, negatives):
+            d_pos = F.pairwise_distance(anchor, positive, p=2) # 1) distance to true positive
+            loss_pos = d_pos.pow(2) # 2) distances to negative
+            d_neg = torch.norm(anchor.unsqueeze(1) - negatives, dim=2)
+            #    hinge loss: max(0, margin - d_neg)^2
+            loss_neg = F.relu(self.margin - d_neg).pow(2).mean(dim=1)
+            return 0.5 * (loss_pos + loss_neg)
 
-        total_loss = loss_pos + loss_neg
-        return total_loss
+        loss_pos_branch = branch_loss(z_pos, z_pos_pos, z_pos_neg)
+        loss_neg_branch = branch_loss(z_neg, z_neg_pos, z_neg_neg)
+        loss = 0.5 * (loss_pos_branch + loss_neg_branch).mean()
+        return loss
