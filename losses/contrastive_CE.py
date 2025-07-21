@@ -3,19 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ContrastiveLoss(torch.nn.Module):
-    def __init__(self, margin: float = 1.0):
+    def __init__(self, temperature: float = 0.5):
         super().__init__()
-        self.margin = margin
+        self.temperature = temperature
         
     def forward(self, z_pos, z_pos_pos, z_pos_neg) -> torch.Tensor:
         B, D = z_pos.shape
+        z_pos = F.normalize(z_pos, dim=1)
+        z_pos_pos = F.normalize(z_pos_pos, dim=1)
+        z_pos_neg = F.normalize(z_pos_neg, dim=2)
 
-        def branch_loss(anchor, positive, negative):
-            d_pos = torch.norm(anchor.unsqueeze(1) - positive, dim=2) # 1) distance to true positive
-            loss_pos = d_pos.pow(2).mean(dim=1) # 2) distances to negative
-            d_neg = torch.norm(anchor.unsqueeze(1) - negative, dim=2) # hinge loss: max(0, margin - d_neg)^2
-            loss_neg = F.relu(self.margin - d_neg).pow(2).mean(dim=1)
-            return 0.5 * (loss_pos + loss_neg)
-        
-        loss = branch_loss(z_pos, z_pos_pos, z_pos_neg)
-        return loss
+        # POSITIVE REPRESENTATION
+        sim_pos = torch.sum(z_pos * z_pos_pos, dim=1, keepdim=True) / self.temperature
+        sim_neg = torch.bmm(z_pos.unsqueeze(1), z_pos_neg.transpose(1, 2)).squeeze(1) / self.temperature
+        logits_pos = torch.cat([sim_pos, sim_neg], dim=1)
+        labels_pos = torch.zeros(B, dtype=torch.long, device=z_pos.device)
+        total_loss = F.cross_entropy(logits_pos, labels_pos)
+
+        return total_loss
