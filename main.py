@@ -2,7 +2,7 @@ import argparse, torch
 from models import *
 from trainer import Train, Test
 from utils import Logger
-from data_loader import DataLoader, OwlDataLoader, Dglloader
+from data_loader import DataLoader, Dglloader, OwlDataLoader
 from utils import load_config
 from sklearn.model_selection import KFold, train_test_split
 
@@ -17,7 +17,7 @@ def main():
     parser.add_argument('--use_pstatement_sampler', action='store_true')
     parser.add_argument('--use_nstatement_sampler', action='store_true')
     parser.add_argument('--use_rstatement_sampler', action='store_true')
-    parser.add_argument('--path', type=str, default="data")
+    parser.add_argument('--path', type=str, default="ppi_data")
     parser.add_argument('--output_dir', type=str, default="")
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
