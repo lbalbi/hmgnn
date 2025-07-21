@@ -4,7 +4,7 @@ class NegativeStatementSampler:
     A sampler that uses negative statements as negative samples
     for each node in the training graph.
     """
-    def __init__(self,  k: int = 2, go_etype="GO"):
+    def __init__(self,  k: int = 2, go_etype="link"):
         self.k = k
         self.go_etype = go_etype
 
@@ -78,7 +78,6 @@ class NegativeStatementSampler:
         return ei
 
 
-
     def get_contrastive_samples(self, z: torch.Tensor, neg_ei: torch.Tensor) -> tuple:
             """
             Generate contrastive positive and negative embeddings.
@@ -92,6 +91,8 @@ class NegativeStatementSampler:
             neg_dst = neg_ei[1].view(N, self.k)
             z_pos_neg = z[neg_dst]
             return z_pos, z_pos_pos, z_pos_neg, z_pos, z_pos_pos, z_pos_neg
+
+
 
 
     def get_contrastive_samples_(self, z: torch.Tensor, neg_ei: torch.Tensor) -> tuple:
@@ -110,8 +111,7 @@ class NegativeStatementSampler:
             z_pos_neg = z[neg_dst]
             z_pos = z
             z_neg, z_neg_pos, z_neg_neg = z, z_pos_pos, z_pos_neg
-            print(f"z_pos: {z_pos.shape}, z_pos_pos: {z_pos_pos.shape}, z_pos_neg: {z_pos_neg.shape}, "
-                f"z_neg: {z_neg.shape}, z_neg_pos: {z_neg_pos.shape}, z_neg_neg: {z_neg_neg.shape}")
+
             return z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg
         
 

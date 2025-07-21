@@ -24,20 +24,19 @@ def main():
     ModelCls = eval(args.model.upper())
     cfg = load_config(task=args.task)
     mcfg = cfg["models"][ModelCls.__name__]
-
-    dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatement_sampler,
-                    use_nstatement_sampler=args.use_nstatement_sampler or args.use_rstatement_sampler)
     if args.path == "gda_data":
         dl = OwlDataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatement_sampler,
                         use_nstatement_sampler=args.use_nstatement_sampler or args.use_rstatement_sampler)
-    
+    else: dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatement_sampler,
+                    use_nstatement_sampler=args.use_nstatement_sampler or args.use_rstatement_sampler)
     state_list = None
     if args.use_pstatement_sampler or args.use_nstatement_sampler: state_list = dl.get_state_list()
     if args.use_pstatement_sampler: mcfg["edge_types"].remove(["node","pos_statement","node"])
     elif args.use_nstatement_sampler or args.use_rstatement_sampler:
         mcfg["edge_types"].remove(["node","neg_statement","node"])
     
-    full_graph = dl.make_data_graph(dl.get_data())
+    if args.path == "gda_data": full_graph = dl.get_graph()
+    else: full_graph = dl.make_data_graph(dl.get_data())
     ppi_etype = mcfg["ppi_etype"]
     src_all, dst_all = full_graph.edges(etype=ppi_etype)
     edge_pairs = list(zip(src_all.tolist(), dst_all.tolist()))
@@ -129,7 +128,7 @@ def main():
 
     final_log = Logger("final_test", dir= args.output_dir)
     tester = Test(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=test_graph, device=device, 
-                  gda_negs=dl.get_negative_edges() if args.path == "gda_data" else None)
+                 task=args.task, gda_negs=dl.get_negative_edges() if args.path == "gda_data" else None)
     tester.run()
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 import torch
 from utils import Metrics, EarlyStopping
 from samplers import NegativeStatementSampler, PartialStatementSampler, NegativeSampler, RandomStatementSampler
-from losses import DualContrastiveLoss_CE, DualContrastiveLoss
+from losses import DualContrastiveLoss_CE, DualContrastiveLoss, ContrastiveLoss
 
 class Train:
     def __init__(self, model, optimizer, epochs, train_loader, val_loader, full_cvgraph, e_type, log, device, task,
@@ -12,6 +12,7 @@ class Train:
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
         self.e_type = e_type
+        self.rstatement_sampler = rstatement_sampler
 
         if nstatement_sampler:
             self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
@@ -19,15 +20,16 @@ class Train:
         elif pstatement_sampler:
             self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
             self.neg_statement_sampler.prepare_global(full_cvgraph, pos_etype="neg_statement", neg_etype="pos_statement")
-        elif rstatement_sampler:
+        elif self.rstatement_sampler:
             self.neg_statement_sampler = RandomStatementSampler()
             self.neg_statement_sampler.prepare_global(full_cvgraph)
         else:
-            self.neg_statement_sampler = NegativeStatementSampler()
+            self.neg_statement_sampler = NegativeStatementSampler(anchor_etype=e_type)
             self.neg_statement_sampler.prepare_global(full_cvgraph)
         self.neg_sampler = NegativeSampler(full_cvgraph, edge_type = ("node", e_type, "node"))
         self.loss_fn = torch.nn.BCELoss()
-        self.contrastive = DualContrastiveLoss_CE()
+        if self.rstatement_sampler: self.contrastive = ContrastiveLoss()
+        else: self.contrastive = DualContrastiveLoss_CE()
         self.alpha = contrastive_weight
         self.earlystopper = EarlyStopping()
         self.log = log
@@ -53,7 +55,7 @@ class Train:
             edge_index = torch.stack([src, dst], dim=0)
             num_pos = edge_index.size(1)
             self.neg_statement_sampler.prepare_batch(batch)
-            neg_statement_index = self.neg_statement_sampler.sample()
+            if self.rstatement_sampler: neg_statement_index = self.neg_statement_sampler.sample()
             if self.task == "gda": 
                 start = self.train_neg_ptr
                 end = start + num_pos
@@ -70,8 +72,12 @@ class Train:
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
             z, out = self.model(batch, edge_index)
-            (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
-            loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
+            if self.rstatement_sampler:
+                (z_pos, z_pos_pos, z_pos_neg) = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
+                loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+            else: 
+                (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_statement_sampler.get_contrastive_samples(z) #, neg_statement_index)
+                loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
             loss = self.loss_fn(out.squeeze(-1), labels)
             loss_ = self.alpha * loss_contrast + loss
             # loss_ = loss
@@ -95,7 +101,7 @@ class Train:
                 edge_index = torch.stack([src, dst], dim=0)
                 num_pos = edge_index.size(1)
                 self.neg_statement_sampler.prepare_batch(batch)
-                neg_statement_index = self.neg_statement_sampler.sample()
+                if self.rstatement_sampler: neg_statement_index = self.neg_statement_sampler.sample()
                 if self.task == "gda":
                     start = self.val_neg_ptr
                     end = start + num_pos
@@ -112,8 +118,12 @@ class Train:
                 labels = torch.cat([torch.ones(src.size(0), device=self.device),
                     torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
                 z, out = self.model(batch, edge_index)
-                (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
-                loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
+                if self.rstatement_sampler:
+                    (z_pos, z_pos_pos, z_pos_neg) = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
+                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                else:
+                    (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_statement_sampler.get_contrastive_samples(z) #, neg_statement_index)
+                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
                 loss = self.loss_fn(out.squeeze(-1), labels)
                 loss_ = self.alpha * loss_contrast + loss
                 # loss_ = loss

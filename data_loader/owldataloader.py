@@ -2,10 +2,10 @@ import os
 import pandas as pd
 import torch
 import dgl
-from rdflib import Graph, Literal
+from rdflib import Graph, Literal, URIRef
 from rdflib.namespace import RDF, RDFS, OWL, XSD
 
-class DataLoader:
+class OwlDataLoader:
     """
     DataLoader that reads .tsv and .owl files from a folder,
     extracts gene_disease_associations, ontology assertions, and subclass edges,
@@ -92,7 +92,8 @@ class DataLoader:
                 g = Graph()
                 g.parse(path, format='xml')
                 # PositivePropertyAssertion
-                for assertion in g.subjects(RDF.type, OWL.PropertyAssertion):
+                PROPERTY_ASSERTION = URIRef("http://www.w3.org/2002/07/owl#PropertyAssertion")
+                for assertion in g.subjects(RDF.type, PROPERTY_ASSERTION):
                     for src in g.objects(assertion, OWL.sourceIndividual):
                         for tgt in g.objects(assertion, OWL.targetIndividual):
                             self.pos_statement.append((str(src), str(tgt)))
@@ -111,7 +112,7 @@ class DataLoader:
 
     def _create_node_mapping(self):
         nodes = set()
-        for edge_list in [self.gda_edges, self.gda_edges, self.pos_statement,
+        for edge_list in [self.gda_edges, self.gda_negedges, self.pos_statement,
                           self.neg_statement, self.subclass_edges]:
             for s, t in edge_list:
                 nodes.add(s)

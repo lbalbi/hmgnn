@@ -69,6 +69,7 @@ class RandomStatementSampler:
             for v in self.global_dst:
                 if v in mapping and v not in invalid:
                     self.neg_cands[i].append(mapping[v])
+    
 
     def sample(self) -> torch.Tensor:
         """
@@ -102,58 +103,14 @@ class RandomStatementSampler:
         src = torch.arange(N, device=self.device).unsqueeze(1).repeat(1, k)
         return torch.stack([src.view(-1), dst.view(-1)], dim=0)
 
-    def get_contrastive_samples(self, z: torch.Tensor, neg_ei: torch.Tensor) -> tuple:
-        """
-        Generate dual-view contrastive embeddings:
-          - positive view: (z_pos, z_pos_pos, z_pos_neg)
-          - negative view: (z_neg, z_neg_pos, z_neg_neg)
 
-        Returns:
-            z_pos     (N, D)
-            z_pos_pos (N, D)
-            z_pos_neg (N, k, D)
-            z_neg     (N, k, D)
-            z_neg_pos (N, k, D)
-            z_neg_neg (N, k, k, D)
-        """
+    def get_contrastive_samples(self, z: torch.Tensor, neg_ei: torch.Tensor) -> tuple:
+
         N, D = z.shape
         k = self.k
-        # --- Positive view ---
-        # Anchor embeddings
-        z_pos = z                              # (N, D)
-        # One positive neighbor per anchor
-        pos_idx = [random.choice(self.pos_local[i]) if self.pos_local[i] else i
-                   for i in range(N)]
-        z_pos_pos = z[pos_idx]                 # (N, D)
-        # k negative neighbors per anchor
-        neg_src, neg_dst = neg_ei             # each is (N*k,)
-        neg_dst = neg_dst.view(N, k)
-        z_pos_neg = z[neg_dst]                 # (N, k, D)
-
-        # --- Negative view ---
-        # Anchors are the previously sampled negatives
-        neg_src = neg_src.view(N, k)
-        z_neg = z[neg_src]                     # (N, k, D)
-        # One positive neighbor per negative anchor
-        neg_pos_idx = []
-        for i in range(N):
-            row = []
-            for v in neg_src[i].tolist():
-                picks = self.pos_local[v] if self.pos_local[v] else [v]
-                row.append(random.choice(picks))
-            neg_pos_idx.append(row)
-        neg_pos_idx = torch.tensor(neg_pos_idx, device=z.device)  # (N, k)
-        z_neg_pos = z[neg_pos_idx]               # (N, k, D)
-
-        # k negative neighbors per negative anchor
-        neg_neg_idx = []
-        for i in range(N):
-            rows = []
-            for v in neg_src[i].tolist():
-                cands = self.neg_cands[v] or [v]
-                rows.append(random.choices(cands, k=k))
-            neg_neg_idx.append(rows)
-        neg_neg_idx = torch.tensor(neg_neg_idx, device=z.device)  # (N, k, k)
-        z_neg_neg = z[neg_neg_idx]                # (N, k, k, D)
-
-        return z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg
+        z_pos = z
+        pos_nb = [random.choice(self.pos_local[u]) if self.pos_local[u] else u for u in range(N)]
+        z_pos_pos = z[pos_nb]
+        neg_dst = neg_ei[1].view(N, k)         
+        z_pos_neg = z[neg_dst]
+        return z_pos, z_pos_pos, z_pos_neg
