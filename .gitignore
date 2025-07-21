@@ -1,4 +1,4 @@
-data/
+ppi_data/
 gda_data/
 output/
 # Ignore Python cache files
