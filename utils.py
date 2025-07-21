@@ -1,16 +1,23 @@
+def ensure_dir(path):
+    import os
+    if not os.path.exists(path):
+        os.makedirs(path)
+
 class Logger:
 
-    def __init__(self, name):
+    def __init__(self, name, dir= ""):
         self.name = name
+        self.dir = "output/" + dir
+        ensure_dir(self.dir)
         self.log_file = f"{name}.log"
-        self.file = open(self.log_file, 'a')
+        self.file = open(self.dir + self.log_file, 'a')
         self.file.write(f"Results for {name}\n")
         self.file.write("=" * 50 + "\n")
         self.file.close()
 
     def log(self, message):
         print(message)
-        self.file = open(self.log_file, 'a')
+        self.file = open(self.dir + self.log_file, 'a')
         self.file.write(message + "\n")
         self.file.flush()
         self.file.close()
@@ -107,6 +114,6 @@ class Metrics:
 
     
 import json
-def load_config(path="config.json"):
-    with open(path, "r") as f:
+def load_config(task, path="config.json"):
+    with open(task + "_"+ path, "r") as f:
         return json.load(f)

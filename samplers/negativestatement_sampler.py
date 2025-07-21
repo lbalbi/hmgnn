@@ -15,7 +15,7 @@ class NegativeStatementSampler:
         src_neg, dst_neg = full_g.edges(etype=neg_etype)
         src_pos, dst_pos = full_g.edges(etype=pos_etype)
         direct = [[] for _ in range(N)]
-        pos    = [[] for _ in range(N)]
+        pos = [[] for _ in range(N)]
         for u,v in zip(src_neg.tolist(), dst_neg.tolist()): direct[u].append(v)
         for u,v in zip(src_pos.tolist(), dst_pos.tolist()): pos[u].append(v)
         two_hop = {}
@@ -78,13 +78,40 @@ class NegativeStatementSampler:
         return ei
 
 
+
     def get_contrastive_samples(self, z: torch.Tensor, neg_ei: torch.Tensor) -> tuple:
-        N, D = z.shape
-        z_pos = z
-        pos_nb = [random.choice(self.pos[u]) if self.pos[u] else u for u in range(N)]
-        z_pos_pos = z[pos_nb]
-        neg_dst   = neg_ei[1].view(N, self.k)
-        z_pos_neg = z[neg_dst]
-        # negatives
-        z_neg, z_neg_pos, z_neg_neg = z_pos, z_pos_pos, z_pos_neg
-        return z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg
+            """
+            Generate contrastive positive and negative embeddings.
+            """
+            N, D = z.shape
+            # Positive samples
+            z_pos = z
+            pos_nb = [random.choice(self.pos[u]) if self.pos[u] else u for u in range(N)]
+            z_pos_pos = z[pos_nb]
+            # Negative samples from sampled edges
+            neg_dst = neg_ei[1].view(N, self.k)
+            z_pos_neg = z[neg_dst]
+            return z_pos, z_pos_pos, z_pos_neg, z_pos, z_pos_pos, z_pos_neg
+
+
+    def get_contrastive_samples_(self, z: torch.Tensor, neg_ei: torch.Tensor) -> tuple:
+            N, D = z.shape
+            pos_idx = []
+            for u in range(N):
+                pool = self.pos[u]
+                if len(pool) >= self.k: sampled = random.sample(pool, self.k)
+                elif pool: sampled = random.choices(pool, k=self.k)
+                else: sampled = [u] * self.k
+                pos_idx.extend(sampled)
+            pos_idx = torch.tensor(pos_idx, device=z.device).view(N, self.k)
+            z_pos_pos = z[pos_idx]
+
+            neg_dst = neg_ei[1].view(N, self.k)
+            z_pos_neg = z[neg_dst]
+            z_pos = z
+            z_neg, z_neg_pos, z_neg_neg = z, z_pos_pos, z_pos_neg
+            print(f"z_pos: {z_pos.shape}, z_pos_pos: {z_pos_pos.shape}, z_pos_neg: {z_pos_neg.shape}, "
+                f"z_neg: {z_neg.shape}, z_neg_pos: {z_neg_pos.shape}, z_neg_neg: {z_neg_neg.shape}")
+            return z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg
+        
+

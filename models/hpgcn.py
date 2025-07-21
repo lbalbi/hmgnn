@@ -36,7 +36,7 @@ class HPGCN(nn.Module):
         in_dim_maps = [in_feats] + [{etype: hidden_dim for etype in in_feats} for _ in range(n_layers - 1)]
         self.layers = nn.ModuleList([HeteroGraphConv({rel: GraphConv(in_dim_maps[layer_idx][rel], hidden_dim)
                     for src, rel, dst in e_etypes}, aggregate="all") for layer_idx in range(n_layers)])
-        self.classify = nn.Linear(2 * hidden_dim, out_dim)
+        self.classify = nn.Linear(4 * hidden_dim, out_dim)
 
 
 
@@ -49,9 +49,10 @@ class HPGCN(nn.Module):
                     for ntype, rel_embs in h_dict.items()}
 
         rel_embs = h_dict[self.n_type]
-        z_pos = rel_embs[("node", "pos_statement", "node")]
-        z_neg = rel_embs[("node","neg_statement","node")]
-        z = z_pos - z_neg
+        z_pos = rel_embs["pos_statement"]
+        z_neg = rel_embs["neg_statement"]
+        z = torch.cat([z_pos, z_neg], dim=1)
+        # z = z_pos - z_neg
         src_ids, dst_ids = edge_index
         hs, hd = z[src_ids], z[dst_ids]
         h_pair = torch.cat([hs, hd], dim=1)
