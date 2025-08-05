@@ -1,94 +1,131 @@
+import copy
 import torch
+import dgl
 from utils import Metrics, EarlyStopping
-from samplers import NegativeStatementSampler, PartialStatementSampler, NegativeSampler, RandomStatementSampler
-from losses import DualContrastiveLoss_CE, DualContrastiveLoss, ContrastiveLoss
+from samplers import (
+    NegativeStatementSampler,
+    PartialStatementSampler,
+    NegativeSampler,
+    RandomStatementSampler
+)
+from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin
 
 class Train:
-    def __init__(self, model, optimizer, epochs, train_loader, val_loader, full_cvgraph, e_type, log, device, task,
-        pstatement_sampler=False, nstatement_sampler=False, rstatement_sampler=False, contrastive_weight=0.1, gda_negs=None,
-        state_list=None):
-        self.model = model
+    def __init__(
+        self, model, optimizer, epochs,train_loader, val_loader,
+        full_cvgraph, e_type,log, device, task, lrs=[0.001],
+        gda_negs=None, pstatement_sampler=False,  nstatement_sampler=False,
+        rstatement_sampler=False, contrastive_weight=0.1, state_list=None,
+        no_contrastive=False
+    ):
+        self.device = device
+        self.log = log
+        self.task = task
+        self.epochs = epochs
+        self.lrs = lrs
+        self.model = model.to(self.device)
         self.optimizer = optimizer
+        self._init_state = copy.deepcopy(self.model.state_dict())
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
         self.e_type = e_type
-        self.rstatement_sampler = rstatement_sampler
 
-        if nstatement_sampler:
+        self._setup_samplers(
+            full_cvgraph, state_list, gda_negs, pstatement_sampler, 
+            nstatement_sampler, rstatement_sampler, no_contrastive)
+        self.loss_fn = torch.nn.BCELoss()
+        self.contrastive = DualContrastiveLoss_CE()
+        self.alpha = contrastive_weight
+        self.earlystopper = EarlyStopping()
+        self.metrics = Metrics()
+        header = "Setting, Epoch, " + ", ".join(self.metrics.get_names())
+        self.log.log(header)
+
+    def _setup_samplers(
+        self, full_cvgraph, state_list,  gda_negs, pstatement_sampler,
+        nstatement_sampler, rstatement_sampler, no_contrastive):
+        self.no_contrastive = no_contrastive
+        self.rstatement_sampler = rstatement_sampler
+        self.pstatement_sampler = pstatement_sampler
+        self.nstatement_sampler = nstatement_sampler
+
+        if rstatement_sampler:
+            self.neg_statement_sampler = RandomStatementSampler()
+            self.neg_statement_sampler.prepare_global(full_cvgraph)
+        elif nstatement_sampler:
             self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
             self.neg_statement_sampler.prepare_global(full_cvgraph)
         elif pstatement_sampler:
             self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_statement_sampler.prepare_global(full_cvgraph, pos_etype="neg_statement", neg_etype="pos_statement")
-        elif self.rstatement_sampler:
-            self.neg_statement_sampler = RandomStatementSampler()
-            self.neg_statement_sampler.prepare_global(full_cvgraph)
-        else:
-            self.neg_statement_sampler = NegativeStatementSampler(anchor_etype=e_type)
-            self.neg_statement_sampler.prepare_global(full_cvgraph)
-        self.neg_sampler = NegativeSampler(full_cvgraph, edge_type = ("node", e_type, "node"))
-        self.loss_fn = torch.nn.BCELoss()
-        if self.rstatement_sampler: self.contrastive = ContrastiveLoss()
-        else: self.contrastive = DualContrastiveLoss_CE()
-        self.alpha = contrastive_weight
-        self.earlystopper = EarlyStopping()
-        self.log = log
-        self.device = device
-        self.task = task
-        self.gda_negs = gda_negs
-        self.epochs = epochs
-        self.metrics = Metrics()
-        self.log.log("Setting, Epoch, " + "".join(name + ", " for name in self.metrics.get_names())[:-2])
-        self.train_neg_ptr = 0
-        self.val_neg_ptr = 0
-        self.test_neg_ptr = 0
+            self.neg_statement_sampler.prepare_global(
+                full_cvgraph, pos_etype="neg_statement", neg_etype="pos_statement" )
+        elif not no_contrastive:
+            self.neg_statement_sampler = NegativeStatementSampler(anchor_etype=self.e_type)
+            self.neg_statement_sampler.prepare_global(
+                full_cvgraph, negatives = gda_negs if self.task == "gda" else None )
+
+        self.neg_sampler = NegativeSampler(
+            full_cvgraph, edge_type=("node", self.e_type, "node"))
 
     def train_epoch(self):
         self.model.train()
         total_loss = total_examples = 0
 
         for batch in self.train_loader:
-
             batch = batch.to(self.device)
             self.optimizer.zero_grad()
-            src, dst  = batch.edges(etype=self.e_type)
-            edge_index = torch.stack([src, dst], dim=0)
-            num_pos = edge_index.size(1)
-            self.neg_statement_sampler.prepare_batch(batch)
-            if self.rstatement_sampler: neg_statement_index = self.neg_statement_sampler.sample()
-            if self.task == "gda": 
-                start = self.train_neg_ptr
-                end = start + num_pos
-                neg_edge_g = self.gda_negs[:, start:end]
-                self.train_neg_ptr = end
-                neg_edge_g = neg_edge_g.to(self.device)
-                neg_src, neg_dst = neg_edge_g
-            else:
-                neg_edge_g = self.neg_sampler.sample()
-                neg_edge_g = neg_edge_g.to(self.device)
-                neg_src, neg_dst = neg_edge_g.edges(etype=("node", self.e_type, "node"))
-            neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
-            labels = torch.cat([torch.ones(edge_index.size(1), device=self.device),
-                torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
-            edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
-            z, out = self.model(batch, edge_index)
+            src, dst = batch.edges(etype=self.e_type)
+            pos_index = torch.stack([src, dst], dim=0)
+
+            # Prepare statement‐based negatives
             if self.rstatement_sampler:
-                (z_pos, z_pos_pos, z_pos_neg) = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
+                self.neg_statement_sampler.prepare_batch(batch, pos_index)
+                neg_stmt_idx = self.neg_statement_sampler.sample()
+            elif self.nstatement_sampler or self.pstatement_sampler:
+                self.neg_statement_sampler.prepare_batch(batch)
+                neg_stmt_idx = self.neg_statement_sampler.sample()
+            elif not self.no_contrastive: self.neg_statement_sampler.prepare_batch(batch)
+
+            # Sample classification negatives
+            neg_edge_g = self.neg_sampler.sample().to(self.device)
+            neg_src, neg_dst = neg_edge_g.edges(etype=("node", self.e_type, "node"))
+            neg_index = torch.stack([neg_src, neg_dst], dim=0)
+            edge_index = torch.cat([pos_index, neg_index], dim=1)
+            labels = torch.cat([torch.ones(pos_index.size(1),  device=self.device),
+                torch.zeros(neg_index.size(1), device=self.device)
+            ], dim=0)
+            # Homogeneous conversion
+            if self.model.__class__.__name__ in {"GCN", "GAT"}:
+                orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
+                for ntype in batch.ntypes:
+                    num = batch.num_nodes(ntype)
+                    batch.nodes[ntype].data[dgl.NID] = torch.arange(num, device=batch.device)
+                batch = dgl.to_homogeneous(batch, ndata=['feat', dgl.NID], store_type=True)
+                batch = batch.to(self.device)
+                batch = dgl.add_self_loop(batch)
+                homo_nid = batch.ndata[dgl.NID]
+                inv = torch.empty(batch.num_nodes(), dtype=torch.long, device=self.device)
+                inv[homo_nid] = torch.arange(batch.num_nodes(), device=self.device)
+                src = inv[orig_src]
+                dst = inv[orig_dst]
+                edge_index = torch.stack([src, dst], dim=0)
+            z, out = self.model(batch, edge_index)
+
+            # Contrastive loss if enabled
+            if not self.no_contrastive:
+                args = (z, neg_stmt_idx) if 'neg_stmt_idx' in locals() else (z,)
+                z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
                 loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-            else: 
-                (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_statement_sampler.get_contrastive_samples(z) #, neg_statement_index)
-                loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
-            loss = self.loss_fn(out.squeeze(-1), labels)
-            loss_ = self.alpha * loss_contrast + loss
-            # loss_ = loss
-            loss_.backward()
+                loss = self.alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
+            else: loss = self.loss_fn(out.squeeze(-1), labels)
+
+            loss.backward()
             self.optimizer.step()
-            num_examples = out.size(0)
-            total_loss += loss_.item() * num_examples
-            total_examples += num_examples
-        if total_examples == 0: return 0
-        return (total_loss / total_examples), (out, labels)
-    
+            total_loss += loss.item() * out.size(0)
+            total_examples+= out.size(0)
+
+        avg_loss = total_loss / total_examples if total_examples else 0
+        return avg_loss, (out, labels)
 
     def validate_epoch(self):
         self.model.eval()
@@ -97,101 +134,85 @@ class Train:
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = batch.to(self.device)
-                src, dst  = batch.edges(etype=self.e_type)
-                edge_index = torch.stack([src, dst], dim=0)
-                num_pos = edge_index.size(1)
-                self.neg_statement_sampler.prepare_batch(batch)
-                if self.rstatement_sampler: neg_statement_index = self.neg_statement_sampler.sample()
-                if self.task == "gda":
-                    start = self.val_neg_ptr
-                    end = start + num_pos
-                    neg_edge_g = self.gda_negs[:, start:end]
-                    self.val_neg_ptr = end
-                    neg_edge_g = neg_edge_g.to(self.device)
-                    neg_src, neg_dst = neg_edge_g
-                else: 
-                    neg_edge_g = self.neg_sampler.sample()
-                    neg_edge_g = neg_edge_g.to(self.device)
-                    neg_src, neg_dst = neg_edge_g.edges(etype=("node", self.e_type, "node"))
-                neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
-                edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
-                labels = torch.cat([torch.ones(src.size(0), device=self.device),
-                    torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
-                z, out = self.model(batch, edge_index)
+                src, dst = batch.edges(etype=self.e_type)
+                pos_index = torch.stack([src, dst], dim=0)
+
                 if self.rstatement_sampler:
-                    (z_pos, z_pos_pos, z_pos_neg) = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
-                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-                else:
-                    (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg) = self.neg_statement_sampler.get_contrastive_samples(z) #, neg_statement_index)
-                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
-                loss = self.loss_fn(out.squeeze(-1), labels)
-                loss_ = self.alpha * loss_contrast + loss
-                # loss_ = loss
-                num_examples = out.size(0)
-                total_loss += loss_.item() * num_examples
-                total_examples += num_examples
-            return (total_loss / total_examples), (out, labels)
+                    self.neg_statement_sampler.prepare_batch(batch, pos_index)
+                    neg_stmt_idx = self.neg_statement_sampler.sample()
+                elif self.nstatement_sampler or self.pstatement_sampler:
+                    self.neg_statement_sampler.prepare_batch(batch)
+                    neg_stmt_idx = self.neg_statement_sampler.sample()
+                elif not self.no_contrastive:
+                    self.neg_statement_sampler.prepare_batch(batch)
 
-    def run(self):
-        for epoch in range(self.epochs):
-            train_loss, (out, labels) = self.train_epoch()
-            if train_loss != 0: print(f'Epoch {epoch+1}/{self.epochs}, Train Loss: {train_loss:.4f}', flush=True)
-            if self.earlystopper.step(train_loss, self.model):
-                print(f" --  Early stopping at epoch {epoch}", flush=True)
-                break
-        return train_loss, (out, labels)
-        
-
-
-class Test:
-    def __init__(self, model, test_loader, e_type, full_graph, log, device, task, gda_negs=None):
-        self.model = model
-        self.test_loader = list(test_loader)
-        self.e_type = e_type
-        self.log = log
-        self.device = device
-        self.task = task
-        self.gda_negs = gda_negs
-        self.neg_sampler = NegativeSampler(full_graph, edge_type = ("node", e_type, "node"))
-        self.metrics = Metrics()
-        self.test_neg_ptr = 0
-
-    def test_epoch(self):
-        self.model.eval()
-        for batch in self.test_loader:
-            batch = batch.to(self.device)
-            src, dst  = batch.edges(etype=self.e_type)
-            edge_index = torch.stack([src, dst], dim=0)
-            num_pos = edge_index.size(1)
-            if self.task == "gda": 
-                start = self.test_neg_ptr
-                end = start + num_pos
-                neg_edge_g = self.gda_negs[:, start:end]
-                self.test_neg_ptr = end
-                neg_edge_g = neg_edge_g.to(self.device)
-                neg_src, neg_dst = neg_edge_g
-            else: 
-                neg_edge_g = self.neg_sampler.sample()
-                neg_edge_g = neg_edge_g.to(self.device)
+                neg_edge_g = self.neg_sampler.sample().to(self.device)
                 neg_src, neg_dst = neg_edge_g.edges(etype=("node", self.e_type, "node"))
-            neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
-            edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
-            labels = torch.cat([torch.ones(src.size(0), device=self.device),
-                torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
-            with torch.no_grad():
+                neg_index = torch.stack([neg_src, neg_dst], dim=0)
+
+                edge_index = torch.cat([pos_index, neg_index], dim=1)
+                labels = torch.cat([torch.ones(pos_index.size(1),  device=self.device),
+                    torch.zeros(neg_index.size(1), device=self.device)], dim=0)
+
+                if self.model.__class__.__name__ in {"GCN", "GAT"}:
+                    orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
+                    for ntype in batch.ntypes:
+                        num = batch.num_nodes(ntype)
+                        batch.nodes[ntype].data[dgl.NID] = torch.arange(num, device=batch.device)
+                    batch = dgl.to_homogeneous(batch, ndata=['feat', dgl.NID], store_type=True)
+                    batch = batch.to(self.device)
+                    batch = dgl.add_self_loop(batch)
+                    homo_nid = batch.ndata[dgl.NID]
+                    inv = torch.empty(batch.num_nodes(), dtype=torch.long, device=self.device)
+                    inv[homo_nid] = torch.arange(batch.num_nodes(), device=self.device)
+                    src = inv[orig_src]
+                    dst = inv[orig_dst]
+                    edge_index = torch.stack([src, dst], dim=0)
+
                 z, out = self.model(batch, edge_index)
-            self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
-        return labels, out
-    
-    
+
+                if not self.no_contrastive:
+                    args = (z, neg_stmt_idx) if 'neg_stmt_idx' in locals() else (z,)
+                    z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
+                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                    loss = self.alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
+                else: loss = self.loss_fn(out.squeeze(-1), labels)
+
+                total_loss += loss.item() * out.size(0)
+                total_examples+= out.size(0)
+
+        avg_loss = total_loss / total_examples if total_examples else 0
+        return avg_loss, (out, labels)
+
     def run(self):
-        labels, out = self.test_epoch()
-        acc, f1, precision, recall, roc_auc = self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
-        print('Test Results:', flush=True)
-        print(f'Accuracy: {acc:.4f}, F1 Score (W): {f1:.4f}, Precision (+): {precision:.4f}, Recall (+): {recall:.4f}, Roc Auc: {roc_auc:.4f}', flush=True)
-        self.log.log("Test, final," + str(acc) + "," + str(f1)+ "," + str(precision)+ "," + str(recall)+ ","+ str(roc_auc))
-        
-        torch.save(self.model.state_dict(), self.log.dir + 'model_'+ self.model.__class__.__name__ +'.pth')
-        torch.save(out, self.log.dir + "predictions_" + self.model.__class__.__name__ + ".pth")
-        torch.save(labels, self.log.dir +  "labels_" + self.model.__class__.__name__ + ".pth")
-        self.log.close()
+        best_lr = None
+        best_val_loss = float('inf')
+        best_metrics  = None
+
+        for lr in self.lrs:
+            self.model.load_state_dict(self._init_state)
+            for pg in self.optimizer.param_groups: pg['lr'] = lr
+            self.earlystopper = EarlyStopping()
+            print(f"\n=== Starting sweep with LR = {lr} ===", flush=True)
+
+            for epoch in range(1, self.epochs + 1):
+                train_loss, _ = self.train_epoch()
+                val_loss, (out, lbls) = self.validate_epoch()
+
+                print(f"LR={lr} | Epoch {epoch}/{self.epochs} | "
+                    f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}",
+                    flush=True)
+                if self.earlystopper.step(val_loss, self.model):
+                    print(f" -- Early stopping at epoch {epoch}", flush=True)
+                    break
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_lr = lr
+                best_metrics = self.metrics.compute(out, lbls)
+
+        print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f} ***")
+        for name, val in zip(self.metrics.get_names(), best_metrics):
+            print(f"{name}: {val:.4f}")
+        return best_lr, best_val_loss, best_metrics
+
+

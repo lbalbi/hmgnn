@@ -42,7 +42,7 @@ class HGCN(nn.Module):
 
 
     def forward(self, graph: DGLHeteroGraph, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-
+        
         h_dict = {ntype: graph.nodes[ntype].data["feat"] for ntype in graph.ntypes}
 
         for layer in self.layers:

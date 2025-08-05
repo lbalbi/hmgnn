@@ -9,11 +9,12 @@ class DataLoader:
     
     def __init__(self, file_path: str,
                  use_pstatement_sampler: bool = False,
-                 use_nstatement_sampler: bool = False):
+                 use_nstatement_sampler: bool = False, use_rstatement_sampler: bool = False):
         
         self.file_path = file_path
         self.use_pstatement_sampler = use_pstatement_sampler
         self.use_nstatement_sampler = use_nstatement_sampler
+        self.use_rstatement_sampler = use_rstatement_sampler
         edge_files = self.path_files(file_path)
         self.data = self.load_data(edge_files)
 
@@ -26,6 +27,10 @@ class DataLoader:
         elif self.use_nstatement_sampler:
             if 'neg_statement' in self.data:
                 src, tgt = self.data.pop('neg_statement')
+                self.state_list = list(zip(src.tolist(), tgt.tolist()))
+        elif self.use_rstatement_sampler:
+            if 'neg_statement' in self.data:
+                src, tgt = self.data['neg_statement']
                 self.state_list = list(zip(src.tolist(), tgt.tolist()))
 
     @staticmethod

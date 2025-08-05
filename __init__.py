@@ -5,6 +5,7 @@ from samplers import *
 from parser import *
 from data_loader import *
 from .utils import *
+from .trainer_bestmodel import *
 from .trainer import *
 from .main import main
 

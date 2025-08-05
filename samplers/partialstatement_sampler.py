@@ -8,7 +8,7 @@ class PartialStatementSampler:
     for each node in the training graph. Designed for scenarios where only positive
     statement edges exist in the graph itself.
     """
-    def __init__(self, k: int = 2, go_etype: str = "GO", neg_edges: list = None):
+    def __init__(self, k: int = 2, go_etype: str = "link", neg_edges: list = None):
         """
         Args:
             k (int): number of negative samples per positive.
@@ -143,4 +143,4 @@ class PartialStatementSampler:
         neg_dst = neg_ei[1].view(N, self.k)
         z_pos_neg = z[neg_dst]
         # Return tuple: (z_pos, z_pos_pos, z_pos_neg, z_neg, z_neg_pos, z_neg_neg)
-        return z_pos, z_pos_pos, z_pos_neg, z_pos, z_pos_pos, z_pos_neg
+        return z_pos, z_pos_pos, z_pos_neg # , z_pos, z_pos_pos, z_pos_neg

@@ -1,4 +1,4 @@
 from .negative_sampler import NegativeSampler
-from .negativestatement_sampler_2 import NegativeStatementSampler
-from .partialstatement_sampler import PartialStatementSampler
+from .negativestatement_sampler_3 import NegativeStatementSampler
+from .partialstatement_sampler_2 import PartialStatementSampler
 from .randomstatement_sampler import RandomStatementSampler

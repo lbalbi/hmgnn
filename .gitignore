@@ -1,5 +1,6 @@
-ppi_data/
-gda_data/
+human_data/
+cerevisae_data/
+melanogaste_data/
 output/
 # Ignore Python cache files
 /__pycache__/
