@@ -1,8 +1,5 @@
-human_data/
-cerevisae_data/
-melanogaster_data/
+*_data/
 output/
-# Ignore Python cache files
 /__pycache__/
 */__pycache__/
 *.log

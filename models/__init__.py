@@ -1,5 +1,5 @@
 from .gcn import GCN
 from .gat import GAT
-from .hgat import HGAT
+from .gae import *
 from .hgcn import HGCN
 from .hpgcn import HPGCN

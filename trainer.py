@@ -95,7 +95,7 @@ class Train:
                 torch.zeros(neg_index.size(1), device=self.device)
             ], dim=0)
             # Homogeneous conversion
-            if self.model.__class__.__name__ in {"GCN", "GAT"}:
+            if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
                 orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                 for ntype in batch.ntypes:
                     num = batch.num_nodes(ntype)
@@ -154,7 +154,7 @@ class Train:
                 labels = torch.cat([torch.ones(pos_index.size(1),  device=self.device),
                     torch.zeros(neg_index.size(1), device=self.device)], dim=0)
 
-                if self.model.__class__.__name__ in {"GCN", "GAT"}:
+                if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
                     orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                     for ntype in batch.ntypes:
                         num = batch.num_nodes(ntype)

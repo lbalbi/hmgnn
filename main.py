@@ -1,6 +1,7 @@
 import argparse, torch
 from models import *
-from trainer import Train, Test
+from trainer import Train
+from trainer_bestmodel import Train_BestModel, Test_BestModel
 from utils import Logger
 from data_loader import DataLoader, Dglloader
 from utils import load_config
@@ -10,7 +11,7 @@ from statistics import mode
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default="human", help="Task to run: human, cerevisae, melanogaster")
-    parser.add_argument('--model', type=str, choices=["hgcn", "hpgcn", "hgat","gcn"], default="hgcn", help="Model to run")
+    parser.add_argument('--model', type=str, choices=["hgcn", "hpgcn", "hgat","gcn", "gae"], default="hgcn", help="Model to run")
     parser.add_argument('--epochs', type=int, default=250, help="Number of epochs for final training")
     parser.add_argument('--CV_epochs', type=int, default=250, help="Number of epochs for cross-validation")
     parser.add_argument('--batch_size', type=int, default=256*512, help="Batch size for training") 
@@ -106,12 +107,13 @@ def main():
         lr, loss, _ = trainer.run()
         best_lrs.append(lr)
     best_lr = mode(best_lrs)
+    
     final_model = ModelCls(in_feats=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                            e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_etype).to(device)
     final_model.load_state_dict(best_state)
     final_optim = torch.optim.Adam(final_model.parameters(), lr=best_lr)
     
-    final_trainer = Train(final_model, final_optim, args.epochs, trainval_loader, [], full_cvgraph=trainval_graph,
+    final_trainer = Train_BestModel(final_model, final_optim, args.epochs, trainval_loader, [], full_cvgraph=trainval_graph,
                           e_type=ppi_etype, log=Logger("final_train", dir=args.output_dir), device=device, 
                           contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
                           pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
@@ -121,7 +123,7 @@ def main():
     print(f"Final training loss: {loss:.4f}")
     
     final_log = Logger("final_test", dir= args.output_dir)
-    tester = Test(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=test_graph, device=device, 
+    tester = Test_BestModel(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=test_graph, device=device, 
                  task=args.task, gda_negs=dl.get_negative_edges() if args.path == "gda_data"  or args.path == "dp_data" else None)
     tester.run()
 

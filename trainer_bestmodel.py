@@ -4,9 +4,9 @@ from samplers import NegativeStatementSampler, PartialStatementSampler, Negative
 from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin
 
 class Train_BestModel:
-    def __init__(self, model, optimizer, epochs, train_loader, val_loader, full_cvgraph, e_type, log, device, task, lrs=[0.001], mcfg=None, cfg=None, gda_negs=None,
-        pstatement_sampler=False, nstatement_sampler=False, rstatement_sampler=False, contrastive_weight=0.1, gda_negs=None,
-        state_list=None, no_contrastive=False):
+    def __init__(self, model, optimizer, epochs, train_loader, val_loader, full_cvgraph, e_type, log, device, task, lrs=[0.001], mcfg=None, cfg=None,
+        pstatement_sampler=False, nstatement_sampler=False, rstatement_sampler=False, contrastive_weight=0.1, gda_negs=None, state_list=None, 
+        no_contrastive=False):
         self.model = model
         self.optimizer = optimizer
         self.lrs = lrs
@@ -76,8 +76,7 @@ class Train_BestModel:
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
 
-            if self.model.__class__.__name__ == "GCN" or self.model.__class__.__name__ == "GAT":
-
+            if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
                 orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                 for ntype in batch.ntypes: num = batch.num_nodes(ntype); batch.nodes[ntype].data[dgl.NID] = torch.arange(num, device=batch.device, dtype=torch.long)
                 batch = dgl.to_homogeneous(batch, ndata=['feat', dgl.NID], store_type=True).to(self.device)
@@ -138,8 +137,7 @@ class Train_BestModel:
                 labels = torch.cat([torch.ones(src.size(0), device=self.device),
                     torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
                 
-                if self.model.__class__.__name__ == "GCN" or self.model.__class__.__name__ == "GAT":
-
+                if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
                     orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                     for ntype in batch.ntypes: num = batch.num_nodes(ntype); batch.nodes[ntype].data[dgl.NID] = torch.arange(num, device=batch.device, dtype=torch.long)
                     batch = dgl.to_homogeneous(batch, ndata=['feat', dgl.NID], store_type=True).to(self.device)
@@ -207,8 +205,7 @@ class Test_BestModel:
             labels = torch.cat([torch.ones(src.size(0), device=self.device),
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
             
-            if self.model.__class__.__name__ == "GCN" or self.model.__class__.__name__ == "GAT":
-
+            if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
                 orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                 for ntype in batch.ntypes: num = batch.num_nodes(ntype); batch.nodes[ntype].data[dgl.NID] = torch.arange(num, device=batch.device, dtype=torch.long)
                 batch = dgl.to_homogeneous(batch, ndata=['feat', dgl.NID], store_type=True).to(self.device)
