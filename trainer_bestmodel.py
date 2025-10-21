@@ -4,12 +4,11 @@ from samplers import NegativeStatementSampler, PartialStatementSampler, Negative
 from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin
 
 class Train_BestModel:
-    def __init__(self, model, optimizer, epochs, train_loader, val_loader, full_cvgraph, e_type, log, device, task, lrs=[0.001], mcfg=None, cfg=None,
+    def __init__(self, model, epochs, train_loader, val_loader, full_cvgraph, e_type, log, device, task, lr=0.001, mcfg=None, cfg=None,
         pstatement_sampler=False, nstatement_sampler=False, rstatement_sampler=False, contrastive_weight=0.1, gda_negs=None, state_list=None, 
         no_contrastive=False):
         self.model = model
-        self.optimizer = optimizer
-        self.lrs = lrs
+        self.best_lr = lr
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
         self.e_type = e_type
@@ -76,7 +75,7 @@ class Train_BestModel:
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
             edge_index = torch.cat([edge_index, neg_edge_index], dim=1)
 
-            if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
+            if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                 orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                 for ntype in batch.ntypes: num = batch.num_nodes(ntype); batch.nodes[ntype].data[dgl.NID] = torch.arange(num, device=batch.device, dtype=torch.long)
                 batch = dgl.to_homogeneous(batch, ndata=['feat', dgl.NID], store_type=True).to(self.device)
@@ -137,7 +136,7 @@ class Train_BestModel:
                 labels = torch.cat([torch.ones(src.size(0), device=self.device),
                     torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
                 
-                if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
+                if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                     orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                     for ntype in batch.ntypes: num = batch.num_nodes(ntype); batch.nodes[ntype].data[dgl.NID] = torch.arange(num, device=batch.device, dtype=torch.long)
                     batch = dgl.to_homogeneous(batch, ndata=['feat', dgl.NID], store_type=True).to(self.device)
@@ -167,6 +166,8 @@ class Train_BestModel:
             return (total_loss / total_examples), (out, labels)
 
     def run(self):
+        self.model.load_state_dict(torch.load(self.log.dir + 'model_'+ self.model.__class__.__name__ +'.pth'))
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.best_lr)
         for epoch in range(self.epochs):
             train_loss, (out, labels) = self.train_epoch()
             if train_loss != 0: print(f'Epoch {epoch+1}/{self.epochs}, Train Loss: {train_loss:.4f}', flush=True)
@@ -205,7 +206,7 @@ class Test_BestModel:
             labels = torch.cat([torch.ones(src.size(0), device=self.device),
                 torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
             
-            if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
+            if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                 orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                 for ntype in batch.ntypes: num = batch.num_nodes(ntype); batch.nodes[ntype].data[dgl.NID] = torch.arange(num, device=batch.device, dtype=torch.long)
                 batch = dgl.to_homogeneous(batch, ndata=['feat', dgl.NID], store_type=True).to(self.device)
@@ -218,18 +219,19 @@ class Test_BestModel:
                 edge_index = torch.stack([src, dst], dim=0)
 
             with torch.no_grad():  z, out = self.model(batch, edge_index)
-            self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
         return labels, out
     
     
     def run(self):
-        torch.save(self.model.state_dict(), self.log.dir + 'model_'+ self.model.__class__.__name__ +'.pth')
+
         labels, out = self.test_epoch()
-        acc, f1, precision, recall, roc_auc = self.metrics.update(out.detach().to("cpu"), labels.to("cpu"))
-        print('Test Results:', flush=True)
-        print(f'Accuracy: {acc:.4f}, F1 Score (W): {f1:.4f}, Precision (+): {precision:.4f}, Recall (+): {recall:.4f}, Roc Auc: {roc_auc:.4f}', flush=True)
-        self.log.log("Test, final," + str(acc) + "," + str(f1)+ "," + str(precision)+ "," + str(recall)+ ","+ str(roc_auc))
-        
         torch.save(out, self.log.dir + "predictions_" + self.model.__class__.__name__ + ".pth")
         torch.save(labels, self.log.dir +  "labels_" + self.model.__class__.__name__ + ".pth")
+
+        acc, f1, precision_p, recall_p, precision_n, recall_n, roc_auc = self.metrics.update_all(out.detach().to("cpu"), labels.to("cpu"))
+        print('Test Results:', flush=True)
+        print(f'Accuracy: {acc:.4f}, F1 Score (W): {f1:.4f}, Precision (+): {precision_p:.4f}, Recall (+): {recall_p:.4f}, '
+              f'Precision (-): {precision_n:.4f}, Recall (-): {recall_n:.4f}, Roc Auc: {roc_auc:.4f}', flush=True)
+        self.log.log("Test, final," + str(acc) + "," + str(f1)+ "," + str(precision_p)+ "," + str(recall_p)+ 
+        "," + str(precision_n)+ "," + str(recall_n)+ "," + str(roc_auc))
         self.log.close()

@@ -95,7 +95,7 @@ class Train:
                 torch.zeros(neg_index.size(1), device=self.device)
             ], dim=0)
             # Homogeneous conversion
-            if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
+            if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                 orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                 for ntype in batch.ntypes:
                     num = batch.num_nodes(ntype)
@@ -154,7 +154,7 @@ class Train:
                 labels = torch.cat([torch.ones(pos_index.size(1),  device=self.device),
                     torch.zeros(neg_index.size(1), device=self.device)], dim=0)
 
-                if self.model.__class__.__name__ in {"GCN", "GAT", "GAE"}:
+                if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                     orig_src, orig_dst = edge_index[0].clone(), edge_index[1].clone()
                     for ntype in batch.ntypes:
                         num = batch.num_nodes(ntype)
@@ -208,9 +208,10 @@ class Train:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_lr = lr
-                best_metrics = self.metrics.compute(out, lbls)
+                best_metrics = self.metrics.update(out.detach().to("cpu"), lbls.to("cpu"))
+                torch.save(self.model.state_dict(), self.log.dir + 'model_'+ self.model.__class__.__name__ +'.pth')
 
-        print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f} ***")
+        print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}  ***")
         for name, val in zip(self.metrics.get_names(), best_metrics):
             print(f"{name}: {val:.4f}")
         return best_lr, best_val_loss, best_metrics

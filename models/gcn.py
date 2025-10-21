@@ -4,11 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dgl.nn import GraphConv
 from typing import List, Tuple, Dict
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from dgl.nn import GraphConv
-from typing import Dict, Tuple, List
 
 
 class GCN(nn.Module):

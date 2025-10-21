@@ -58,7 +58,7 @@ class DataLoader:
         return data_dict
     
 
-    def make_data_graph(self, data: Dict[str, Tuple[torch.Tensor, torch.Tensor]]) -> dgl.DGLGraph:
+    def make_data_graph(self, data: Dict[str, Tuple[torch.Tensor, torch.Tensor]], orthogonal: bool = False) -> dgl.DGLGraph:
         """Create a DGLGraph from the data dictionary."""
         g = dgl.heterograph({
             ("node", edge_type, "node"): (src.tolist(), tgt.tolist())
@@ -67,7 +67,9 @@ class DataLoader:
         
         for ntype in g.ntypes:
             num_nodes = g.num_nodes(ntype)
-            g.nodes[ntype].data['feat'] = torch.randn(num_nodes, 128)
+            embedding = torch.nn.Embedding(num_nodes, 128)
+            if orthogonal: g.nodes[ntype].data['feat'] = torch.nn.init.orthogonal_(embedding.weight)
+            else: g.nodes[ntype].data['feat'] = torch.randn(num_nodes, 128)
         return g
     
     

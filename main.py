@@ -24,9 +24,9 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ModelCls = eval(args.model.upper())
+    ModelCls = eval(args.model.upper()) if args.model != "gae" else eval("GCN_" + args.model.upper())
     cfg = load_config(task=args.task)
-    mcfg = cfg["models"][ModelCls.__name__]
+    mcfg = cfg["models"][ModelCls.__name__ if args.model != "gae" else "GAE"]
 
     dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatement_sampler,
                     use_nstatement_sampler=args.use_nstatement_sampler, use_rstatement_sampler=args.use_rstatement_sampler)
@@ -95,7 +95,7 @@ def main():
         model = ModelCls(in_feats=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                          e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_etype).to(device)
         optim = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
-        log = Logger(f"{ModelCls.__name__}_fold{fold}", dir=args.output_dir)
+        log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold}", dir=args.output_dir)
 
         trainer = Train(model, optim, args.CV_epochs, train_loader, val_loader,
                         e_type=ppi_etype, log=log, device=device, full_cvgraph=train_graph,
@@ -109,17 +109,15 @@ def main():
     best_lr = mode(best_lrs)
     
     final_model = ModelCls(in_feats=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
-                           e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_etype).to(device)
-    final_model.load_state_dict(best_state)
-    final_optim = torch.optim.Adam(final_model.parameters(), lr=best_lr)
+                           e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_etype).to(device)    
     
-    final_trainer = Train_BestModel(final_model, final_optim, args.epochs, trainval_loader, [], full_cvgraph=trainval_graph,
+    final_trainer = Train_BestModel(final_model, args.epochs, trainval_loader, [], full_cvgraph=trainval_graph,
                           e_type=ppi_etype, log=Logger("final_train", dir=args.output_dir), device=device, 
                           contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
                           pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
-                          rstatement_sampler=args.use_rstatement_sampler, task=args.task, lr=[best_lr],
+                          rstatement_sampler=args.use_rstatement_sampler, task=args.task, lr=best_lr,
                           gda_negs=dl.get_negative_edges() if args.path == "gda_data"  or args.path == "dp_data" else None, no_contrastive=args.no_contrastive)
-    lr, loss, _ = final_trainer.run()
+    loss, (pred, _) = final_trainer.run()
     print(f"Final training loss: {loss:.4f}")
     
     final_log = Logger("final_test", dir= args.output_dir)

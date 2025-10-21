@@ -109,8 +109,19 @@ class Metrics:
         self.roc_auc_value = roc_auc_score(labels, preds, average='weighted')
         return self.accuracy_value, self.f1_value, self.precision_value, self.recall_value, self.roc_auc_value
     
+    def update_all(self, preds, labels):
+        preds = torch.round(preds)
+        self.accuracy_value = accuracy_score(labels, preds)
+        self.f1_value = f1_score(labels, preds, average='weighted', zero_division=0)
+        self.precision_value_p = precision_score(labels, preds, zero_division=0)
+        self.recall_value_p = recall_score(labels, preds, zero_division=0)
+        self.precision_value_n = precision_score(labels, preds, pos_label=0, zero_division=0)
+        self.recall_value_n = recall_score(labels, preds, pos_label=0, zero_division=0)
+        self.roc_auc_value = roc_auc_score(labels, preds, average='weighted')
+        return self.accuracy_value, self.f1_value, self.precision_value_p, self.recall_value_p, self.precision_value_n, self.recall_value_n, self.roc_auc_value
+
     def get_names(self):
-        return ["accuracy, f1 score, precision, recall, roc auc"]
+        return ["accuracy", "f1 score", "precision", "recall", "roc auc"]
 
     
 import json
