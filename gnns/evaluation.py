@@ -1,4 +1,5 @@
 import sklearn.metrics, torch
+from torch_geometric.data import HeteroData
 import numpy as np
 
 def evaluate_pyg(model, g, labels, npairs, e_types, mask_, device_, val=False, save=False, homo=False):
