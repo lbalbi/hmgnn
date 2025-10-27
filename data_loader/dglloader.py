@@ -1,125 +1,149 @@
 import torch
-import dgl
-from typing import Optional, Iterator, Tuple, List
+from typing import Optional, Iterator, Tuple, List, Dict
+from torch_geometric.data import HeteroData
+
 
 class Dglloader:
     """
-    Splits a DGLHeteroGraph into train/validation/test subgraphs based on the source nodes
+    Splits a heterogeneous graph into train/validation subgraphs based on the source nodes
     of a given edge type (e.g. "PPI"). Allows iteration over mini-batch subgraphs by PPI-edge batches.
-
     Args:
-        graph (DGLHeteroGraph): Input full heterogeneous graph.
-        ppi_rel (str): Relation name for PPI edges (etype[1] in canonical_etypes).
+        graph (HeteroData): Input full heterogeneous graph.
+        ppi_rel (str): Relation name for PPI edges (etype[1] in edge_types).
         batch_size (int): Number of PPI edges per batch.
         val_split (float): Fraction of PPI source nodes for validation set.
-        test_split (float): Fraction of PPI source nodes for test set.
+        device (Optional[torch.device] or str): Device to move subgraphs to.
         shuffle (bool): Shuffle PPI source nodes before splitting.
         seed (Optional[int]): Random seed for reproducibility.
     """
-    def __init__(
-        self,
-        graph: dgl.DGLGraph,
-        ppi_rel: str = "PPI",
-        batch_size: int = 32,
-        val_split: float = 0.1,
-        device : Optional[torch.device] = "cpu",
-        shuffle: bool = True,
-        seed: Optional[int] = None,
-    ):
-        assert isinstance(graph, dgl.DGLGraph), "graph must be a DGLHeteroGraph"
-        self.graph = graph
+    def __init__( self, graph: HeteroData, ppi_rel: str = "PPI", batch_size: int = 32,
+        val_split: float = 0.1, device: Optional[torch.device] = "cpu", shuffle: bool = True,
+        seed: Optional[int] = None):
+        
+        assert isinstance(graph, HeteroData), "graph must be a PyG HeteroData"
+        self.graph: HeteroData = graph
         self.ppi_rel = ppi_rel
         self.batch_size = batch_size
         self.val_split = val_split
         self.shuffle = shuffle
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         if seed is not None: torch.manual_seed(seed)
-
-        self.ppi_etype = next(
-            (et for et in graph.canonical_etypes if et[1] == ppi_rel),
-            None
-        )
-        assert self.ppi_etype is not None, f"Relation '{ppi_rel}' not in graph.canonical_etypes"
-
-        self.other_etypes = [et for et in graph.canonical_etypes if et != self.ppi_etype]
-
+            
+        self.ppi_etype = next((et for et in graph.edge_types if et[1] == ppi_rel), None)
+        assert self.ppi_etype is not None, f"Relation '{ppi_rel}' not in graph.edge_types"
+        self.other_etypes: List[tuple] = [et for et in graph.edge_types if et != self.ppi_etype]
+        self._num_nodes: Dict[str, int] = self._infer_all_num_nodes()
         self._split_by_source_nodes()
         self.train_graph = self._create_split_graph(self.train_eids)
         self.val_graph = self._create_split_graph(self.val_eids)
 
 
-    def _split_by_source_nodes(self): # Get all PPI edges' source nodes and corresponding edge IDs
-        src, _ = self.graph.edges(etype=self.ppi_etype)
-        num_ppi = src.size(0)
-        edge_ids = torch.arange(num_ppi)
+    def _infer_all_num_nodes(self) -> Dict[str, int]:
+        """
+        Determine number of nodes per node type. Prefer stored `num_nodes` or
+        infer from max node id across incident edges.
+        """
+        num_nodes: Dict[str, int] = {}
+        for ntype in self.graph.node_types:
+            explicit = getattr(self.graph[ntype], "num_nodes", None)
+            if explicit is not None:
+                num_nodes[ntype] = int(explicit)
+                continue
+            max_id = -1
+            for (src_t, _, dst_t) in self.graph.edge_types:
+                ei = self.graph[(src_t, _, dst_t)].get("edge_index", None)
+                if ei is None: continue
+                if src_t == ntype and ei.size(1) > 0:
+                    max_id = max(max_id, int(ei[0].max().item()))
+                if dst_t == ntype and ei.size(1) > 0:
+                    max_id = max(max_id, int(ei[1].max().item()))
+            num_nodes[ntype] = max_id + 1 if max_id >= 0 else 0
+        return num_nodes
+
+    
+    def _split_by_source_nodes(self):
+        """Get all PPI edges' source nodes and corresponding edge IDs; split by unique sources."""
+        edge_index = self.graph[self.ppi_etype].edge_index
+        src = edge_index[0]
+        num_ppi = src.numel()
+        edge_ids = torch.arange(num_ppi, device=src.device)
         unique_src = torch.unique(src)
-
-        if self.shuffle:  unique_src = unique_src[torch.randperm(len(unique_src))]
-
+        if self.shuffle:
+            unique_src = unique_src[torch.randperm(len(unique_src), device=unique_src.device)]
         n_val = int(len(unique_src) * self.val_split)
         n_train = len(unique_src) - n_val
-
         train_src = unique_src[:n_train]
         val_src = unique_src[n_train:n_train + n_val]
-
         mask_train = torch.isin(src, train_src)
         mask_val = torch.isin(src, val_src)
+        self.train_eids = edge_ids[mask_train].cpu()
+        self.val_eids = edge_ids[mask_val].cpu()
 
-        self.train_eids = edge_ids[mask_train]
-        self.val_eids = edge_ids[mask_val]
-
-
-    def _create_split_graph(self, ppi_eids: torch.Tensor) -> dgl.DGLGraph:
+    
+    def _create_split_graph(self, ppi_eids: torch.Tensor) -> HeteroData:
         """
         Build a subgraph containing specified PPI edges (by edge IDs) and all edges of other types.
-        Preserves all original nodes.
+        Preserves all original nodes and copies node features if present.
+        Also stores original edge IDs in `orig_eid` per relation.
         """
-        eid_dict = {}
+        sub = HeteroData()
+        for ntype in self.graph.node_types:
+            sub[ntype].num_nodes = self._num_nodes[ntype]
+            for key, val in self.graph[ntype].items():
+                if key in ("x"): sub[ntype][key] = val
 
         for et in self.other_etypes:
-            num = self.graph.num_edges(et)
-            eid_dict[et] = torch.arange(num)
-        eid_dict[self.ppi_etype] = ppi_eids
+            store = self.graph[et]
+            if "edge_index" not in store: continue
+            ei = store.edge_index
+            sub[et].edge_index = ei
+            sub[et].orig_eid = torch.arange(ei.size(1), dtype=torch.long)
 
-        # Build edge-induced subgraph, preserving nodes
-        return dgl.edge_subgraph(self.graph, eid_dict, relabel_nodes=False, store_ids=True).to(self.device)
+            for key, val in store.items():
+                if key in ("edge_index", "orig_eid"): continue
+                if hasattr(val, "size") and val.size(0) == ei.size(1):
+                    sub[et][key] = val
 
-    def _batch_graphs(self, eids: torch.Tensor) -> Iterator[dgl.DGLGraph]:
-        """
-        Yield mini-batch subgraphs for slices of PPI edges.
-        """
+        ppi_store = self.graph[self.ppi_etype]
+        ppi_ei = ppi_store.edge_index[:, ppi_eids]
+        sub[self.ppi_etype].edge_index = ppi_ei
+        sub[self.ppi_etype].orig_eid = ppi_eids.clone()
+
+        for key, val in ppi_store.items():
+            if key in ("edge_index", "orig_eid"): continue
+            if hasattr(val, "size") and val.size(0) == ppi_store.edge_index.size(1):
+                sub[self.ppi_etype][key] = val[ppi_eids]
+        return sub.to(self.device)
+
+    
+    def _batch_graphs(self, eids: torch.Tensor) -> Iterator[HeteroData]:
+        """Yield mini-batch subgraphs for slices of PPI edges."""
         for start in range(0, len(eids), self.batch_size):
             batch_eids = eids[start:start + self.batch_size]
             yield self._create_split_graph(batch_eids)
 
-    def train_batches(self) -> Iterator[dgl.DGLGraph]:
+    def train_batches(self) -> Iterator[HeteroData]:
         """Iterate mini-batch train subgraphs."""
         return self._batch_graphs(self.train_eids)
 
-    def validation_batches(self) -> Iterator[dgl.DGLGraph]:
+    def validation_batches(self) -> Iterator[HeteroData]:
         """Iterate mini-batch validation subgraphs."""
         return self._batch_graphs(self.val_eids)
 
-    def get_split_graphs(self) -> Tuple[dgl.DGLGraph, dgl.DGLGraph, dgl.DGLGraph]:
-        """Return the full train/val/test heterographs."""
+    def get_split_graphs(self) -> Tuple[HeteroData, HeteroData]:
+        """Return the full train/val heterographs."""
         return self.train_graph, self.val_graph
 
     def get_relation(self) -> str:
-        """
-        Return the relation name used for PPI edges.
-        """
+        """Return the relation name used for PPI edges."""
         return self.ppi_rel
 
-    def __iter__(self) -> Iterator[dgl.DGLGraph]:
-        """
-        Iterate over mini-batch subgraphs for training.
-        """
+    def __iter__(self) -> Iterator[HeteroData]:
+        """Iterate over mini-batch subgraphs for training."""
         return self.train_batches()
-    
+
     def __len__(self) -> int:
-        """
-        Return the number of mini-batches in the training set.
-        """
+        """Return the number of mini-batches in the training set."""
         return (len(self.train_eids) + self.batch_size - 1) // self.batch_size
 
     def __repr__(self) -> str:
