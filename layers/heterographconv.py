@@ -3,7 +3,7 @@ import torch as th
 import torch.nn as nn
 
 class HeteroGraphConv(nn.Module):
-    r"""A generic module for computing convolution on heterogeneous graphs.
+    """A generic module for computing convolution on heterogeneous graphs.
     The heterograph convolution applies sub-modules on their associating
     relation graphs, which reads the features from source nodes and writes the
     updated ones to destination nodes. If multiple relations have the same
@@ -27,79 +27,51 @@ class HeteroGraphConv(nn.Module):
 
     def _get_module(self, etype):
         mod = self.mod_dict.get(etype, None)
-        if mod is not None:
-            return mod
+        if mod is not None: return mod
         if isinstance(etype, tuple):
-            # etype is canonical
             _, etype, _ = etype
             return self.mod_dict[etype]
-        raise KeyError(f"Cannot find module with edge type {etype}")
 
     def forward(self, g, inputs, mod_args=None, mod_kwargs=None):
-        if mod_args is None:
-            mod_args = {}
-        if mod_kwargs is None:
-            mod_kwargs = {}
-
+        
+        if mod_args is None: mod_args = {}
+        if mod_kwargs is None: mod_kwargs = {}
         outputs = {nty: [] for nty in g.dsttypes}
-
-        # Handle bipartite-block or full-graph uniformly
         if isinstance(inputs, tuple) or g.is_block:
-            if isinstance(inputs, tuple):
-                src_inputs, dst_inputs = inputs
+            if isinstance(inputs, tuple): src_inputs, dst_inputs = inputs
             else:
                 src_inputs = inputs
-                dst_inputs = {
-                    k: v[: g.number_of_dst_nodes(k)] for k, v in inputs.items()
-                }
+                dst_inputs = {k: v[: g.number_of_dst_nodes(k)] for k, v in inputs.items()}
 
             for stype, etype, dtype in g.canonical_etypes:
                 if stype not in src_inputs or dtype not in dst_inputs:
                     continue
                 rel_graph = g[stype, etype, dtype]
-
-                # unwrap per‐relation if needed
                 feat_src = src_inputs[stype]
-                if isinstance(feat_src, dict):
-                    feat_src = feat_src[etype]
+                if isinstance(feat_src, dict): feat_src = feat_src[etype]
                 feat_dst = dst_inputs[dtype]
-                if isinstance(feat_dst, dict):
-                    feat_dst = feat_dst[etype]
+                if isinstance(feat_dst, dict): feat_dst = feat_dst[etype]
 
                 dstdata = self._get_module((stype, etype, dtype))(
-                    rel_graph,
-                    (feat_src, feat_dst),
-                    *mod_args.get(etype, ()),
-                    **mod_kwargs.get(etype, {})
-                )
+                    rel_graph,(feat_src, feat_dst),*mod_args.get(etype, ()),
+                    **mod_kwargs.get(etype, {}))
                 outputs[dtype].append((etype, dstdata))
         else:
             for stype, etype, dtype in g.canonical_etypes:
-                if stype not in inputs:
-                    continue
+                if stype not in inputs: continue
                 rel_graph = g[stype, etype, dtype]
-
-                # unwrap per‐relation if needed
                 feat_src = inputs[stype]
-                if isinstance(feat_src, dict):
-                    feat_src = feat_src[etype]
+                if isinstance(feat_src, dict): feat_src = feat_src[etype]
                 feat_dst = inputs[dtype]
-                if isinstance(feat_dst, dict):
-                    feat_dst = feat_dst[etype]
+                if isinstance(feat_dst, dict): feat_dst = feat_dst[etype]
 
-                dstdata = self._get_module((stype, etype, dtype))(
-                    rel_graph,
-                    (feat_src, feat_dst),
-                    *mod_args.get(etype, ()),
-                    **mod_kwargs.get(etype, {})
-                )
+                dstdata = self._get_module((stype, etype, dtype))(rel_graph, (feat_src, feat_dst),
+                    *mod_args.get(etype, ()),**mod_kwargs.get(etype, {}))
                 outputs[dtype].append((etype, dstdata))
 
-        # aggregate per‐relation results
         rsts = {}
         for nty, alist in outputs.items():
-            if alist:
-                rsts[nty] = self.agg_fn(alist, nty)
+            if alist: rsts[nty] = self.agg_fn(alist, nty)
         return rsts
 
 
