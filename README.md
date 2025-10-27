@@ -17,3 +17,6 @@ Re-implemented from DGL to PyG so far:
 - DataLoader
 - GNNs
 - Layers
+
+Implementation agnostic:
+- Utils
