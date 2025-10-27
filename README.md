@@ -12,3 +12,7 @@ sbatch run.sh
 ```
 
 This pipeline is extensible to other GNNs and datasets by adding their parameters and metadata to the config.json file.
+
+Re-implemented from DGL to PyG so far:
+- DataLoader
+- GNNs
