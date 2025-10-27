@@ -64,7 +64,7 @@ def train(model, device, train_ppis, train_neg_ppis, train_pos_labels, train_neg
         optimizer.step()
     print("Testing final model . . .", flush=True)
     test_dict = masking(test_dict, [i for i in range(len(test_ppis))], "has_edge", "all", device)
-    test_acc, test_f1, test_pr, test_re, test_roc_auc = evaluate_dgl(model, test_dict, torch.cat((torch.ones(len(test_ppis)),
+    test_acc, test_f1, test_pr, test_re, test_roc_auc = evaluate_pyg(model, test_dict, torch.cat((torch.ones(len(test_ppis)),
                         torch.zeros(len(test_neg_ppis)))), test_neg_ppis, e_types=["has_edge"], mask_="all", device_=device, save=True, homo=True)
     return test_acc, test_f1, test_pr, test_re, test_roc_auc
 
@@ -123,5 +123,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
