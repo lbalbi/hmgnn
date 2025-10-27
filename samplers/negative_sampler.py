@@ -1,10 +1,4 @@
-import dgl
-import torch
-import random
-
-import dgl
-import torch
-import random
+import dgl, torch
 
 class NegativeSampler:
     """

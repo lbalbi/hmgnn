@@ -1,7 +1,4 @@
-import torch
-import random
-import dgl
-
+import torch, dgl
 class NegativeStatementSampler:
     """
     A sampler that draws k negatives (and one positive) for each anchor node in the

@@ -1,6 +1,4 @@
-import random
-import torch
-import dgl
+import random, torch, dgl
 
 class RandomStatementSampler:
     """
