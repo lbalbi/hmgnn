@@ -57,9 +57,9 @@ def main():
     eid_dict[ppi_etype] = trainval_eids
     trainval_graph = full_graph.edge_subgraph(eid_dict, relabel_nodes=False, store_ids=True)
 
-    trainval_loader = Dglloader(trainval_graph, ppi_rel=ppi_etype, batch_size=args.batch_size,
+    trainval_loader = Pygloader(trainval_graph, ppi_rel=ppi_etype, batch_size=args.batch_size,
                        val_split=0.1, device=device, seed=42)
-    test_loader = Dglloader(test_graph, ppi_rel=ppi_etype, batch_size=args.batch_size,
+    test_loader = Pygloader(test_graph, ppi_rel=ppi_etype, batch_size=args.batch_size,
                        val_split=0, device=device, seed=42)
 
     kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
@@ -89,8 +89,8 @@ def main():
         train_graph = full_graph.edge_subgraph(eid_dict_train, relabel_nodes=False, store_ids=True)
         val_graph = full_graph.edge_subgraph(eid_dict_val, relabel_nodes=False, store_ids=True)
 
-        train_loader = Dglloader(train_graph, ppi_rel=ppi_etype, val_split=0, batch_size=args.batch_size, device=device).train_batches()
-        val_loader = Dglloader(val_graph, ppi_rel=ppi_etype, val_split=0, batch_size=args.batch_size, device=device).train_batches()
+        train_loader = Pygloader(train_graph, ppi_rel=ppi_etype, val_split=0, batch_size=args.batch_size, device=device).train_batches()
+        val_loader = Pygloader(val_graph, ppi_rel=ppi_etype, val_split=0, batch_size=args.batch_size, device=device).train_batches()
 
         model = ModelCls(in_feats=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                          e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_etype).to(device)
