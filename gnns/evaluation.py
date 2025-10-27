@@ -1,4 +1,4 @@
-import sklearn.metrics, torch, dgl
+import sklearn.metrics, torch
 import numpy as np
 
 def evaluate_pyg(model, g, labels, npairs, e_types, mask_, device_, val=False, save=False, homo=False):
