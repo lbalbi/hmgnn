@@ -10,7 +10,7 @@ def train(model, device, train_ppis, train_neg_ppis, train_pos_labels, train_neg
     print("Training model: ", model.name, flush=True)
     train_dict_, test_dict = make_homographs( device, train_ppis, 
                                           test_ppis, go_links, pos_annots, neg_annots, rem_go, rem_pos, rem_neg)
-    best_f1 = 0
+    best_f1, best_epoch, best_acc = 0, 0, 0
     optimizer = torch.optim.Adam(model.parameters())
     from sklearn.model_selection import KFold
     skf = KFold(n_splits=10, shuffle=True, random_state=0)
@@ -28,7 +28,6 @@ def train(model, device, train_ppis, train_neg_ppis, train_pos_labels, train_neg
         model.reset_parameters()
         loss = torch.nn.BCELoss()
         for epoch in range(1, epochs +1):
-
             model.train()
             optimizer.zero_grad()
             logits = torch.squeeze(model(train_dict, e_types=["has_edge"], n_pairs=train_npairs.to(device),
@@ -42,7 +41,6 @@ def train(model, device, train_ppis, train_neg_ppis, train_pos_labels, train_neg
             if epoch % 5 == 0:
                 acc, f1, pr, re, roc_auc = evaluate_dgl(model, val_dict, torch.cat((val_pos_labels_, val_neg_labels_)),
                                                      val_npairs, e_types = ["has_edge"], mask_ = "valid", device_=device)
-
                 if f1 > best_f1 and epoch > (epochs+1)/3:
                     best_epoch = epoch
                     best_acc = acc
@@ -97,7 +95,7 @@ def main():
 
     pos_annots = torch.tensor(pandas.read_csv(args.positive_annotations, header=None, index_col=False).values)
     neg_annots = torch.tensor(pandas.read_csv(args.negative_annotations, header=None, index_col=False).values)
-
+          
     if args.remove_contradictions == 1: pos_annots = pos_annots[~numpy.isin(pos_annots, 
                         pandas.read_csv(args.direct_contradictions, header=None, index_col=False).values).all(1)]
     if args.remove_contradictions == 2: pos_annots = pos_annots[~numpy.isin(pos_annots, numpy.concatenate(
@@ -112,7 +110,6 @@ def main():
         test_ppis = numpy.array([e for e in ppis if tuple(e) not in used_ppis])
         test_neg_ppis = numpy.array([e for e in neg_ppis if tuple(e) not in used_neg_ppis])
     else: train_ppis, test_ppis, train_neg_ppis, test_neg_ppis = mask_edges(ppis, neg_ppis, partition=0.9)
-
     train_pos_labels, train_neg_labels = torch.ones(len(train_ppis)), torch.zeros(len(train_neg_ppis))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -126,4 +123,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
