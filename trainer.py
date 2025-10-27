@@ -1,6 +1,5 @@
 import copy
 import torch
-import dgl
 from utils import Metrics, EarlyStopping
 from samplers import (
     NegativeStatementSampler,
