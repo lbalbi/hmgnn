@@ -31,7 +31,8 @@ def train(model, device, train_ppis, train_neg_ppis, train_pos_labels, train_neg
 
             model.train()
             optimizer.zero_grad()
-            logits = torch.squeeze(model(train_dict, train_npairs, e_types = ["has_edge"], mask = "train"))
+            logits = torch.squeeze(model(train_dict, e_types=["has_edge"], n_pairs=train_npairs.to(device),
+                    predictee_n="node", mask="train",val=False))
             loss_ = loss(logits, torch.cat((train_pos_labels_,train_neg_labels_)).to(device))
             loss_.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -57,7 +58,8 @@ def train(model, device, train_ppis, train_neg_ppis, train_pos_labels, train_neg
         optimizer.zero_grad()
         all_idx = torch.cat((torch.tensor(train_idx).to(torch.int64), torch.tensor(val_idx).to(torch.int64)))
         train_dict_ = masking(train_dict_, all_idx, "has_edge", "all", device)
-        logits = torch.squeeze(model(train_dict_.to(device), train_neg_ppis, e_types=["has_edge"], mask="all"))
+        logits = torch.squeeze(model(train_dict_.to(device), e_types=["has_edge"], n_pairs=train_neg_ppis.to(device),
+              predictee_n="node", mask="all", val=False))
         loss_ = loss(logits, torch.cat((train_pos_labels, train_neg_labels)).to(device))
         loss_.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -124,3 +126,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
