@@ -3,7 +3,7 @@ from models import *
 from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
 from utils import Logger
-from data_loader import DataLoader, Dglloader
+from data_loader import DataLoader, Pygloader
 from utils import load_config
 from sklearn.model_selection import KFold, train_test_split
 from statistics import mode
