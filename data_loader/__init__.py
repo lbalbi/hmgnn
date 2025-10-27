@@ -1,3 +1,3 @@
 from .dataloader import *
-from .dglloader import *
+from .pygloader import *
 from .owldataloader import *
