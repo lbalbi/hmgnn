@@ -3,7 +3,7 @@ from typing import Optional, Iterator, Tuple, List, Dict
 from torch_geometric.data import HeteroData
 
 
-class Dglloader:
+class Pygloader:
     """
     Splits a heterogeneous graph into train/validation subgraphs based on the source nodes
     of a given edge type (e.g. "PPI"). Allows iteration over mini-batch subgraphs by PPI-edge batches.
