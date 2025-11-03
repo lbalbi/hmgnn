@@ -3,6 +3,12 @@ def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
+
+import json
+def load_config(task, path="config.json"):
+    with open(task + "_"+ path, "r") as f:
+        return json.load(f)
+    
 class Logger:
 
     def __init__(self, name, dir= ""):
@@ -123,8 +129,13 @@ class Metrics:
     def get_names(self):
         return ["accuracy", "f1 score", "precision", "recall", "roc auc"]
 
-    
-import json
-def load_config(task, path="config.json"):
-    with open(task + "_"+ path, "r") as f:
-        return json.load(f)
+
+
+# PyG helpers
+def _target_edge_key(model, e_type, n_type_fallback="node"):
+    n_type = getattr(model, "n_type", n_type_fallback)
+    return (n_type, e_type, n_type), n_type
+
+def _get_pos_edge_index(model, e_type, data):
+    key, _ = _target_edge_key(model, e_type)
+    return data.edge_index_dict[key]

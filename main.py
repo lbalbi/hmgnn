@@ -2,9 +2,8 @@ import argparse, torch
 from models import *
 from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
-from utils import Logger
+from utils import Logger, load_config
 from data_loader import DataLoader, Pygloader
-from utils import load_config
 from sklearn.model_selection import KFold, train_test_split
 from statistics import mode
 
@@ -29,100 +28,78 @@ def main():
     mcfg = cfg["models"][ModelCls.__name__ if args.model != "gae" else "GAE"]
 
     dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatement_sampler,
-                    use_nstatement_sampler=args.use_nstatement_sampler, use_rstatement_sampler=args.use_rstatement_sampler)
+        use_nstatement_sampler=args.use_nstatement_sampler, use_rstatement_sampler=args.use_rstatement_sampler)
+
     state_list = None
     if args.use_pstatement_sampler or args.use_nstatement_sampler: state_list = dl.get_state_list()
-    if args.use_pstatement_sampler: mcfg["edge_types"].remove(["node","pos_statement","node"])
-    elif args.use_nstatement_sampler: mcfg["edge_types"].remove(["node","neg_statement","node"])
+    if args.use_pstatement_sampler and ["node","pos_statement","node"] in mcfg["edge_types"]:
+        mcfg["edge_types"].remove(["node","pos_statement","node"])
+    elif args.use_nstatement_sampler and ["node","neg_statement","node"] in mcfg["edge_types"]:
+        mcfg["edge_types"].remove(["node","neg_statement","node"])
 
     full_graph = dl.make_data_graph(dl.get_data())
-    ppi_etype = mcfg["ppi_etype"]
-    src_all, dst_all = full_graph.edges(etype=ppi_etype)
-    edge_pairs = list(zip(src_all.tolist(), dst_all.tolist()))
-    trainval_pairs, test_pairs = train_test_split(edge_pairs, test_size=0.1, random_state=42, shuffle=True) 
+    ppi_rel = mcfg["ppi_etype"][1] if isinstance(mcfg["ppi_etype"], (list, tuple)) else mcfg["ppi_etype"]
+    ppi_key = next((et for et in full_graph.edge_types if et[1] == ppi_rel), None)
+    ppi_ei = full_graph[ppi_key].edge_index
+    all_eids = torch.arange(ppi_ei.size(1))
+    trainval_eids_np, test_eids_np = train_test_split(all_eids.cpu().numpy(), test_size=0.1, random_state=42, shuffle=True)
+    trainval_eids = torch.tensor(trainval_eids_np, dtype=torch.long)
+    test_eids = torch.tensor(test_eids_np, dtype=torch.long)
 
-    all_etypes = full_graph.canonical_etypes
-    test_src, test_dst = zip(*test_pairs)
-    test_src,test_dst = torch.tensor(test_src), torch.tensor(test_dst)
-    test_eids = full_graph.edge_ids(test_src, test_dst, etype=ppi_etype)
-    eid_dict = {et: full_graph.edges(form='eid', etype=et) for et in all_etypes}
-    eid_dict[ppi_etype] = test_eids
-    test_graph = full_graph.edge_subgraph(eid_dict, relabel_nodes=False, store_ids=True)
-
-    trainval_src, trainval_dst = zip(*trainval_pairs)
-    trainval_src = torch.tensor(trainval_src)
-    trainval_dst = torch.tensor(trainval_dst)
-    trainval_eids = full_graph.edge_ids(trainval_src, trainval_dst, etype=ppi_etype)
-    eid_dict = {et: full_graph.edges(form='eid', etype=et) for et in all_etypes}
-    eid_dict[ppi_etype] = trainval_eids
-    trainval_graph = full_graph.edge_subgraph(eid_dict, relabel_nodes=False, store_ids=True)
-
-    trainval_loader = Pygloader(trainval_graph, ppi_rel=ppi_etype, batch_size=args.batch_size,
-                       val_split=0.1, device=device, seed=42)
-    test_loader = Pygloader(test_graph, ppi_rel=ppi_etype, batch_size=args.batch_size,
-                       val_split=0, device=device, seed=42)
+    split_helper = Pygloader(full_graph, ppi_rel=ppi_rel, batch_size=args.batch_size, val_split=0, device=device)
+    trainval_graph = split_helper._create_split_graph(trainval_eids)
+    test_graph = split_helper._create_split_graph(test_eids)
+    trainval_loader = Pygloader(trainval_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
+                                val_split=0.1, device=device, seed=42)
+    test_loader = Pygloader(test_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
+                            val_split=0.0, device=device, seed=42)
 
     kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
-    best_f1 = -1.0
-    best_lrs = []
-    best_state = None
-    for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_pairs), 1):
+    best_lrs, best_f1 = [], -1.0
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
         print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
 
-        fold_train_pairs = [trainval_pairs[i] for i in train_idx]
-        fold_val_pairs = [trainval_pairs[i] for i in val_idx]
-        train_src, train_dst = zip(*fold_train_pairs)
-        val_src, val_dst = zip(*fold_val_pairs)
-        train_src = torch.tensor(train_src)
-        train_dst = torch.tensor(train_dst)
-        val_src = torch.tensor(val_src)
-        val_dst = torch.tensor(val_dst)
+        fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
+        fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
+        fold_train_graph = split_helper._create_split_graph(fold_train_eids)
+        fold_val_graph = split_helper._create_split_graph(fold_val_eids)
+        train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
+                                 batch_size=args.batch_size, device=device).train_batches()
+        val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
+                               batch_size=args.batch_size, device=device).train_batches()
 
-        train_eids = full_graph.edge_ids(train_src, train_dst, etype=ppi_etype)
-        val_eids = full_graph.edge_ids(val_src, val_dst, etype=ppi_etype)
-
-        eid_dict_train = {et: full_graph.edges(form='eid', etype=et) for et in all_etypes}
-        eid_dict_val = {et: full_graph.edges(form='eid', etype=et) for et in all_etypes}
-        eid_dict_train[ppi_etype] = train_eids
-        eid_dict_val[ppi_etype] = val_eids
-
-        train_graph = full_graph.edge_subgraph(eid_dict_train, relabel_nodes=False, store_ids=True)
-        val_graph = full_graph.edge_subgraph(eid_dict_val, relabel_nodes=False, store_ids=True)
-
-        train_loader = Pygloader(train_graph, ppi_rel=ppi_etype, val_split=0, batch_size=args.batch_size, device=device).train_batches()
-        val_loader = Pygloader(val_graph, ppi_rel=ppi_etype, val_split=0, batch_size=args.batch_size, device=device).train_batches()
-
-        model = ModelCls(in_feats=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
-                         e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_etype).to(device)
+        model = ModelCls(hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
+            e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_rel).to(device)
         optim = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
         log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold}", dir=args.output_dir)
-
-        trainer = Train(model, optim, args.CV_epochs, train_loader, val_loader,
-                        e_type=ppi_etype, log=log, device=device, full_cvgraph=train_graph,
-                        contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
-                        pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
-                        rstatement_sampler=args.use_rstatement_sampler, task=args.task,
-                        gda_negs=dl.get_negative_edges() if args.path == "gda_data" or args.path == "dp_data" else None, no_contrastive=args.no_contrastive)
-
+        gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
+                   (args.path == "gda_data" or args.path == "dp_data") else None
+        trainer = Train(model, optim, args.CV_epochs, train_loader, val_loader,e_type=ppi_rel, log=log, 
+            device=device, full_cvgraph=fold_train_graph, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+            pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
+            rstatement_sampler=args.use_rstatement_sampler, task=args.task,gda_negs=gda_negs, no_contrastive=args.no_contrastive)
         lr, loss, _ = trainer.run()
         best_lrs.append(lr)
     best_lr = mode(best_lrs)
+
+    final_model = ModelCls(hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
+                e_etypes=[tuple(e) for e in mcfg["edge_types"]],ppi_etype=ppi_rel).to(device)
     
-    final_model = ModelCls(in_feats=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
-                           e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_etype).to(device)    
-    
-    final_trainer = Train_BestModel(final_model, args.epochs, trainval_loader, [], full_cvgraph=trainval_graph,
-                          e_type=ppi_etype, log=Logger("final_train", dir=args.output_dir), device=device, 
-                          contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
-                          pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
-                          rstatement_sampler=args.use_rstatement_sampler, task=args.task, lr=best_lr,
-                          gda_negs=dl.get_negative_edges() if args.path == "gda_data"  or args.path == "dp_data" else None, no_contrastive=args.no_contrastive)
+    final_log = Logger("final_train", dir=args.output_dir)
+    gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
+        (args.path == "gda_data" or args.path == "dp_data") else None
+    final_trainer = Train_BestModel(final_model, args.epochs, trainval_loader, [], 
+        full_cvgraph=trainval_graph, e_type=ppi_rel, log=final_log, device=device, task=args.task, lr=best_lr,
+        contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+        pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
+        rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
     loss, (pred, _) = final_trainer.run()
     print(f"Final training loss: {loss:.4f}")
-    
-    final_log = Logger("final_test", dir= args.output_dir)
-    tester = Test_BestModel(final_model, test_loader=test_loader, e_type=ppi_etype, log=final_log, full_graph=test_graph, device=device, 
-                 task=args.task, gda_negs=dl.get_negative_edges() if args.path == "gda_data"  or args.path == "dp_data" else None)
+
+    final_log_test = Logger("final_test", dir=args.output_dir)
+    tester = Test_BestModel(final_model, test_loader=test_loader, e_type=ppi_rel, log=final_log_test,
+        full_graph=test_graph, device=device, task=args.task, gda_negs=gda_negs)
     tester.run()
 
 if __name__ == "__main__":
