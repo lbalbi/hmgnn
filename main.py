@@ -65,9 +65,9 @@ def main():
         fold_train_graph = split_helper._create_split_graph(fold_train_eids)
         fold_val_graph = split_helper._create_split_graph(fold_val_eids)
         train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
-                                 batch_size=args.batch_size, device=device).train_batches()
+                                 batch_size=args.batch_size, device=device)
         val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
-                               batch_size=args.batch_size, device=device).train_batches()
+                               batch_size=args.batch_size, device=device)
 
         model = ModelCls(hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
             e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_rel).to(device)
