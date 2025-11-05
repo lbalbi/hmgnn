@@ -176,12 +176,13 @@ class Train:
         best_metrics  = None
 
         for lr_ in self.lrs:
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr_)
             self.model.load_state_dict(self._init_state)
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr_)
             for pg in self.optimizer.param_groups:
                 pg['lr'] = lr_
             self.earlystopper = EarlyStopping()
             print(f"\n=== Starting sweep with LR = {lr_} ===", flush=True)
+
             for epoch in range(1, self.epochs + 1):
                 train_loss, _ = self.train_epoch()
                 val_loss, (out, lbls) = self.validate_epoch()

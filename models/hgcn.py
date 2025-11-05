@@ -11,8 +11,9 @@ class HGCN(nn.Module):
     The `edge_index` passed to forward() are the candidate node pairs (on `n_type`) to classify.
     """
 
-    def __init__(self, hidden_dim: int, out_dim: int, n_layers: int = 2, ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"), 
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, n_layers: int = 2, ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"), 
                  n_type: str = "node", e_etypes: Optional[List[Tuple[str, str, str]]] = None):
+                 
         super().__init__()
         self.ppi_etype = ppi_etype
         self.e_types = e_etypes
@@ -20,14 +21,14 @@ class HGCN(nn.Module):
 
         self.convs = nn.ModuleList()
         for _ in range(n_layers):
-            conv_dict = {(src, rel, dst): GCNConv(-1, hidden_dim, add_self_loops=True, normalize=True)
+            in_ch = in_dim[n_type] if _ == 0 else hidden_dim
+            conv_dict = {(src, rel, dst): GCNConv(in_ch, hidden_dim, add_self_loops=True, normalize=True)
                 for (src, rel, dst) in e_etypes}
             self.convs.append(HeteroConv(conv_dict, aggr='mean'))
         self.classify = nn.Linear(2 * hidden_dim, out_dim)
 
 
     def forward(self, data, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-
         x_dict = data.x_dict
         edge_index_dict = data.edge_index_dict
         h_dict = x_dict
@@ -39,6 +40,6 @@ class HGCN(nn.Module):
         hd = h_dict[self.n_type][dst_ids]
         h_pair = torch.cat([hs, hd], dim=1)
         logits = self.classify(h_pair)
-
+        
         z = h_dict[self.n_type]
         return z, torch.sigmoid(logits)

@@ -14,9 +14,12 @@ def main():
     parser.add_argument('--epochs', type=int, default=250, help="Number of epochs for final training")
     parser.add_argument('--CV_epochs', type=int, default=250, help="Number of epochs for cross-validation")
     parser.add_argument('--batch_size', type=int, default=256*512, help="Batch size for training") 
-    parser.add_argument('--use_pstatement_sampler', action='store_true', help="Use partial statement sampler")
-    parser.add_argument('--use_nstatement_sampler', action='store_true', help="Use negative statement sampler")
-    parser.add_argument('--use_rstatement_sampler', action='store_true', help="Use random statement sampler")
+    parser.add_argument('--use_pstatement_sampler', action='store_true', help="Use positive statement sampler to remove \
+        positives from graph but keep in sampling")
+    parser.add_argument('--use_nstatement_sampler', action='store_true', help="Use negative statement sampler to remove \
+        negatives from graph but keep in sampling")
+    parser.add_argument('--use_rstatement_sampler', action='store_true', help="Use random statement sampler to not use \
+    statements in sampling")
     parser.add_argument('--no_contrastive', action='store_true', help="Disable contrastive learning")
     parser.add_argument('--path', type=str, default="human_data", help="Path to the dataset directory")
     parser.add_argument('--output_dir', type=str, default="", help="Directory to save output logs and models")
@@ -69,7 +72,7 @@ def main():
         val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
                                batch_size=args.batch_size, device=device)
 
-        model = ModelCls(hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
+        model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
             e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_rel).to(device)
         log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold}", dir=args.output_dir)
         gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
@@ -84,7 +87,7 @@ def main():
     best_lr = mode(best_lrs)
     best_epoch = mode(best_epochs)
 
-    final_model = ModelCls(hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
+    final_model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                 e_etypes=[tuple(e) for e in mcfg["edge_types"]],ppi_etype=ppi_rel).to(device)
     
     final_log = Logger("final_train", dir=args.output_dir)

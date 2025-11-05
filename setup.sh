@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=setup_env
-#SBATCH --nodelist=opel
 #SBATCH --output=./output/setup.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
-#SBATCH --partition=compute
+#SBATCH --nodelist=liseda-05
+#SBATCH --partition=tier3
 
 
 ENV_DIR="${1:-.venv}"

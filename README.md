@@ -11,12 +11,7 @@ To run the full pipeline for the Contrastive Relational GNN execute the followin
 sbatch run.sh
 ```
 
+Within the .sh file you can pass specific arguments to change the experimental settings; see the examples provided in the file.
+
 This pipeline is extensible to other GNNs and datasets by adding their parameters and metadata to the config.json file.
 
-Re-implemented from DGL to PyG so far:
-- DataLoader
-- GNNs
-- Layers
-
-Implementation agnostic:
-- Utils
