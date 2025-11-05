@@ -19,7 +19,6 @@ class Train:
         self.epochs = epochs
         self.lrs = lrs
         self.model = model.to(self.device)
-        self.optimizer = optimizer
         self._init_state = copy.deepcopy(self.model.state_dict())
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
@@ -176,23 +175,24 @@ class Train:
         best_val_loss = float('inf')
         best_metrics  = None
 
-        for lr in self.lrs:
+        for lr_ in self.lrs:
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr_)
             self.model.load_state_dict(self._init_state)
             for pg in self.optimizer.param_groups:
-                pg['lr'] = lr
+                pg['lr'] = lr_
             self.earlystopper = EarlyStopping()
-            print(f"\n=== Starting sweep with LR = {lr} ===", flush=True)
+            print(f"\n=== Starting sweep with LR = {lr_} ===", flush=True)
             for epoch in range(1, self.epochs + 1):
                 train_loss, _ = self.train_epoch()
                 val_loss, (out, lbls) = self.validate_epoch()
-                print(f"LR={lr} | Epoch {epoch}/{self.epochs} | "
+                print(f"LR={lr_} | Epoch {epoch}/{self.epochs} | "
                     f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}", flush=True)
                 if self.earlystopper.step(val_loss, self.model):
                     print(f" -- Early stopping at epoch {epoch}", flush=True)
                     break
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_lr = lr
+                best_lr = lr_
                 best_metrics = self.metrics.update(out.detach().to("cpu"), lbls.to("cpu"))
                 torch.save(self.model.state_dict(), self.log.dir + 'model_' + self.model.__class__.__name__ + '.pth')
 

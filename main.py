@@ -14,7 +14,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=250, help="Number of epochs for final training")
     parser.add_argument('--CV_epochs', type=int, default=250, help="Number of epochs for cross-validation")
     parser.add_argument('--batch_size', type=int, default=256*512, help="Batch size for training") 
-    parser.add_argument('--use_pstatement_sampler', action='store_true', help="Use positive statement sampler")
+    parser.add_argument('--use_pstatement_sampler', action='store_true', help="Use partial statement sampler")
     parser.add_argument('--use_nstatement_sampler', action='store_true', help="Use negative statement sampler")
     parser.add_argument('--use_rstatement_sampler', action='store_true', help="Use random statement sampler")
     parser.add_argument('--no_contrastive', action='store_true', help="Disable contrastive learning")
@@ -71,11 +71,10 @@ def main():
 
         model = ModelCls(hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
             e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_rel).to(device)
-        optim = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
         log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold}", dir=args.output_dir)
         gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
                    (args.path == "gda_data" or args.path == "dp_data") else None
-        trainer = Train(model, optim, args.CV_epochs, train_loader, val_loader,e_type=ppi_rel, log=log, 
+        trainer = Train(model, args.CV_epochs, train_loader, val_loader,e_type=ppi_rel, log=log, lrs=cfg["lrs"],
             device=device, full_cvgraph=fold_train_graph, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
             pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
             rstatement_sampler=args.use_rstatement_sampler, task=args.task,gda_negs=gda_negs, no_contrastive=args.no_contrastive)
