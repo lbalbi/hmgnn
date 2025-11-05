@@ -189,14 +189,16 @@ class Train:
                     f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}", flush=True)
                 if self.earlystopper.step(val_loss, self.model):
                     print(f" -- Early stopping at epoch {epoch}", flush=True)
+                    best_epoch = epoch
                     break
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_lr = lr_
+                best_epoch = epoch
                 best_metrics = self.metrics.update(out.detach().to("cpu"), lbls.to("cpu"))
-                torch.save(self.model.state_dict(), self.log.dir + 'model_' + self.model.__class__.__name__ + '.pth')
+                #torch.save(self.model.state_dict(), self.log.dir + 'model_' + self.model.__class__.__name__ + '.pth')
 
         print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}  ***")
         for name, val in zip(self.metrics.get_names(), best_metrics):
             print(f"{name}: {val:.4f}")
-        return best_lr, best_val_loss, best_metrics
+        return best_lr, best_val_loss, best_metrics, best_epoch

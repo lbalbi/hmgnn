@@ -55,7 +55,7 @@ def main():
                             val_split=0.0, device=device, seed=42)
 
     kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
-    best_lrs, best_f1 = [], -1.0
+    best_lrs, best_f1, best_epochs = [], -1.0, []
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
         print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
@@ -74,13 +74,15 @@ def main():
         log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold}", dir=args.output_dir)
         gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
                    (args.path == "gda_data" or args.path == "dp_data") else None
-        trainer = Train(model, args.CV_epochs, train_loader, val_loader,e_type=ppi_rel, log=log, lrs=cfg["lrs"],
+        trainer = Train(model, args.CV_epochs, train_loader, val_loader,e_type=ppi_rel, log=log, lrs=cfg["lr"],
             device=device, full_cvgraph=fold_train_graph, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
             pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
             rstatement_sampler=args.use_rstatement_sampler, task=args.task,gda_negs=gda_negs, no_contrastive=args.no_contrastive)
-        lr, loss, _ = trainer.run()
+        lr, loss, _, epoch_ = trainer.run()
+        best_epochs.append(epoch_)
         best_lrs.append(lr)
     best_lr = mode(best_lrs)
+    best_epoch = mode(best_epochs)
 
     final_model = ModelCls(hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                 e_etypes=[tuple(e) for e in mcfg["edge_types"]],ppi_etype=ppi_rel).to(device)
@@ -88,13 +90,13 @@ def main():
     final_log = Logger("final_train", dir=args.output_dir)
     gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
         (args.path == "gda_data" or args.path == "dp_data") else None
-    final_trainer = Train_BestModel(final_model, args.epochs, trainval_loader, [], 
+    final_trainer = Train_BestModel(final_model, best_epoch, trainval_loader, [], 
         full_cvgraph=trainval_graph, e_type=ppi_rel, log=final_log, device=device, task=args.task, lr=best_lr,
         contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
         pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
         rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
     loss, (pred, _) = final_trainer.run()
-    print(f"Final training loss: {loss:.4f}")
+    print(f"Final training loss: {loss:.4f}", flush=True)
 
     final_log_test = Logger("final_test", dir=args.output_dir)
     tester = Test_BestModel(final_model, test_loader=test_loader, e_type=ppi_rel, log=final_log_test,

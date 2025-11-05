@@ -168,7 +168,7 @@ class Train_BestModel:
 
 
     def run(self):
-        self.model.load_state_dict(torch.load(self.log.dir+'model_'+self.model.__class__.__name__+'.pth', map_location=self.device, weights_only=False))
+        # self.model.load_state_dict(torch.load(self.log.dir+'model_'+self.model.__class__.__name__+'.pth', map_location=self.device, weights_only=False))
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.best_lr)
         for epoch in range(self.epochs):
             train_loss, (out, labels) = self.train_epoch()
