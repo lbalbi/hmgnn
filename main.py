@@ -74,7 +74,7 @@ def main():
         log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold}", dir=args.output_dir)
         gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
                    (args.path == "gda_data" or args.path == "dp_data") else None
-        trainer = Train(model, args.CV_epochs, train_loader, val_loader,e_type=ppi_rel, log=log, lrs=cfg["lr"],
+        trainer = Train(model, args.CV_epochs, train_loader, val_loader, e_type=ppi_rel, log=log, lrs=cfg["lr"],
             device=device, full_cvgraph=fold_train_graph, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
             pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
             rstatement_sampler=args.use_rstatement_sampler, task=args.task,gda_negs=gda_negs, no_contrastive=args.no_contrastive)

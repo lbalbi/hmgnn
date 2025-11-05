@@ -8,7 +8,7 @@ from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin
 
 class Train:
     def __init__(
-        self, model, optimizer, epochs, train_loader, val_loader,
+        self, model, epochs, train_loader, val_loader,
         full_cvgraph, e_type, log, device, task, lrs=[0.001],
         gda_negs=None, pstatement_sampler=False,  nstatement_sampler=False,
         rstatement_sampler=False, contrastive_weight=0.1, state_list=None,
