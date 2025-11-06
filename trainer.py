@@ -176,6 +176,9 @@ class Train:
         best_metrics  = None
 
         for lr_ in self.lrs:
+            best_lr_epoch = None
+            best_lr_val_loss = float('inf')
+            best_lr_metrics = None
             self.model.load_state_dict(self._init_state)
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr_)
             for pg in self.optimizer.param_groups: pg['lr'] = lr_
@@ -193,13 +196,14 @@ class Train:
                     print(f" -- Early stopping at epoch {epoch}", flush=True)
                     best_epoch = epoch
                     break
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_lr = lr_
-                best_epoch = epoch
+
+            if val_loss < best_lr_val_loss: # best per LR
+                best_lr_val_loss, best_lr_epoch = val_loss, epoch
+                best_lr_metrics = self.metrics.update(out.detach().to("cpu"), lbls.to("cpu"))
+                self.log.log(f"Best Metrics: LR={lr_}, {epoch}, " + ", ".join([f"{v:.4f}" for v in best_lr_metrics]))
+            if val_loss < best_val_loss: # best overall to chose LR
+                best_val_loss, best_lr, best_epoch = val_loss, lr_, epoch
                 best_metrics = self.metrics.update(out.detach().to("cpu"), lbls.to("cpu"))
-                torch.save(self.model.state_dict(), self.log.dir + 'model_' + self.model.__class__.__name__ + '.pth')
-            self.log.log(f"Best Metrics: LR={lr_}, {epoch}, " + ", ".join([f"{v:.4f}" for v in best_metrics]))
 
         print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}  ***")
         for name, val in zip(self.metrics.get_names(), best_metrics):

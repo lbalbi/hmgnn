@@ -2,3 +2,4 @@ Job running on node: liseda-05
 LOG_DIR = output/human_noLC
 OUTDIR  = output/human_noLC/output_human_noLC_run_1
 LOGFILE = output/human_noLC/output_human_noLC_run_1.txt
+slurmstepd-liseda-05: error: *** JOB 4657 ON liseda-05 CANCELLED AT 2025-11-06T10:46:33 ***
