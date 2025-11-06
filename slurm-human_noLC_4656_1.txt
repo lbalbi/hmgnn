@@ -1,0 +1,4 @@
+Job running on node: liseda-05
+LOG_DIR = output/human_noLC
+OUTDIR  = output/human_noLC/output_human_noLC_run_1
+LOGFILE = output/human_noLC/output_human_noLC_run_1.txt

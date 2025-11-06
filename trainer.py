@@ -178,14 +178,15 @@ class Train:
         for lr_ in self.lrs:
             self.model.load_state_dict(self._init_state)
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr_)
-            for pg in self.optimizer.param_groups:
-                pg['lr'] = lr_
+            for pg in self.optimizer.param_groups: pg['lr'] = lr_
             self.earlystopper = EarlyStopping()
             print(f"\n=== Starting sweep with LR = {lr_} ===", flush=True)
 
             for epoch in range(1, self.epochs + 1):
+
                 train_loss, _ = self.train_epoch()
                 val_loss, (out, lbls) = self.validate_epoch()
+
                 print(f"LR={lr_} | Epoch {epoch}/{self.epochs} | "
                     f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}", flush=True)
                 if self.earlystopper.step(val_loss, self.model):
@@ -197,7 +198,8 @@ class Train:
                 best_lr = lr_
                 best_epoch = epoch
                 best_metrics = self.metrics.update(out.detach().to("cpu"), lbls.to("cpu"))
-                #torch.save(self.model.state_dict(), self.log.dir + 'model_' + self.model.__class__.__name__ + '.pth')
+                torch.save(self.model.state_dict(), self.log.dir + 'model_' + self.model.__class__.__name__ + '.pth')
+            self.log.log(f"Best Metrics: LR={lr_}, {epoch}, " + ", ".join([f"{v:.4f}" for v in best_metrics]))
 
         print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}  ***")
         for name, val in zip(self.metrics.get_names(), best_metrics):

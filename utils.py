@@ -11,25 +11,30 @@ def load_config(task, path="config.json"):
     
 class Logger:
 
-    def __init__(self, name, dir= ""):
+    def __init__(self, name, dir= "", non_verbose=False):
+        self.non_verbose = non_verbose
         self.name = name
         self.dir = "output/" + dir
         ensure_dir(self.dir)
         self.log_file = f"{name}.log"
-        self.file = open(self.dir + self.log_file, 'a')
-        self.file.write(f"Results for {name}\n")
-        self.file.write("=" * 50 + "\n")
-        self.file.close()
+        if not self.non_verbose:
+            self.file = open(self.dir + self.log_file, 'a')
+            self.file.write(f"Results for {name}\n")
+            self.file.write("=" * 50 + "\n")
+            self.file.close()
 
     def log(self, message):
         print(message)
-        self.file = open(self.dir + self.log_file, 'a')
-        self.file.write(message + "\n")
-        self.file.flush()
-        self.file.close()
+        if not self.non_verbose:
+            self.file = open(self.dir + self.log_file, 'a')
+            self.file.write(message + "\n")
+            self.file.flush()
+            self.file.close()
 
     def close(self):
         self.file.close()
+
+
 
 import torch, copy
 class EarlyStopping:

@@ -90,7 +90,7 @@ def main():
     final_model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                 e_etypes=[tuple(e) for e in mcfg["edge_types"]],ppi_etype=ppi_rel).to(device)
     
-    final_log = Logger("final_train", dir=args.output_dir)
+    final_log = Logger("final_train", dir=args.output_dir, non_verbose=True)
     gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
         (args.path == "gda_data" or args.path == "dp_data") else None
     final_trainer = Train_BestModel(final_model, best_epoch, trainval_loader, [], 
