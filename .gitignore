@@ -5,3 +5,4 @@ output/
 *.log
 *.json
 *.csv
+slurm_log.txt
