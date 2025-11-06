@@ -5,7 +5,6 @@
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
 
-
 echo "Job running on node: $(hostname)"
 set -euo pipefail
 

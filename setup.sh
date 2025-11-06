@@ -4,6 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
 
+
 set -euo pipefail
 
 ENV_NAME="${ENV_NAME:-py311-cu121}"
@@ -53,7 +54,7 @@ print("torch_geometric:", torch_geometric.__version__)
 PY
 
 echo ">>> Downloading data archive"
-DATA_URL="${DATA_URL:-https://zenodo_xx.com/path/to/data.zip}"
+DATA_URL="${DATA_URL:-https://zenodo.org/records/17542163/files/data.zip}"
 DATA_ZIP="${DATA_ZIP:-data.zip}"
 curl -L "$DATA_URL" -o "$DATA_ZIP"
 unzip -o -q "$DATA_ZIP"
