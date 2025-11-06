@@ -4,8 +4,6 @@
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
-#SBATCH --nodelist=liseda-05
-#SBATCH --partition=tier3
 
 
 echo "Job running on node: $(hostname)"

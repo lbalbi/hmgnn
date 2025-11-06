@@ -8,7 +8,7 @@ The model is trained for a final objective that results from combining the contr
 To setup a conda environment with the needed dependencies and download the benchmarks and experimental settings for the C-RGCN paper run the following in-line command:
 
 ```
-sbatch setup.sh
+sbatch setup.sh ENV_NAME=myenv
 ```
 
 To run a full default experiment for the Contrastive Relational GNN execute the following in-line command:
