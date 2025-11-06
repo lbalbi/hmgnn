@@ -14,4 +14,6 @@ To run the full pipeline for the Contrastive Relational GNN execute the followin
 sbatch run.sh
 ```
 
-This pipeline is extensible to other GNNs and datasets by adding their parameters and metadata to the config.json file.
+Within the .sh file you can pass specific arguments to change the experimental settings and benchmarks; see the examples provided in the file.
+
+This pipeline is extensible to other GNN configurations and datasets by adding their parameters and metadata in a config.json file.
