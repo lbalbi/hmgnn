@@ -176,6 +176,7 @@ class Train:
         best_metrics  = None
 
         for lr_ in self.lrs:
+            
             best_lr_epoch = None
             best_lr_val_loss = float('inf')
             best_lr_metrics = None
@@ -204,7 +205,8 @@ class Train:
             if val_loss < best_val_loss: # best overall to chose LR
                 best_val_loss, best_lr, best_epoch = val_loss, lr_, epoch
                 best_metrics = self.metrics.update(out.detach().to("cpu"), lbls.to("cpu"))
-
+                torch.save(self.model.state_dict(), self.log.dir + 'model_' + self.model.__class__.__name__ + '.pth')
+        
         print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}  ***")
         for name, val in zip(self.metrics.get_names(), best_metrics):
             print(f"{name}: {val:.4f}")
