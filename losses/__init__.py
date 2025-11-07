@@ -1,2 +1,3 @@
 from .dualcontrastive_CE import DualContrastiveLoss_CE
 from .dualcontrastive_margin import DualContrastiveLoss_Margin
+from .contradict_dualcontrastive_CE import Contradiction_ContrastiveLoss
