@@ -34,9 +34,9 @@ class GCN(nn.Module):
         self.ppi_etype = ppi_etype
 
         self.convs = nn.ModuleList()
-        self.convs.append(GCNConv(input_dim, hidden_dim, add_self_loops=True, normalize=True))
+        self.convs.append(GCNConv(input_dim, hidden_dim, add_self_loops=False, normalize=True))
         for _ in range(n_layers - 1):
-            self.convs.append(GCNConv(hidden_dim, hidden_dim, add_self_loops=True, normalize=True))
+            self.convs.append(GCNConv(hidden_dim, hidden_dim, add_self_loops=False, normalize=True))
         self.classify = nn.Linear(2 * hidden_dim, out_dim)
 
     def forward(self, features, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

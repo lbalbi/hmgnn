@@ -17,7 +17,7 @@ class Pygloader:
         seed (Optional[int]): Random seed for reproducibility.
     """
     def __init__( self, graph: HeteroData, ppi_rel: str = "PPI", batch_size: int = 32,
-        val_split: float = 0.1, device: Optional[torch.device] = "cpu", shuffle: bool = True,
+        val_split: float = 0.1, train=True, device: Optional[torch.device] = "cpu", shuffle: bool = True,
         seed: Optional[int] = None):
         
         assert isinstance(graph, HeteroData), "graph must be a PyG HeteroData"
@@ -26,6 +26,7 @@ class Pygloader:
         self.batch_size = batch_size
         self.val_split = val_split
         self.shuffle = shuffle
+        self.train = train
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         if seed is not None: torch.manual_seed(seed)
             
@@ -104,18 +105,25 @@ class Pygloader:
                 if hasattr(val, "size") and val.size(0) == ei.size(1):
                     sub[et][key] = val
 
-        ppi_store = self.graph[self.ppi_etype]
-        ppi_ei = ppi_store.edge_index[:, ppi_eids]
-        sub[self.ppi_etype].edge_index = ppi_ei
-        sub[self.ppi_etype].orig_eid = ppi_eids.clone()
+        if self.train == True:
+            ppi_store = self.graph[self.ppi_etype]
+            ppi_ei = ppi_store.edge_index[:, ppi_eids]
+            ppi_ei_rev = ppi_ei.flip(0) # reverse edges
+            ppi_ei = torch.cat([ppi_ei, ppi_ei_rev], dim=1)
+            sub[self.ppi_etype].edge_index = ppi_ei
+            sub[self.ppi_etype].orig_eid = torch.cat([ppi_eids.clone(), ppi_eids.clone()],dim=0) # sub[self.ppi_etype].orig_eid = ppi_eids.clone()
 
-        for key, val in ppi_store.items():
-            if key in ("edge_index", "orig_eid"): continue
-            if hasattr(val, "size") and val.size(0) == ppi_store.edge_index.size(1):
-                sub[self.ppi_etype][key] = val[ppi_eids]
+            for key, val in ppi_store.items():
+                if key in ("edge_index", "orig_eid"): continue
+                if hasattr(val, "size") and val.size(0) == ppi_store.edge_index.size(1):
+                    # sub[self.ppi_etype][key] = val[ppi_eids]
+                    attr_fwd = val[ppi_eids]
+                    attr_full = torch.cat([attr_fwd, attr_fwd], dim=0)
+                    sub[self.ppi_etype][key] = attr_full
         return sub.to(self.device)
 
-    
+
+
     def _batch_graphs(self, eids: torch.Tensor) -> Iterator[HeteroData]:
         """Yield mini-batch subgraphs for slices of PPI edges."""
         for start in range(0, len(eids), self.batch_size):

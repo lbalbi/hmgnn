@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default="human", help="Task to run: human, cerevisae, melanogaster")
     parser.add_argument('--model', type=str, choices=["hgcn", "hpgcn", "hgat","gcn", "gae"], default="hgcn", help="Model to run")
-    parser.add_argument('--epochs', type=int, default=250, help="Number of epochs for final training")
+    parser.add_argument('--epochs', type=int, default=300, help="Number of epochs for final training")
     parser.add_argument('--CV_epochs', type=int, default=250, help="Number of epochs for cross-validation")
     parser.add_argument('--batch_size', type=int, default=256*512, help="Batch size for training") 
     parser.add_argument('--use_pstatement_sampler', action='store_true', help="Use positive statement sampler to remove \
@@ -54,7 +54,7 @@ def main():
     test_graph = split_helper._create_split_graph(test_eids)
     trainval_loader = Pygloader(trainval_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
                                 val_split=0.1, device=device, seed=42)
-    test_loader = Pygloader(test_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
+    test_loader = Pygloader(test_graph, ppi_rel=ppi_rel, batch_size=args.batch_size, train=False,
                             val_split=0.0, device=device, seed=42)
 
     kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
@@ -62,14 +62,13 @@ def main():
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
         print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
-
         fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
         fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
         fold_train_graph = split_helper._create_split_graph(fold_train_eids)
         fold_val_graph = split_helper._create_split_graph(fold_val_eids)
         train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
                                  batch_size=args.batch_size, device=device)
-        val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
+        val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0, train=False,
                                batch_size=args.batch_size, device=device)
 
         model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
