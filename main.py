@@ -48,13 +48,19 @@ def main():
     trainval_eids_np, test_eids_np = train_test_split(all_eids.cpu().numpy(), test_size=0.1, random_state=42, shuffle=True)
     trainval_eids = torch.tensor(trainval_eids_np, dtype=torch.long)
     test_eids = torch.tensor(test_eids_np, dtype=torch.long)
+    #split_helper = Pygloader(full_graph, ppi_rel=ppi_rel, batch_size=args.batch_size, val_split=0, device=device)
+    #trainval_graph = split_helper._create_split_graph(trainval_eids)
+    #test_graph = split_helper._create_split_graph(test_eids)
+    split_helper_train = Pygloader(full_graph, ppi_rel=ppi_rel, batch_size=args.batch_size, val_split=0,device=device)
+    trainval_graph = split_helper_train._create_split_graph(trainval_eids, train=True)
+    test_ppis  = full_graph[ppi_key].edge_index[:, test_eids]
+    test_graph = trainval_graph
+    #split_helper_test = Pygloader(full_graph, ppi_rel=ppi_rel,batch_size=args.batch_size, val_split=0,device=device)
+    #test_graph, test_ppis = split_helper_test._create_split_graph(test_eids, train=False)
 
-    split_helper = Pygloader(full_graph, ppi_rel=ppi_rel, batch_size=args.batch_size, val_split=0, device=device)
-    trainval_graph = split_helper._create_split_graph(trainval_eids)
-    test_graph = split_helper._create_split_graph(test_eids)
     trainval_loader = Pygloader(trainval_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
                                 val_split=0.1, device=device, seed=42)
-    test_loader = Pygloader(test_graph, ppi_rel=ppi_rel, batch_size=args.batch_size, train=False,
+    test_loader = Pygloader(test_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
                             val_split=0.0, device=device, seed=42)
 
     kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
@@ -64,11 +70,11 @@ def main():
         print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
         fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
         fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
-        fold_train_graph = split_helper._create_split_graph(fold_train_eids)
-        fold_val_graph = split_helper._create_split_graph(fold_val_eids)
+        fold_train_graph = split_helper_train._create_split_graph(fold_train_eids)
+        fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids,train=False)
         train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
                                  batch_size=args.batch_size, device=device)
-        val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0, train=False,
+        val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
                                batch_size=args.batch_size, device=device)
 
         model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
@@ -76,8 +82,8 @@ def main():
         log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold}", dir=args.output_dir)
         gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
                    (args.path == "gda_data" or args.path == "dp_data") else None
-        trainer = Train(model, args.CV_epochs, train_loader, val_loader, e_type=ppi_rel, log=log, lrs=cfg["lr"],
-            device=device, full_cvgraph=fold_train_graph, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+        trainer = Train(model, args.CV_epochs, train_loader, val_loader, e_type=ppi_rel, val_edges=ppi_vei, val_edge_batch_size=args.batch_size, 
+        log=log, lrs=cfg["lr"], device=device, full_graph=full_graph, full_cvgraph=fold_train_graph, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
             pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
             rstatement_sampler=args.use_rstatement_sampler, task=args.task,gda_negs=gda_negs, no_contrastive=args.no_contrastive)
         lr, loss, _, epoch_ = trainer.run()
@@ -92,8 +98,13 @@ def main():
     final_log = Logger("final_train", dir=args.output_dir, non_verbose=True)
     gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
         (args.path == "gda_data" or args.path == "dp_data") else None
-    final_trainer = Train_BestModel(final_model, best_epoch, trainval_loader, [], 
-        full_cvgraph=trainval_graph, e_type=ppi_rel, log=final_log, device=device, task=args.task, lr=best_lr,
+    #final_trainer = Train_BestModel(final_model, best_epoch, trainval_loader, [], 
+        # full_cvgraph=trainval_graph, e_type=ppi_rel, log=final_log, device=device, task=args.task, lr=best_lr,
+        # contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+        # pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
+        # rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
+    final_trainer = Train_BestModel(final_model, best_epoch, trainval_loader, [],full_cvgraph=trainval_graph,full_graph=full_graph,
+        e_type=ppi_rel, log=final_log, device=device, task=args.task, lr=best_lr,
         contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
         pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
         rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
@@ -101,8 +112,8 @@ def main():
     print(f"Final training loss: {loss:.4f}", flush=True)
 
     final_log_test = Logger("final_test", dir=args.output_dir)
-    tester = Test_BestModel(final_model, test_loader=test_loader, e_type=ppi_rel, log=final_log_test,
-        full_graph=test_graph, device=device, task=args.task, gda_negs=gda_negs)
+    tester = Test_BestModel(final_model, test_loader=test_loader, e_type=ppi_rel, test_edges=test_ppis, test_edge_batch_size=args.batch_size,
+    log=final_log_test, test_graph=test_graph, full_graph=full_graph, device=device, task=args.task, gda_negs=gda_negs)
     tester.run()
 
 if __name__ == "__main__":

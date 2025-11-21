@@ -17,7 +17,7 @@ class Pygloader:
         seed (Optional[int]): Random seed for reproducibility.
     """
     def __init__( self, graph: HeteroData, ppi_rel: str = "PPI", batch_size: int = 32,
-        val_split: float = 0.1, train=True, device: Optional[torch.device] = "cpu", shuffle: bool = True,
+        val_split: float = 0.1, device: Optional[torch.device] = "cpu", shuffle: bool = True,
         seed: Optional[int] = None):
         
         assert isinstance(graph, HeteroData), "graph must be a PyG HeteroData"
@@ -26,17 +26,20 @@ class Pygloader:
         self.batch_size = batch_size
         self.val_split = val_split
         self.shuffle = shuffle
-        self.train = train
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         if seed is not None: torch.manual_seed(seed)
             
         self.ppi_etype = next((et for et in graph.edge_types if et[1] == ppi_rel), None)
-        assert self.ppi_etype is not None, f"Relation '{ppi_rel}' not in graph.edge_types"
-        self.other_etypes: List[tuple] = [et for et in graph.edge_types if et != self.ppi_etype]
         self._num_nodes: Dict[str, int] = self._infer_all_num_nodes()
+        if self.ppi_etype is None:
+            self.other_etypes: List[tuple] = list(graph.edge_types)
+            self.train_eids = torch.empty(0, dtype=torch.long)
+            self.val_eids = torch.empty(0, dtype=torch.long)
+            return
+        self.other_etypes: List[tuple] = [et for et in graph.edge_types if et != self.ppi_etype]
         self._split_by_source_nodes()
-        self.train_graph = self._create_split_graph(self.train_eids)
-        self.val_graph = self._create_split_graph(self.val_eids)
+        #self.train_graph = self._create_split_graph(self.train_eids, train=True)
+        #self.val_graph = self._create_split_graph(self.val_eids, train=False)
 
 
     def _infer_all_num_nodes(self) -> Dict[str, int]:
@@ -81,7 +84,7 @@ class Pygloader:
         self.val_eids = edge_ids[mask_val].cpu()
 
     
-    def _create_split_graph(self, ppi_eids: torch.Tensor) -> HeteroData:
+    def _create_split_graph(self, ppi_eids: torch.Tensor, train=True) -> HeteroData:
         """
         Build a subgraph containing specified PPI edges (by edge IDs) and all edges of other types.
         Preserves all original nodes and copies node features if present.
@@ -105,9 +108,9 @@ class Pygloader:
                 if hasattr(val, "size") and val.size(0) == ei.size(1):
                     sub[et][key] = val
 
-        if self.train == True:
-            ppi_store = self.graph[self.ppi_etype]
-            ppi_ei = ppi_store.edge_index[:, ppi_eids]
+        ppi_store = self.graph[self.ppi_etype]
+        ppi_ei = ppi_store.edge_index[:, ppi_eids]
+        if train:
             ppi_ei_rev = ppi_ei.flip(0) # reverse edges
             ppi_ei = torch.cat([ppi_ei, ppi_ei_rev], dim=1)
             sub[self.ppi_etype].edge_index = ppi_ei
@@ -120,6 +123,7 @@ class Pygloader:
                     attr_fwd = val[ppi_eids]
                     attr_full = torch.cat([attr_fwd, attr_fwd], dim=0)
                     sub[self.ppi_etype][key] = attr_full
+        else: return sub.to(self.device), ppi_ei
         return sub.to(self.device)
 
 
@@ -138,9 +142,9 @@ class Pygloader:
         """Iterate mini-batch validation subgraphs."""
         return self._batch_graphs(self.val_eids)
 
-    def get_split_graphs(self) -> Tuple[HeteroData, HeteroData]:
-        """Return the full train/val heterographs."""
-        return self.train_graph, self.val_graph
+    # def get_split_graphs(self) -> Tuple[HeteroData, HeteroData]:
+    #     """Return the full train/val heterographs."""
+    #     return self.train_graph, self.val_graph
 
     def get_relation(self) -> str:
         """Return the relation name used for PPI edges."""
