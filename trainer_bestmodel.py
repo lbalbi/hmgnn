@@ -139,15 +139,15 @@ class Train_BestModel:
                 dst = edge_index[1] + offsets[n_type]
                 mapped_pairs = torch.stack([src, dst], dim=0)
                 z, out = self.model(hom_data, mapped_pairs)
-            else: z, out = self.model(batch, edge_index)
+            else: z_pos, z_neg, out = self.model(batch, edge_index)
 
             if not self.no_contrastive:
                 if self.rstatement_sampler or self.nstatement__sampler or self.pstatement_sampler:
                     z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
-                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                    loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
                 else:
                     z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
-                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                    loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
 
             loss_cls = self.loss_fn(out.squeeze(-1), labels)
 
@@ -196,15 +196,15 @@ class Train_BestModel:
                     dst = edge_index[1] + offsets[n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     z, out = self.model(hom_data, mapped_pairs)
-                else: z, out = self.model(graph, edge_index)
+                else: z_pos, z_neg, out = self.model(graph, edge_index)
 
                 if not self.no_contrastive:
                     if self.rstatement_sampler or self.nstatement__sampler or self.pstatement_sampler:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
-                        loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                        loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
                     else:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
-                        loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                        loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
                         
                 loss_cls = self.loss_fn(out.squeeze(-1), labels)
                 loss_total = (self.alpha * loss_contrast + loss_cls if not self.no_contrastive else loss_cls)
@@ -248,17 +248,17 @@ class Train_BestModel:
                     dst = edge_index[1] + offsets[n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     z, out = self.model(hom_data, mapped_pairs)
-                else: z, out = self.model(batch, edge_index)
+                else: z_pos, z_neg, out = self.model(batch, edge_index)
 
 
                 if not self.no_contrastive:
                     if self.rstatement_sampler or self.nstatement__sampler or self.pstatement_sampler:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(
                             z, neg_statement_index)
-                        loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                        loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
                     else:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
-                        loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                        loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
 
                 loss_cls = self.loss_fn(out.squeeze(-1), labels)
                 loss_total = (self.alpha * loss_contrast + loss_cls if not self.no_contrastive else loss_cls)
@@ -340,7 +340,7 @@ class Test_BestModel:
                     dst = edge_index[1] + offsets[n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     _, out = self.model(hom_data, mapped_pairs)
-                else: _, out = self.model(g, edge_index)
+                else: z_pos, z_neg, out = self.model(g, edge_index)
 
                 all_labels.append(labels.cpu())
                 all_out.append(out.cpu())

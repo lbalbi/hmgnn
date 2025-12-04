@@ -153,13 +153,13 @@ class Train:
                 dst = edge_index_pairs[1] + offsets[self.n_type]
                 mapped_pairs = torch.stack([src, dst], dim=0)
                 z, out = self.model(hom_data, mapped_pairs)
-            else: z, out = self.model(batch, edge_index_pairs)
+            else: z_pos, z_neg, out = self.model(batch, edge_index_pairs)
 
             self._alpha = F.softplus(self.alpha)
             if not self.no_contrastive:
                 args = (z, neg_stmt_idx) if "neg_stmt_idx" in locals() else (z,)
                 z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
-                loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
                 loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
             else: loss = self.loss_fn(out.squeeze(-1), labels)
 
@@ -204,16 +204,16 @@ class Train:
                     dst = edge_index_pairs[1] + offsets[self.n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     z, out = self.model(hom_data, mapped_pairs)
-                else: z, out = self.model(graph, edge_index_pairs)
+                else: z_pos, z_neg, out = self.model(graph, edge_index_pairs)
 
                 self._alpha = F.softplus(self.alpha)
                 if not self.no_contrastive:
                     if self.rstatement_sampler or self.nstatement_sampler or self.pstatement_sampler:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z, neg_stmt_idx)
-                        loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                        loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
                     else:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
-                        loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                        loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
                     loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
                 else: loss = self.loss_fn(out.squeeze(-1), labels)
 
@@ -251,13 +251,13 @@ class Train:
                     dst = edge_index_pairs[1] + offsets[self.n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     z, out = self.model(hom_data, mapped_pairs)
-                else: z, out = self.model(batch, edge_index_pairs)
+                else: z_pos, z_neg, out = self.model(batch, edge_index_pairs)
 
                 self._alpha = F.softplus(self.alpha)
                 if not self.no_contrastive:
                     args = (z, neg_stmt_idx) if "neg_stmt_idx" in locals() else (z,)
                     z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
-                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                    loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
                     loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
                 else: loss = self.loss_fn(out.squeeze(-1), labels)
 
