@@ -200,7 +200,9 @@ class Train:
             self._alpha = F.softplus(self.alpha)
 
             if (not self.no_contrastive) and (self.contrastive is not None):
-                loss_contrast = self.contrastive(z_pos, z_neg, neg_stmt_idx)
+                args = (z_pos, neg_stmt_idx if self.model.__class__.__name__ in 
+                    {"GCN", "GAT", "GCN_GAE"} else z_pos, z_neg, neg_stmt_idx)
+                loss_contrast = self.contrastive(*args)
                 loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
             else:
                 loss = self.loss_fn(out.squeeze(-1), labels)
