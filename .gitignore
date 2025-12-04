@@ -1,9 +1,7 @@
 *data/
 output/
-scripts/
 /__pycache__/
 */__pycache__/
 *.log
 *.json
-*.csv
 slurm_log.txt
