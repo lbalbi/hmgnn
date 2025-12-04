@@ -1,13 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 class GCN(nn.Module):
-    """
-    Homogeneous GCN model for link classification (PyTorch Geometric).
-
+    """ Homogeneous GCN model for link classification (PyTorch Geometric).
     Args:
         in_feats (Dict[str, int]): Input feature sizes for node type. Only the first value is used.
         hidden_dim (int): Hidden embedding dimension.
@@ -18,18 +17,14 @@ class GCN(nn.Module):
         e_etypes (List[Tuple[str, str, str]]): Unused; kept for compatibility.
     """
 
-    def __init__(
-        self,
-        in_feats: Dict[str, int],
-        hidden_dim: int,
-        out_dim: int,
-        n_layers: int = 2,
-        ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"),
-        n_type: str = "node",
-        e_etypes: List[Tuple[str, str, str]] = None,
-    ):
+    def __init__(self, in_feats: Optional[Dict[str, int]] = None, hidden_dim: int = 256, out_dim: int = 1,
+        n_layers: int = 2, ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"), n_type: str = "node",
+        e_etypes: List[Tuple[str, str, str]] = None, in_dim=None):
         super().__init__()
-        input_dim = list(in_feats.values())[0]
+
+        if in_feats is None: in_feats = in_dim
+        if isinstance(in_feats, dict): input_dim = list(in_feats.values())[0]
+        else: input_dim = int(in_feats)
         self.n_type = n_type
         self.ppi_etype = ppi_etype
 
@@ -39,14 +34,16 @@ class GCN(nn.Module):
             self.convs.append(GCNConv(hidden_dim, hidden_dim, add_self_loops=False, normalize=True))
         self.classify = nn.Linear(2 * hidden_dim, out_dim)
 
-    def forward(self, features, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        full_edge_index = edge_index
-        h = features
+
+    def forward(self, data: Data, edge_index_pairs: torch.Tensor):
+        h = data.x
+        full_edge_index = data.edge_index
+
         for conv in self.convs:
             h = conv(h, full_edge_index)
             h = F.relu(h)
-        src_ids, dst_ids = edge_index
+        src_ids, dst_ids = edge_index_pairs
         hs = h[src_ids]
         hd = h[dst_ids]
         h_pair = torch.cat([hs, hd], dim=1)

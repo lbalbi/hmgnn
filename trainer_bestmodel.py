@@ -86,9 +86,13 @@ class Train_BestModel:
 
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = None
-        if not no_contrastive and (self.neg_statement_sampler is not None):
-            self.contrastive = ComposedContrastiveLoss_Multi(
-                sampler=self.neg_statement_sampler, temperature=0.5, lambda_neg=1.0)
+        if (not no_contrastive) and (self.neg_statement_sampler is not None):
+            if self.model.__class__.__name__ in {"GCN", "GAT", "HGCN", "GCN_GAE"}:
+                self.contrastive = DualContrastiveLoss_CE(sampler=self.neg_statement_sampler,
+                    temperature=0.5)
+            else:
+                self.contrastive = ComposedContrastiveLoss_Multi(sampler=self.neg_statement_sampler,
+                    temperature=0.5, lambda_neg=1.0)
 
         self.alpha = contrastive_weight
         self.earlystopper = EarlyStopping()

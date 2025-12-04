@@ -44,9 +44,14 @@ class Train:
 
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = None
-        if not no_contrastive and (self.neg_statement_sampler is not None):
-            self.contrastive = ComposedContrastiveLoss_Multi(
-                sampler=self.neg_statement_sampler, temperature=0.5, lambda_neg=1.0)
+
+        if (not no_contrastive) and (self.neg_statement_sampler is not None):
+            if self.model.__class__.__name__ in {"GCN", "GAT", "HGCN", "GCN_GAE"}:
+                self.contrastive = DualContrastiveLoss_CE(sampler=self.neg_statement_sampler, temperature=0.5)
+            else:
+                self.contrastive = ComposedContrastiveLoss_Multi(sampler=self.neg_statement_sampler,
+                    temperature=0.5, lambda_neg=1.0)
+
 
         init_alpha = float(contrastive_weight)
         if init_alpha <= 0:
@@ -182,17 +187,14 @@ class Train:
             elif (not self.no_contrastive) and (self.neg_statement_sampler is not None):
                 self.neg_statement_sampler.prepare_batch(batch)
 
-            # Forward pass
             if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                 hom_data, offsets = self._to_homogeneous_pyg(batch)
                 src = edge_index_pairs[0] + offsets[self.n_type]
                 dst = edge_index_pairs[1] + offsets[self.n_type]
                 mapped_pairs = torch.stack([src, dst], dim=0)
                 z_single, out = self.model(hom_data, mapped_pairs)
-                # single-view models: use same embedding for both views
                 z_pos = z_neg = z_single
             else:
-                # HGCN-style models return two embeddings
                 z_pos, z_neg, out = self.model(batch, edge_index_pairs)
 
             self._alpha = F.softplus(self.alpha)

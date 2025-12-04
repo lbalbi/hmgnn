@@ -1,14 +1,24 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 class DualContrastiveLoss_CE(torch.nn.Module):
-    def __init__(self, temperature: float = 0.5):
+    def __init__(self, sampler, temperature: float = 0.5):
         super().__init__()
+        self.sampler = sampler
         self.temperature = temperature
         
-    def forward(
-        self, z_pos, z_pos_pos, z_pos_neg) -> torch.Tensor:
+        
+    def forward(self, z_pos_full: torch.Tensor, z_neg_full: torch.Tensor,
+        neg_statement_index: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+        if self.sampler is None:
+            raise RuntimeError("DualContrastiveLoss_CE called without a sampler.")
+
+        (z_pos, z_pos_pos, z_pos_neg) = self.sampler.get_contrastive_samples(
+            z_pos_full, neg_statement_index=neg_statement_index)
+
         B, D = z_pos.shape
         z_pos = F.normalize(z_pos, dim=1)
         z_pos_pos = F.normalize(z_pos_pos, dim=1)
