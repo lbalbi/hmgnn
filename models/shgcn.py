@@ -13,7 +13,7 @@ class SHGCN(nn.Module):
     and out is [num_candidate_edges, out_dim] (sigmoid-probabilities for classfication pairs)
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int = 1, num_layers: int = 2,
+    def __init__(self, in_dim, hidden_dim: int, out_dim: int = 1, num_layers: int = 2,
         ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"), n_type: str = "node",
         e_etypes: Optional[List[Tuple[str, str, str]]] = None, neg_rel_name: str = "neg_statement"):
         super().__init__()
@@ -25,24 +25,26 @@ class SHGCN(nn.Module):
         self.hidden_dim = hidden_dim
         self.neg_rel_name = neg_rel_name
 
+        if isinstance(in_dim, dict): base_in_ch = in_dim[self.n_type]
+        else: base_in_ch = int(in_dim)
+
         neg_candidates = [et for et in e_etypes if et[1] == neg_rel_name]
         self.neg_etype = None if len(neg_candidates) == 0 else neg_candidates[0]
         self.pos_etypes = [et for et in e_etypes if et != self.neg_etype]
-        if self.neg_etype is None:
-            print("[HGCN] WARNING: No edge type with rel =", neg_rel_name,
+        if self.neg_etype is None: print("[HGCN] WARNING: No edge type with rel =", neg_rel_name,
                   "found in e_etypes. z_neg will be zeros.")
 
         self.convs_pos = nn.ModuleList()
         self.convs_neg = nn.ModuleList()
 
         for layer in range(num_layers):
-            in_ch = in_dim if layer == 0 else hidden_dim
+            in_ch = base_in_ch if layer == 0 else hidden_dim
             conv_dict_pos = {et: GCNConv(in_ch, hidden_dim, add_self_loops=True, normalize=True)
                 for et in self.pos_etypes}
             conv_dict_neg = {}
             if self.neg_etype is not None:
                 conv_dict_neg[self.neg_etype] = GCNConv(in_ch, hidden_dim, add_self_loops=True, normalize=True)
-
+                
             self.convs_pos.append(HeteroConv(conv_dict_pos, aggr="mean"))
             self.convs_neg.append(HeteroConv(conv_dict_neg, aggr="mean"))
         self.classify = nn.Linear(4 * hidden_dim, out_dim)

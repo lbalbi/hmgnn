@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 
-class DualContrastiveLoss_CE(nn.Module):
+class ComposedContrastiveLoss_CE(nn.Module):
     """ Dual-view contrastive loss. For each view v in {pos, neg}:
         - pulls z_anchor_v towards z_v_pos
         - pushes z_anchor_v away from z_v_neg (K negatives per anchor)
