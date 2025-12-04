@@ -9,7 +9,10 @@ from samplers import (
     NegativeSampler,
     RandomStatementSampler,
 )
-from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin, ComposedContrastiveLoss_CE
+from losses import (
+    DualContrastiveLoss_CE, DualContrastiveLoss_Margin,
+    ComposedContrastiveLoss_CE, ComposedContrastiveLoss_Multi
+)
 
 
 def _to_homogeneous_pyg(hetero, device):
@@ -84,7 +87,7 @@ class Train_BestModel:
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = None
         if not no_contrastive and (self.neg_statement_sampler is not None):
-            self.contrastive = ComposedContrastiveLoss_CE(
+            self.contrastive = ComposedContrastiveLoss_Multi(
                 sampler=self.neg_statement_sampler, temperature=0.5, lambda_neg=1.0)
 
         self.alpha = contrastive_weight

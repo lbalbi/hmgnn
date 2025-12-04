@@ -9,7 +9,7 @@ from samplers import (
 )
 from losses import (
     DualContrastiveLoss_CE, DualContrastiveLoss_Margin,
-    ComposedContrastiveLoss_CE, ComposedContrastiveLoss
+    ComposedContrastiveLoss_CE, ComposedContrastiveLoss_Multi
 )
 
 
@@ -45,7 +45,7 @@ class Train:
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = None
         if not no_contrastive and (self.neg_statement_sampler is not None):
-            self.contrastive = ComposedContrastiveLoss_CE(
+            self.contrastive = ComposedContrastiveLoss_Multi(
                 sampler=self.neg_statement_sampler, temperature=0.5, lambda_neg=1.0)
 
         init_alpha = float(contrastive_weight)
