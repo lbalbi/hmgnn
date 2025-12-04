@@ -1,32 +1,39 @@
+# partialstatement_sampler.py
 import random, torch
 from typing import List, Tuple, Optional, Dict
 from torch import Tensor
 from torch_geometric.data import HeteroData
 from .utils import _find_key_by_rel, _num_nodes_of
 
+
 class PartialStatementSampler:
     """ A high-performance sampler that uses an external list of negative statements or graph-based negative edges, 
     with vectorization and no Python loops in the hot path. Assumes relations are within the same node type for statements/GO
     """
+
     def __init__(self, k: int = 2, go_etype: str = "link", neg_edges: Optional[List[Tuple[int, int]]] = None):
         self.k = k
         self.go_etype = go_etype
         self.external_neg = neg_edges or []
+
+        # Global (full-graph) structures
         self.pos_global: List[List[int]] = []
         self.pos_targets: set = set()
         self.direct_global: List[List[int]] = []
         self.two_hop_global: List[List[int]] = []
+
+        # Pool matrices (CPU, full graph)
         self.pool_matrix_cpu: Optional[Tensor] = None
         self.pool_mask_cpu: Optional[Tensor] = None
-        self.M: int = 0
-        self.orig: Optional[Tensor] = None
-        self.mapping: Dict[int, int] = {}
-        self.batch_pool: Optional[Tensor] = None
-        self.batch_mask: Optional[Tensor] = None
+        self.M: int = 0  # max pool size
+
+        # Batch mapping
+        self.orig: Optional[Tensor] = None          # global ids for local row i
+        self.mapping: Dict[int, int] = {}           # global -> local
+        self.batch_pool: Optional[Tensor] = None    # (B, M)
+        self.batch_mask: Optional[Tensor] = None    # (B, M)
         self.B: int = 0
         self.device = torch.device("cpu")
-
-
 
     def prepare_global(self, full_g: HeteroData, pos_etype: str = "pos_statement", neg_etype: str = "neg_statement"):
         """ Builds pools from the full graph (PyG HeteroData) and computes, for every node u:
@@ -42,6 +49,8 @@ class PartialStatementSampler:
         node_type = src_nt
 
         N = _num_nodes_of(full_g, node_type)
+
+        # Negatives: external list or graph edges
         if self.external_neg:
             src_neg, dst_neg = zip(*self.external_neg)
             src_neg = list(src_neg)
@@ -51,22 +60,28 @@ class PartialStatementSampler:
                 src_neg_t, dst_neg_t = full_g[neg_key].edge_index
                 src_neg = src_neg_t.tolist()
                 dst_neg = dst_neg_t.tolist()
-            else: src_neg, dst_neg = [], []
+            else:
+                src_neg, dst_neg = [], []
+
+        # Positives
         if "edge_index" in full_g[pos_key]:
             src_pos_t, dst_pos_t = full_g[pos_key].edge_index
             src_pos = src_pos_t.tolist()
             dst_pos = dst_pos_t.tolist()
-        else: src_pos, dst_pos = [], []
+        else:
+            src_pos, dst_pos = [], []
 
         pos_global: List[List[int]] = [[] for _ in range(N)]
         for u, v in zip(src_pos, dst_pos):
             pos_global[u].append(v)
         self.pos_global = pos_global
         self.pos_targets = set(dst_pos)
+
         direct_global: List[List[int]] = [[] for _ in range(N)]
         for u, v in zip(src_neg, dst_neg):
             direct_global[u].append(v)
 
+        # GO hierarchy: predecessors as backup negatives
         go_key = _find_key_by_rel(full_g, self.go_etype)
         predecessors: Dict[int, List[int]] = {}
         if "edge_index" in full_g[go_key]:
@@ -81,21 +96,30 @@ class PartialStatementSampler:
                 for b in direct_global[u]:
                     sup.update(predecessors.get(b, []))
                 two_hop_global[u] = list(sup)
+
         self.direct_global = direct_global
         self.two_hop_global = two_hop_global
 
+        # Build negative candidate pools per node
         pools: List[List[int]] = []
         for u in range(N):
-            if len(direct_global[u]) >= self.k: pool = direct_global[u].copy()
-            else: pool = list({*direct_global[u], *two_hop_global[u]})
+            if len(direct_global[u]) >= self.k:
+                pool = direct_global[u].copy()
+            else:
+                pool = list({*direct_global[u], *two_hop_global[u]})
+
             if len(pool) < self.k:
                 excluded = set(direct_global[u]) | set(pos_global[u])
                 candidates = list(self.pos_targets - excluded)
                 needed = self.k - len(pool)
                 if candidates:
-                    if len(candidates) >= needed: pool.extend(random.sample(candidates, needed))
-                    else: pool.extend(random.choices(candidates, k=needed))
-            if len(pool) == 0: pool = [u]
+                    if len(candidates) >= needed:
+                        pool.extend(random.sample(candidates, needed))
+                    else:
+                        pool.extend(random.choices(candidates, k=needed))
+
+            if len(pool) == 0:
+                pool = [u]
             pools.append(pool)
 
         M = max(len(row) for row in pools) if pools else 0
@@ -104,52 +128,67 @@ class PartialStatementSampler:
             self.pool_mask_cpu = torch.empty(0, 0, dtype=torch.bool)
             self.M = 0
             return
+
         pool_mat = torch.full((N, M), fill_value=0, dtype=torch.long)
         mask_mat = torch.zeros((N, M), dtype=torch.bool)
         for u, row in enumerate(pools):
             L = len(row)
             pool_mat[u, :L] = torch.tensor(row, dtype=torch.long)
             mask_mat[u, :L] = True
+
         self.pool_matrix_cpu = pool_mat
         self.pool_mask_cpu = mask_mat
         self.M = M
 
-
-
     def prepare_batch(self, batch: HeteroData):
-        """ Node IDs are global and each batch subgraph retains the full node set: 
-        'batch['node'].num_nodes == full.num_nodes'.
+        """ Node IDs are global and each batch subgraph retains the full node set:
+            'batch['node'].num_nodes == full.num_nodes'.
         """
         any_key = next(iter(batch.edge_types))
-        self.device = batch[any_key].edge_index.device if batch[any_key].edge_index.is_cuda else torch.device("cpu")
+        self.device = (
+            batch[any_key].edge_index.device
+            if batch[any_key].edge_index.is_cuda
+            else torch.device("cpu")
+        )
         ntype = _find_key_by_rel(batch, self.go_etype)[0]
         B = _num_nodes_of(batch, ntype)
+
         self.orig = torch.arange(B, dtype=torch.long)
         self.mapping = {g.item(): i for i, g in enumerate(self.orig)}
-        self.batch_pool = self.pool_matrix_cpu[self.orig].to(self.device)
-        self.batch_mask = self.pool_mask_cpu[self.orig].to(self.device)
+
+        if self.pool_matrix_cpu is not None and self.pool_matrix_cpu.numel() > 0:
+            self.batch_pool = self.pool_matrix_cpu[self.orig].to(self.device)
+            self.batch_mask = self.pool_mask_cpu[self.orig].to(self.device)
+        else:
+            self.batch_pool = None
+            self.batch_mask = None
+
         self.B = int(B)
 
-
     def sample(self) -> Tensor:
-        """ Vectorized sampling of k negatives per node, returns edge_index with (src=row_id, dst=sampled pool entry).
+        """ Vectorized sampling of k negatives per node, returns edge_index with
+            (src=row_id, dst=sampled pool entry).
         """
-        if self.B == 0 or self.M == 0: return torch.empty(2, 0, dtype=torch.long, device=self.device)
+        if self.B == 0 or self.M == 0 or self.batch_pool is None or self.batch_mask is None:
+            return torch.empty(2, 0, dtype=torch.long, device=self.device)
+
         probs = self.batch_mask.float()
         row_sums = probs.sum(dim=1, keepdim=True)
-        zero_rows = (row_sums == 0)
+        zero_rows = row_sums == 0
         if zero_rows.any():
             probs[zero_rows, :] = 1.0
             row_sums = probs.sum(dim=1, keepdim=True)
         probs = probs / row_sums
+
         idx = torch.multinomial(probs, self.k, replacement=True)
-        dst = torch.gather(self.batch_pool, 1, idx) 
+        dst = torch.gather(self.batch_pool, 1, idx)
         src = torch.arange(self.B, device=self.device).unsqueeze(1).expand(-1, self.k)
         return torch.stack([src, dst], dim=0).reshape(2, -1)
 
-
     def get_contrastive_samples(self, z: Tensor, neg_ei: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """ Args: z: (B, D) node embeddings for the batch (local == global id order).
+        """(Old single-view API – kept for backward-compat)
+        Args:
+            z: (B, D) node embeddings for the batch (local == global id order).
             neg_ei: [2, B*k] edge_index sampled by `sample()`; we use its dst as negatives.
         Returns:
             z_pos: (B, D) embeddings of each node (anchor of positive view)
@@ -158,18 +197,109 @@ class PartialStatementSampler:
         """
         B, D = z.shape
         device, z_pos = z.device, z
+
         pos_nb: List[int] = []
         for i, g in enumerate(self.orig.tolist()):
             opts = self.pos_global[g] if g < len(self.pos_global) else []
             if opts:
                 g2 = random.choice(opts)
                 pos_nb.append(self.mapping.get(g2, i))
-            else: pos_nb.append(i)
+            else:
+                pos_nb.append(i)
 
         pos_nb = torch.tensor(pos_nb, device=device, dtype=torch.long)
         z_pos_pos = z[pos_nb]
-        if neg_ei.numel() == 0: z_pos_neg = z_pos.unsqueeze(1).expand(-1, self.k, -1)
+
+        if neg_ei.numel() == 0:
+            z_pos_neg = z_pos.unsqueeze(1).expand(-1, self.k, -1)
         else:
             neg_dst = neg_ei[1].view(B, self.k)
             z_pos_neg = z[neg_dst]
+
         return z_pos, z_pos_pos, z_pos_neg
+
+    # NEW: dual-view API used by DualContrastiveLoss_CE
+    def get_dual_contrastive_samples(
+        self,
+        z_pos: Tensor,
+        z_neg: Tensor,
+        neg_statement_index: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """
+        Dual-view version of get_contrastive_samples.
+
+        Uses the same node-wise anchors, positives and negatives to slice both
+        z_pos (positive view) and z_neg (negative view).
+
+        neg_statement_index:
+          if provided, it is the edge_index returned by `sample()` (2, B*k).
+          If None, we resample negatives from the batch pools.
+        """
+        B = z_pos.size(0)
+        k = self.k
+        Dp = z_pos.size(1)
+        Dn = z_neg.size(1)
+
+        if B == 0:
+            z_anchor_pos = z_pos.new_zeros((0, Dp))
+            z_pos_pos = z_pos.new_zeros((0, Dp))
+            z_pos_neg = z_pos.new_zeros((0, k, Dp))
+            z_anchor_neg = z_neg.new_zeros((0, Dn))
+            z_neg_pos = z_neg.new_zeros((0, Dn))
+            z_neg_neg = z_neg.new_zeros((0, k, Dn))
+            return (z_anchor_pos, z_pos_pos, z_pos_neg, z_anchor_neg, z_neg_pos, z_neg_neg)
+
+        device = z_pos.device
+
+        # Anchors: all nodes 0..B-1 in current batch
+        if self.orig is None:
+            self.orig = torch.arange(B, dtype=torch.long)
+            self.mapping = {g.item(): i for i, g in enumerate(self.orig)}
+
+        anchors_t = self.orig.to(device)
+
+        # Positives: one statement neighbor per node (or self if none)
+        pos_nb: List[int] = []
+        orig_list = self.orig.tolist()
+        for i, g in enumerate(orig_list):
+            opts = self.pos_global[g] if g < len(self.pos_global) else []
+            if opts:
+                g2 = random.choice(opts)
+                pos_nb.append(self.mapping.get(g2, i))
+            else:
+                pos_nb.append(i)
+        pos_nb_t = torch.tensor(pos_nb, device=device, dtype=torch.long)
+
+        # Negatives: B x k indices
+        if neg_statement_index is not None and neg_statement_index.numel() > 0:
+            neg_dst = neg_statement_index[1].to(device).view(B, k)
+        else:
+            # If no explicit neg edge_index given, sample from the candidate pools again
+            if (
+                self.batch_pool is None
+                or self.batch_mask is None
+                or self.M == 0
+                or self.B == 0
+            ):
+                neg_dst = anchors_t.unsqueeze(1).expand(-1, k)
+            else:
+                probs = self.batch_mask.float()
+                row_sums = probs.sum(dim=1, keepdim=True)
+                zero_rows = row_sums == 0
+                if zero_rows.any():
+                    probs[zero_rows, :] = 1.0
+                    row_sums = probs.sum(dim=1, keepdim=True)
+                probs = probs / row_sums
+                idx = torch.multinomial(probs, k, replacement=True)
+                neg_dst = torch.gather(self.batch_pool, 1, idx)
+
+        # Slice both views with the same indices
+        z_anchor_pos = z_pos[anchors_t]
+        z_pos_pos = z_pos[pos_nb_t]
+        z_pos_neg = z_pos[neg_dst]
+
+        z_anchor_neg = z_neg[anchors_t]
+        z_neg_pos = z_neg[pos_nb_t]
+        z_neg_neg = z_neg[neg_dst]
+
+        return (z_anchor_pos, z_pos_pos, z_pos_neg, z_anchor_neg, z_neg_pos, z_neg_neg)

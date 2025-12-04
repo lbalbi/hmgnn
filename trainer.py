@@ -34,12 +34,22 @@ class Train:
         self.fullcv_graph = full_cvgraph.to(self.device)
         self.val_edges = val_edges
         self.val_edge_batch_size = val_edge_batch_size
-        self._setup_samplers(full_cvgraph, full_graph, state_list, gda_negs, pstatement_sampler,
-            nstatement_sampler, rstatement_sampler, no_contrastive)
+
+        # samplers (including NegativeStatementSampler) are created here
+        self._setup_samplers(
+            full_cvgraph, full_graph, state_list, gda_negs,
+            pstatement_sampler, nstatement_sampler, rstatement_sampler, no_contrastive
+        )
+
         self.loss_fn = torch.nn.BCELoss()
-        self.contrastive = DualContrastiveLoss_CE()
+        self.contrastive = None
+        if not no_contrastive and (self.neg_statement_sampler is not None):
+            self.contrastive = ComposedContrastiveLoss_CE(
+                sampler=self.neg_statement_sampler, temperature=0.5, lambda_neg=1.0)
+
         init_alpha = float(contrastive_weight)
-        if init_alpha <= 0: init_alpha = 0.1
+        if init_alpha <= 0:
+            init_alpha = 0.1
         self.alpha = torch.nn.Parameter(torch.log(torch.tensor(init_alpha, device=self.device)))
         self.earlystopper = EarlyStopping()
         self.metrics = Metrics()
@@ -56,6 +66,9 @@ class Train:
         self.rstatement_sampler = rstatement_sampler
         self.pstatement_sampler = pstatement_sampler
         self.nstatement_sampler = nstatement_sampler
+
+        self.neg_statement_sampler = None
+
         if rstatement_sampler:
             self.neg_statement_sampler = RandomStatementSampler()
             self.neg_statement_sampler.prepare_global(full_cvgraph)
@@ -64,16 +77,26 @@ class Train:
             self.neg_statement_sampler.prepare_global(full_cvgraph)
         elif pstatement_sampler:
             self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_statement_sampler.prepare_global(full_cvgraph,pos_etype="neg_statement",
-                neg_etype="pos_statement")
+            self.neg_statement_sampler.prepare_global(
+                full_cvgraph,
+                pos_etype="neg_statement",
+                neg_etype="pos_statement"
+            )
         elif not self.no_contrastive:
+            # default: our new NegativeStatementSampler
             self.neg_statement_sampler = NegativeStatementSampler(anchor_etype=self.e_type)
-            self.neg_statement_sampler.prepare_global(full_cvgraph, negatives=gda_negs if self.task == "gda" else None)
-        #self.neg_sampler = NegativeSampler(full_graph, edge_type=("node", self.e_type, "node"), device=self.device)
+            self.neg_statement_sampler.prepare_global(
+                full_cvgraph,
+                negatives=gda_negs if self.task == "gda" else None
+            )
+
         ppi_key = next(et for et in full_graph.edge_types if et[1] == self.e_type)
         all_pos_edge_index = full_graph[ppi_key].edge_index
-        self.neg_sampler = NegativeSampler(full_cvgraph, edge_type=("node", self.e_type, "node"),
-            all_pos_edge_index=all_pos_edge_index)
+        self.neg_sampler = NegativeSampler(
+            full_cvgraph,
+            edge_type=("node", self.e_type, "node"),
+            all_pos_edge_index=all_pos_edge_index
+        )
 
 
 
@@ -108,7 +131,7 @@ class Train:
 
 
 
-    def _prepare_pairs_and_labels(self,graph,pos_index: torch.Tensor = None):
+    def _prepare_pairs_and_labels(self, graph, pos_index: torch.Tensor = None):
         """
         Builds edge_index (pos+neg) and labels given a HeteroData graph to use for samplers / embedding
         and a pos_index: [2, N_pos] or None. If pos_index is None, positives are taken from the graph adjacency
@@ -116,13 +139,19 @@ class Train:
         directly (validation/test masked-edge setting).
         """
 
-        if pos_index is None: pos_index = _get_pos_edge_index(self.model, self.e_type, graph)
+        if pos_index is None:
+            pos_index = _get_pos_edge_index(self.model, self.e_type, graph)
         pos_index = pos_index.to(self.device)
         neg_src, neg_dst = self.neg_sampler.sample(pos_index.size(1))
         neg_index = torch.stack([neg_src, neg_dst], dim=0)
         edge_index = torch.cat([pos_index, neg_index], dim=1)
-        labels = torch.cat([torch.ones(pos_index.size(1), device=self.device),
-                torch.zeros(neg_index.size(1), device=self.device),], dim=0)
+        labels = torch.cat(
+            [
+                torch.ones(pos_index.size(1), device=self.device),
+                torch.zeros(neg_index.size(1), device=self.device),
+            ],
+            dim=0,
+        )
         return edge_index, labels, pos_index
 
 
@@ -136,37 +165,48 @@ class Train:
             self.optimizer.zero_grad()
 
             edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(
-                batch, pos_index=None)
+                batch, pos_index=None
+            )
 
+            # reset neg_stmt_idx each iteration
+            neg_stmt_idx = None
+
+            # Prepare statement sampler state
             if self.rstatement_sampler:
                 self.neg_statement_sampler.prepare_batch(batch, pos_index)
                 neg_stmt_idx = self.neg_statement_sampler.sample()
             elif self.nstatement_sampler or self.pstatement_sampler:
                 self.neg_statement_sampler.prepare_batch(batch)
                 neg_stmt_idx = self.neg_statement_sampler.sample()
-            elif not self.no_contrastive:
+            elif (not self.no_contrastive) and (self.neg_statement_sampler is not None):
                 self.neg_statement_sampler.prepare_batch(batch)
 
+            # Forward pass
             if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                 hom_data, offsets = self._to_homogeneous_pyg(batch)
                 src = edge_index_pairs[0] + offsets[self.n_type]
                 dst = edge_index_pairs[1] + offsets[self.n_type]
                 mapped_pairs = torch.stack([src, dst], dim=0)
-                z, out = self.model(hom_data, mapped_pairs)
-            else: z_pos, z_neg, out = self.model(batch, edge_index_pairs)
+                z_single, out = self.model(hom_data, mapped_pairs)
+                # single-view models: use same embedding for both views
+                z_pos = z_neg = z_single
+            else:
+                # HGCN-style models return two embeddings
+                z_pos, z_neg, out = self.model(batch, edge_index_pairs)
 
             self._alpha = F.softplus(self.alpha)
-            if not self.no_contrastive:
-                args = (z, neg_stmt_idx) if "neg_stmt_idx" in locals() else (z,)
-                z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
-                loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
+
+            if (not self.no_contrastive) and (self.contrastive is not None):
+                loss_contrast = self.contrastive(z_pos, z_neg, neg_stmt_idx)
                 loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-            else: loss = self.loss_fn(out.squeeze(-1), labels)
+            else:
+                loss = self.loss_fn(out.squeeze(-1), labels)
 
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item() * out.size(0)
             total_examples += out.size(0)
+
         avg_loss = total_loss / total_examples if total_examples else 0.0
         return avg_loss, (out, labels)
 
@@ -188,34 +228,35 @@ class Train:
                 end = min(start + batch_size, num_pos)
                 pos_index = pos_edges[:, start:end]
                 edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(
-                    graph, pos_index=pos_index)
+                    graph, pos_index=pos_index
+                )
 
+                neg_stmt_idx = None
                 if self.rstatement_sampler:
                     self.neg_statement_sampler.prepare_batch(graph, pos_index)
                     neg_stmt_idx = self.neg_statement_sampler.sample()
                 elif self.nstatement_sampler or self.pstatement_sampler:
                     self.neg_statement_sampler.prepare_batch(graph)
                     neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif not self.no_contrastive: self.neg_statement_sampler.prepare_batch(graph)
+                elif (not self.no_contrastive) and (self.neg_statement_sampler is not None):
+                    self.neg_statement_sampler.prepare_batch(graph)
 
                 if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                     hom_data, offsets = self._to_homogeneous_pyg(graph)
                     src = edge_index_pairs[0] + offsets[self.n_type]
                     dst = edge_index_pairs[1] + offsets[self.n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
-                    z, out = self.model(hom_data, mapped_pairs)
-                else: z_pos, z_neg, out = self.model(graph, edge_index_pairs)
+                    z_single, out = self.model(hom_data, mapped_pairs)
+                    z_pos = z_neg = z_single
+                else:
+                    z_pos, z_neg, out = self.model(graph, edge_index_pairs)
 
                 self._alpha = F.softplus(self.alpha)
-                if not self.no_contrastive:
-                    if self.rstatement_sampler or self.nstatement_sampler or self.pstatement_sampler:
-                        z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z, neg_stmt_idx)
-                        loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
-                    else:
-                        z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
-                        loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
+                if (not self.no_contrastive) and (self.contrastive is not None):
+                    loss_contrast = self.contrastive(z_pos, z_neg, neg_stmt_idx)
                     loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-                else: loss = self.loss_fn(out.squeeze(-1), labels)
+                else:
+                    loss = self.loss_fn(out.squeeze(-1), labels)
 
                 total_loss += loss.item() * out.size(0)
                 total_examples += out.size(0)
@@ -225,10 +266,12 @@ class Train:
         return avg_loss, (last_out, last_labels)
 
 
+
     def validate_epoch(self):
-        
+
         self.model.eval()
-        if self.val_edges is not None: return self._val_on_graph_and_edges(self.fullcv_graph, self.val_edges)
+        if self.val_edges is not None:
+            return self._val_on_graph_and_edges(self.fullcv_graph, self.val_edges)
         total_loss = total_examples = 0
         last_out, last_labels = None, None
 
@@ -236,13 +279,15 @@ class Train:
             for batch in self.val_loader:
                 batch = batch.to(self.device)
                 edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(batch)
+
+                neg_stmt_idx = None
                 if self.rstatement_sampler:
                     self.neg_statement_sampler.prepare_batch(batch, pos_index)
                     neg_stmt_idx = self.neg_statement_sampler.sample()
                 elif self.nstatement_sampler or self.pstatement_sampler:
                     self.neg_statement_sampler.prepare_batch(batch)
                     neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif not self.no_contrastive:
+                elif (not self.no_contrastive) and (self.neg_statement_sampler is not None):
                     self.neg_statement_sampler.prepare_batch(batch)
 
                 if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
@@ -250,16 +295,17 @@ class Train:
                     src = edge_index_pairs[0] + offsets[self.n_type]
                     dst = edge_index_pairs[1] + offsets[self.n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
-                    z, out = self.model(hom_data, mapped_pairs)
-                else: z_pos, z_neg, out = self.model(batch, edge_index_pairs)
+                    z_single, out = self.model(hom_data, mapped_pairs)
+                    z_pos = z_neg = z_single
+                else:
+                    z_pos, z_neg, out = self.model(batch, edge_index_pairs)
 
                 self._alpha = F.softplus(self.alpha)
-                if not self.no_contrastive:
-                    args = (z, neg_stmt_idx) if "neg_stmt_idx" in locals() else (z,)
-                    z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
-                    loss_contrast = self.contrastive(z_pos, z_neg, z_pos_pos, z_pos_neg)
+                if (not self.no_contrastive) and (self.contrastive is not None):
+                    loss_contrast = self.contrastive(z_pos, z_neg, neg_stmt_idx)
                     loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-                else: loss = self.loss_fn(out.squeeze(-1), labels)
+                else:
+                    loss = self.loss_fn(out.squeeze(-1), labels)
 
                 total_loss += loss.item() * out.size(0)
                 total_examples += out.size(0)
