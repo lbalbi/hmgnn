@@ -1,4 +1,5 @@
 import copy, torch
+import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops
 from utils import Metrics, EarlyStopping, _get_pos_edge_index
@@ -8,7 +9,7 @@ from samplers import (
     NegativeSampler,
     RandomStatementSampler,
 )
-from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin
+from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin, ComposedContrastiveLoss_CE
 
 
 class Train:
@@ -37,7 +38,9 @@ class Train:
             nstatement_sampler, rstatement_sampler, no_contrastive)
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = DualContrastiveLoss_CE()
-        self.alpha = contrastive_weight
+        init_alpha = float(contrastive_weight)
+        if init_alpha <= 0: init_alpha = 0.1
+        self.alpha = torch.nn.Parameter(torch.log(torch.tensor(init_alpha, device=self.device)))
         self.earlystopper = EarlyStopping()
         self.metrics = Metrics()
         header = "Setting, Epoch, " + ", ".join(self.metrics.get_names())
@@ -107,10 +110,8 @@ class Train:
 
     def _prepare_pairs_and_labels(self,graph,pos_index: torch.Tensor = None):
         """
-        Build edge_index (pos+neg) and labels given:
-          - graph: HeteroData to use for samplers / embedding
-          - pos_index: [2, N_pos] or None
-        If pos_index is None, positives are taken from the graph adjacency
+        Builds edge_index (pos+neg) and labels given a HeteroData graph to use for samplers / embedding
+        and a pos_index: [2, N_pos] or None. If pos_index is None, positives are taken from the graph adjacency
         via _get_pos_edge_index (training). If provided, they are used
         directly (validation/test masked-edge setting).
         """
@@ -154,14 +155,13 @@ class Train:
                 z, out = self.model(hom_data, mapped_pairs)
             else: z, out = self.model(batch, edge_index_pairs)
 
+            self._alpha = F.softplus(self.alpha)
             if not self.no_contrastive:
                 args = (z, neg_stmt_idx) if "neg_stmt_idx" in locals() else (z,)
                 z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
                 loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-                loss = self.alpha * loss_contrast + self.loss_fn(
-                    out.squeeze(-1), labels)
-            else:
-                loss = self.loss_fn(out.squeeze(-1), labels)
+                loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
+            else: loss = self.loss_fn(out.squeeze(-1), labels)
 
             loss.backward()
             self.optimizer.step()
@@ -206,6 +206,7 @@ class Train:
                     z, out = self.model(hom_data, mapped_pairs)
                 else: z, out = self.model(graph, edge_index_pairs)
 
+                self._alpha = F.softplus(self.alpha)
                 if not self.no_contrastive:
                     if self.rstatement_sampler or self.nstatement_sampler or self.pstatement_sampler:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z, neg_stmt_idx)
@@ -213,7 +214,7 @@ class Train:
                     else:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
                         loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-                    loss = self.alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
+                    loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
                 else: loss = self.loss_fn(out.squeeze(-1), labels)
 
                 total_loss += loss.item() * out.size(0)
@@ -252,11 +253,12 @@ class Train:
                     z, out = self.model(hom_data, mapped_pairs)
                 else: z, out = self.model(batch, edge_index_pairs)
 
+                self._alpha = F.softplus(self.alpha)
                 if not self.no_contrastive:
                     args = (z, neg_stmt_idx) if "neg_stmt_idx" in locals() else (z,)
                     z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
                     loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-                    loss = self.alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
+                    loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
                 else: loss = self.loss_fn(out.squeeze(-1), labels)
 
                 total_loss += loss.item() * out.size(0)
@@ -268,16 +270,19 @@ class Train:
 
     def run(self):
         best_lr = None
-        best_val_loss = float("inf")
+        # best_val_loss = float("inf")
+        best_val_f1 = float("-inf")
         best_metrics = None
 
         for lr_ in self.lrs:
             best_lr_epoch = None
-            best_lr_val_loss = float("inf")
+            #best_lr_val_loss = float("inf")
+            best_f1_this_lr = float("-inf")
             best_lr_metrics = None
 
             self.model.load_state_dict(self._init_state)
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr_)
+            params = list(self.model.parameters()) + [self.alpha]
+            self.optimizer = torch.optim.Adam(params, lr=lr_)
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr_
             self.earlystopper = EarlyStopping()
@@ -294,16 +299,16 @@ class Train:
                     best_epoch = epoch
                     break
 
-            if val_loss < best_lr_val_loss:  # best per LR
-                best_lr_val_loss, best_lr_epoch = val_loss, epoch
-                best_lr_metrics = self.metrics.update(out.detach().cpu(), lbls.cpu())
+            lr_metrics = self.metrics.update(out.detach().cpu(), lbls.cpu())
+            if lr_metrics[1] > best_f1_this_lr:  # best per LR
+                best_f1_this_lr, best_lr_epoch, best_lr_metrics, best_val_loss = lr_metrics[1], epoch, lr_metrics, val_loss
                 self.log.log(f"Best Metrics: LR={lr_}, {epoch}, " + ", ".join([f"{v:.4f}" for v in best_lr_metrics]))
-            if val_loss < best_val_loss:  # best overall
-                best_val_loss, best_lr, best_epoch = val_loss, lr_, epoch
-                best_metrics = self.metrics.update(out.detach().cpu(), lbls.cpu())
+            
+            if lr_metrics[1] > best_val_f1:  # best overall
+                best_val_f1, best_lr, best_epoch, best_alpha, best_metrics, best_val_loss = lr_metrics[1], lr_, epoch, self._alpha.item(), lr_metrics, val_loss
                 torch.save(self.model.state_dict(), self.log.dir + "model_" + self.model.__class__.__name__ + ".pth")
 
-        print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}  ***")
+        print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}, Val F1 = {best_val_f1:.4f}  ***")
         for name, val in zip(self.metrics.get_names(), best_metrics):
             print(f"{name}: {val:.4f}")
-        return best_lr, best_val_loss, best_metrics, best_epoch
+        return best_lr, best_val_loss, best_metrics, best_epoch, best_alpha

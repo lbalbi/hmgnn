@@ -1,13 +1,12 @@
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops
 from utils import Metrics, EarlyStopping, _get_pos_edge_index, _target_edge_key
-from samplers import (
-    NegativeStatementSampler,
+from samplers import (NegativeStatementSampler,
     PartialStatementSampler,
     NegativeSampler,
-    RandomStatementSampler,
-)
+    RandomStatementSampler)
 from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin
 
 
@@ -151,6 +150,7 @@ class Train_BestModel:
                     loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
 
             loss_cls = self.loss_fn(out.squeeze(-1), labels)
+
             loss_total = (self.alpha * loss_contrast + loss_cls if not self.no_contrastive else loss_cls)
             loss_total.backward()
             self.optimizer.step()
@@ -203,10 +203,9 @@ class Train_BestModel:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z, neg_statement_index)
                         loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
                     else:
-                        z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(
-                            z
-                        )
+                        z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
                         loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+                        
                 loss_cls = self.loss_fn(out.squeeze(-1), labels)
                 loss_total = (self.alpha * loss_contrast + loss_cls if not self.no_contrastive else loss_cls)
                 num_examples = out.size(0)
@@ -251,6 +250,7 @@ class Train_BestModel:
                     z, out = self.model(hom_data, mapped_pairs)
                 else: z, out = self.model(batch, edge_index)
 
+
                 if not self.no_contrastive:
                     if self.rstatement_sampler or self.nstatement__sampler or self.pstatement_sampler:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(
@@ -259,12 +259,14 @@ class Train_BestModel:
                     else:
                         z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
                         loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
+
                 loss_cls = self.loss_fn(out.squeeze(-1), labels)
                 loss_total = (self.alpha * loss_contrast + loss_cls if not self.no_contrastive else loss_cls)
                 num_examples = out.size(0)
                 total_loss += loss_total.item() * num_examples
                 total_examples += num_examples
                 last_out, last_labels = out, labels
+
         return (total_loss / total_examples), (last_out, last_labels)
 
 

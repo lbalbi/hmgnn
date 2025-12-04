@@ -1,4 +1,4 @@
-import argparse, torch
+import argparse, torch, os
 from models import *
 from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
@@ -22,7 +22,7 @@ def main():
     statements in sampling")
     parser.add_argument('--no_contrastive', action='store_true', help="Disable contrastive learning")
     parser.add_argument('--path', type=str, default="human_data", help="Path to the dataset directory")
-    parser.add_argument('--output_dir', type=str, default="", help="Directory to save output logs and models")
+    parser.add_argument('--output_dir', type=str, default="output/", help="Directory to save output logs and models")
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -42,36 +42,52 @@ def main():
 
     full_graph = dl.make_data_graph(dl.get_data())
     ppi_rel = mcfg["ppi_etype"][1] if isinstance(mcfg["ppi_etype"], (list, tuple)) else mcfg["ppi_etype"]
+
     ppi_key = next((et for et in full_graph.edge_types if et[1] == ppi_rel), None)
     ppi_ei = full_graph[ppi_key].edge_index
     all_eids = torch.arange(ppi_ei.size(1))
-    trainval_eids_np, test_eids_np = train_test_split(all_eids.cpu().numpy(), test_size=0.1, random_state=42, shuffle=True)
-    trainval_eids = torch.tensor(trainval_eids_np, dtype=torch.long)
-    test_eids = torch.tensor(test_eids_np, dtype=torch.long)
-    #split_helper = Pygloader(full_graph, ppi_rel=ppi_rel, batch_size=args.batch_size, val_split=0, device=device)
-    #trainval_graph = split_helper._create_split_graph(trainval_eids)
-    #test_graph = split_helper._create_split_graph(test_eids)
-    split_helper_train = Pygloader(full_graph, ppi_rel=ppi_rel, batch_size=args.batch_size, val_split=0,device=device)
+
+    split_helper_train = Pygloader(full_graph, ppi_rel=ppi_rel, 
+            batch_size=args.batch_size, val_split=0, device=device)
+
+    split_id = args.path.split("/")[0]
+    split_dir = os.path.join(split_id, "splits_{}".format(args.task))
+    os.makedirs(split_dir, exist_ok=True)
+    trainval_eids_path = os.path.join(split_dir, "trainval_eids.pt")
+    test_eids_path = os.path.join(split_dir, "test_eids.pt")
+
+    if os.path.exists(trainval_eids_path) and os.path.exists(test_eids_path):
+        trainval_eids = torch.load(trainval_eids_path, weights_only=False)
+        test_eids = torch.load(test_eids_path, weights_only=False)
+    else:
+        trainval_eids_np, test_eids_np = train_test_split(
+            all_eids.cpu().numpy(), test_size=0.15, random_state=42, shuffle=True)
+        trainval_eids = torch.tensor(trainval_eids_np, dtype=torch.long)
+        test_eids = torch.tensor(test_eids_np, dtype=torch.long)
+        torch.save(trainval_eids, trainval_eids_path)
+        torch.save(test_eids, test_eids_path)
+
     trainval_graph = split_helper_train._create_split_graph(trainval_eids, train=True)
-    test_ppis  = full_graph[ppi_key].edge_index[:, test_eids]
+    test_ppis = full_graph[ppi_key].edge_index[:, test_eids]
     test_graph = trainval_graph
-    #split_helper_test = Pygloader(full_graph, ppi_rel=ppi_rel,batch_size=args.batch_size, val_split=0,device=device)
-    #test_graph, test_ppis = split_helper_test._create_split_graph(test_eids, train=False)
 
     trainval_loader = Pygloader(trainval_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
                                 val_split=0.1, device=device, seed=42)
     test_loader = Pygloader(test_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
                             val_split=0.0, device=device, seed=42)
 
+
     kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
-    best_lrs, best_f1, best_epochs = [], -1.0, []
+    best_lrs, best_epochs, best_alphas = [], [], []
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
         print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
+
         fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
         fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
         fold_train_graph = split_helper_train._create_split_graph(fold_train_eids)
         fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids,train=False)
+
         train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
                                  batch_size=args.batch_size, device=device)
         val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
@@ -86,11 +102,14 @@ def main():
         log=log, lrs=cfg["lr"], device=device, full_graph=full_graph, full_cvgraph=fold_train_graph, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
             pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
             rstatement_sampler=args.use_rstatement_sampler, task=args.task,gda_negs=gda_negs, no_contrastive=args.no_contrastive)
-        lr, loss, _, epoch_ = trainer.run()
+        lr, loss,  _, epoch_, alpha_ = trainer.run()
         best_epochs.append(epoch_)
         best_lrs.append(lr)
+        best_alphas.append(alpha_)
+
     best_lr = mode(best_lrs)
     best_epoch = mode(best_epochs)
+    best_alpha = mode(best_alphas)
 
     final_model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                 e_etypes=[tuple(e) for e in mcfg["edge_types"]],ppi_etype=ppi_rel).to(device)
@@ -98,19 +117,14 @@ def main():
     final_log = Logger("final_train", dir=args.output_dir, non_verbose=True)
     gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
         (args.path == "gda_data" or args.path == "dp_data") else None
-    #final_trainer = Train_BestModel(final_model, best_epoch, trainval_loader, [], 
-        # full_cvgraph=trainval_graph, e_type=ppi_rel, log=final_log, device=device, task=args.task, lr=best_lr,
-        # contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
-        # pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
-        # rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
     final_trainer = Train_BestModel(final_model, best_epoch, trainval_loader, [],full_cvgraph=trainval_graph,full_graph=full_graph,
         e_type=ppi_rel, log=final_log, device=device, task=args.task, lr=best_lr,
-        contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+        contrastive_weight=best_alpha, state_list=state_list,
         pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
         rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
     loss, (pred, _) = final_trainer.run()
     print(f"Final training loss: {loss:.4f}", flush=True)
-
+    
     final_log_test = Logger("final_test", dir=args.output_dir)
     tester = Test_BestModel(final_model, test_loader=test_loader, e_type=ppi_rel, test_edges=test_ppis, test_edge_batch_size=args.batch_size,
     log=final_log_test, test_graph=test_graph, full_graph=full_graph, device=device, task=args.task, gda_negs=gda_negs)

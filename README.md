@@ -1,4 +1,4 @@
-Original implementation of Contrastive Relational GNN approach for the paper submission "Integrating Negative Scientific Knowledge into Relational Graph Learning".
+Original implementation of Contrastive Relational GNN approach for the paper submission "Contrastive Graph Learning with Negative Biomedical Knowledge".
 
 ####
 
@@ -11,18 +11,12 @@ To setup a conda environment with the needed dependencies and download the bench
 sbatch setup.sh ENV_NAME=myenv
 ```
 
-To run a full default experiment for the Contrastive Relational GNN execute the following in-line command:
-
-```
-sbatch run.sh
-```
-
-To run 10 experiments in parallel (asuming a SLURM environment) execute the following in-line command:
+To run 10 experiments in parallel for the Contrastive Relational (asuming a SLURM environment) execute the following in-line command:
 
 ```
 sbatch run_parallel.sh
 ```
 
-Within the .sh files you can pass specific arguments to change the experimental settings and benchmarks; see the examples provided in the files.
+Within the .sh files you can pass specific arguments to change the experimental settings and benchmarks; see the example .sh provided.
 
 This pipeline is extensible to other GNN configurations and datasets by adding their parameters and metadata in a config.json file.
