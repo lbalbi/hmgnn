@@ -135,11 +135,13 @@ class Train_BestModel:
                 dst = edge_index[1] + offsets[n_type]
                 mapped_pairs = torch.stack([src, dst], dim=0)
                 z_single, out = self.model(hom_data, mapped_pairs)
-                z_pos = z_neg = z_single
             else: z_pos, z_neg, out = self.model(batch, edge_index)
 
             use_contrastive = (not self.no_contrastive) and (self.contrastive is not None)
-            if use_contrastive: loss_contrast = self.contrastive(z_pos, z_neg, neg_statement_index)
+            if use_contrastive: 
+                args = (z_single, neg_statement_index) if self.model.__class__.__name__ in  {"GCN", "GAT", 
+                "GCN_GAE"} else (z_pos, z_neg, neg_statement_index)
+                loss_contrast = self.contrastive(*args)
             loss_cls = self.loss_fn(out.squeeze(-1), labels)
             loss_total = (self.alpha * loss_contrast + loss_cls if use_contrastive else loss_cls)
 
@@ -189,12 +191,13 @@ class Train_BestModel:
                     dst = edge_index[1] + offsets[n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     z_single, out = self.model(hom_data, mapped_pairs)
-                    z_pos = z_neg = z_single
                 else: z_pos, z_neg, out = self.model(graph, edge_index)
 
                 use_contrastive = (not self.no_contrastive) and (self.contrastive is not None)
                 if use_contrastive:
-                    loss_contrast = self.contrastive(z_pos, z_neg, neg_statement_index)
+                    args = (z_single, neg_statement_index) if self.model.__class__.__name__ in {"GCN",
+                     "GAT", "GCN_GAE"} else (z_pos, z_neg, neg_statement_index)
+                    loss_contrast = self.contrastive(*args)
                 loss_cls = self.loss_fn(out.squeeze(-1), labels)
                 loss_total = (self.alpha * loss_contrast + loss_cls if use_contrastive else loss_cls)
 
@@ -240,11 +243,13 @@ class Train_BestModel:
                     dst = edge_index[1] + offsets[n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     z_single, out = self.model(hom_data, mapped_pairs)
-                    z_pos = z_neg = z_single
                 else: z_pos, z_neg, out = self.model(batch, edge_index)
 
                 use_contrastive = (not self.no_contrastive) and (self.contrastive is not None)
-                if use_contrastive: loss_contrast = self.contrastive(z_pos, z_neg, neg_statement_index)
+                if use_contrastive: 
+                    args = (z_single, neg_statement_index) if self.model.__class__.__name__ in {"GCN", 
+                     "GAT", "GCN_GAE"} else (z_pos, z_neg, neg_statement_index)
+                    loss_contrast = self.contrastive(*args)
                 loss_cls = self.loss_fn(out.squeeze(-1), labels)
                 loss_total = (self.alpha * loss_contrast + loss_cls if use_contrastive else loss_cls)
 
