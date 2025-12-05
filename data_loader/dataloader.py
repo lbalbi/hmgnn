@@ -5,21 +5,21 @@ import pandas as pd
 import torch
 from torch_geometric.data import HeteroData
 
-
 EdgeType = Union[str, int]
 
 
 class DataLoader:
     """DataLoader for loading heterogeneous graph data from CSV/TXT files.
 
-    It expects each file to have columns: `source_node`, `target_node`, `edge_type`.
+    Expects each file to have columns:
+        source_node, target_node, edge_type
 
-    This version supports:
-      - Multiple relation types per file (via the `edge_type` column).
-      - Separating *training* vs *test* files by filename:
+    Features:
+      - Handles many relation types via the `edge_type` column.
+      - Splits *training* vs *test* files by filename:
           * files whose name contains "test" (case-insensitive) are treated as test
           * all other files are treated as training
-      - Optional extraction/removal of statement edges for samplers.
+      - Optionally extracts/removes statement edges (pos/neg) for samplers.
     """
 
     def __init__(
@@ -46,7 +46,7 @@ class DataLoader:
             if "test" in os.path.basename(f).lower()
         ]
 
-        # Graph is built only from training files
+        # Graph is built only from training files (e.g. train2id_pos/neg)
         self.data: Dict[EdgeType, Tuple[torch.Tensor, torch.Tensor]] = self.load_data(train_files)
         # Test edges (not added to the graph)
         self.test_data: Dict[EdgeType, Tuple[torch.Tensor, torch.Tensor]] = (
@@ -63,7 +63,7 @@ class DataLoader:
             if "neg_statement" in self.data:
                 src, tgt = self.data.pop("neg_statement")
                 self.state_list = list(zip(src.tolist(), tgt.tolist()))
-        elif self.use_rstatement_sampler:  # keep neg_statement edges in the graph, but store them as state_list
+        elif self.use_rstatement_sampler:
             if "neg_statement" in self.data:
                 src, tgt = self.data["neg_statement"]
                 self.state_list = list(zip(src.tolist(), tgt.tolist()))
@@ -82,15 +82,22 @@ class DataLoader:
 
     def load_data(self, edge_files: List[str]) -> Dict[EdgeType, Tuple[torch.Tensor, torch.Tensor]]:
         """Load a list of CSV/TXT files and group edges by `edge_type`.
-        Returns: Dict[edge_type, (src_tensor, tgt_tensor)]
+
+        Returns:
+            Dict[edge_type, (src_tensor, tgt_tensor)]
         """
-        if not edge_files: return {}
+        if not edge_files:
+            return {}
+
         dfs = [pd.read_csv(f) for f in edge_files]
         all_edges = pd.concat(dfs, ignore_index=True)
 
-        if not {"source_node", "target_node", "edge_type"}.issubset(all_edges.columns):
-            raise ValueError("Input files must contain columns: 'source_node', 'target_node', 'edge_type'. "
-                f"Got columns: {list(all_edges.columns)}")
+        required_cols = {"source_node", "target_node", "edge_type"}
+        if not required_cols.issubset(all_edges.columns):
+            raise ValueError(
+                "Input files must contain columns: 'source_node', 'target_node', 'edge_type'. "
+                f"Got columns: {list(all_edges.columns)}"
+            )
 
         data_dict: Dict[EdgeType, Tuple[torch.Tensor, torch.Tensor]] = {}
         for edge_type, group in all_edges.groupby("edge_type"):
@@ -99,7 +106,9 @@ class DataLoader:
             data_dict[edge_type] = (src_nodes, tgt_nodes)
         return data_dict
 
-
+    # ------------------------------------------------------------------
+    # Graph construction
+    # ------------------------------------------------------------------
     def make_data_graph(
         self,
         data: Dict[EdgeType, Tuple[torch.Tensor, torch.Tensor]],
@@ -107,11 +116,13 @@ class DataLoader:
         in_dim: int = 128,
     ) -> HeteroData:
         """Create a PyTorch Geometric HeteroData graph from the edge dictionary.
+
         The graph uses a single node type "node" and multiple edge types of the
         form ("node", edge_type, "node").
         """
         hetero = HeteroData()
 
+        # Infer number of nodes from max id in all edges
         max_id = -1
         for src, tgt in data.values():
             if src.numel():
@@ -121,21 +132,27 @@ class DataLoader:
         num_nodes = max_id + 1 if max_id >= 0 else 0
         hetero["node"].num_nodes = num_nodes
 
+        # Add edges
         for edge_type, (src, tgt) in data.items():
             if src.numel() == 0:
                 continue
             edge_index = torch.stack([src, tgt], dim=0)
             hetero[("node", edge_type, "node")].edge_index = edge_index
 
+        # Optional node features
         if num_nodes > 0:
             if orthogonal:
                 emb = torch.nn.Embedding(num_nodes, in_dim)
                 torch.nn.init.orthogonal_(emb.weight)
                 hetero["node"].x = emb.weight
-            else: hetero["node"].x = torch.randn(num_nodes, in_dim)
+            else:
+                hetero["node"].x = torch.randn(num_nodes, in_dim)
+
         return hetero
 
-
+    # ------------------------------------------------------------------
+    # Accessors
+    # ------------------------------------------------------------------
     def get_state_list(self) -> List[Tuple[int, int]]:
         """Return the list of statement edges removed (or referenced) from the graph data."""
         return self.state_list
@@ -148,6 +165,14 @@ class DataLoader:
         """Test edges loaded from 'test' files (e.g., test2id_pos.txt)."""
         return self.test_data
 
+    def get_edge_types(self) -> List[EdgeType]:
+        """List of edge_type values discovered from the training data."""
+        return list(self.data.keys())
+
+    def get_test_edge_types(self) -> List[EdgeType]:
+        """List of edge_type values discovered from the test data."""
+        return list(self.test_data.keys())
+
     def get_test_pairs(self, edge_type: EdgeType) -> torch.Tensor:
         """Return test pairs [2, N] for a given relation, or an empty tensor if not present."""
         if edge_type not in self.test_data:
@@ -155,9 +180,7 @@ class DataLoader:
         src, tgt = self.test_data[edge_type]
         return torch.stack([src, tgt], dim=0)
 
-    def get_edge_types(self) -> List[EdgeType]:
-        return list(self.data.keys())
-
+    # For compatibility with GDA-style datasets (no-ops by default)
     def get_negative_edges(self) -> Optional[Dict]:
         return None
 
