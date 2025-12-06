@@ -36,7 +36,7 @@ class NegativeStatementSampler:
         - "instance_of" (`instance_rel`, typically the P31 relation index). """
 
     def __init__(self, k: int = 1, subclass_rel: str = "subclass_of",
-        neg_prefix: str = "NOT_", instance_rel: Optional[str] = None,):
+        neg_prefix: str = "NOT_", instance_rel: str = "2"):
         """ Args:
             k: number of negatives per anchor for contrastive loss.
             subclass_rel: relation name for subclass-of edges ("subclass_of").

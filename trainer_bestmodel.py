@@ -10,30 +10,21 @@ from dualcontrastive_CE import DualContrastiveLoss_CE
 
 
 class Train_BestModel:
-    """
-    Final training on the full training set for a fixed number of epochs
+    """ Final training on the full training set for a fixed number of epochs
     (e.g., the best epoch found during validation, or args.epochs).
-
+    
     Uses triple mini-batching for memory efficiency and optionally
     a contrastive objective via NegativeStatementSampler + DualContrastiveLoss_CE.
+    BCE and contrastive losses are merged into a single loss per batch, so that
+    gradients flow through both encoder and classifier jointly.
     """
 
-    def __init__(
-        self,
-        model: nn.Module,
-        graph: HeteroData,
-        heads: torch.Tensor,
-        rel_ids: torch.Tensor,
-        tails: torch.Tensor,
-        labels: torch.Tensor,
-        lr: float,
-        epochs: int,
-        device: torch.device,
-        log,
-        batch_size: int = 4096,
+    def __init__(self, model: nn.Module, graph: HeteroData, heads: torch.Tensor,
+        rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr: float,
+        epochs: int, device: torch.device, log, batch_size: int = 4096,
         contrastive_sampler: Optional[NegativeStatementSampler] = None,
-        contrastive_weight: float = 0.1,
-    ):
+        contrastive_weight: float = 0.1):
+
         self.model = model.to(device)
         self.graph = graph
         self.heads = heads
@@ -45,64 +36,71 @@ class Train_BestModel:
         self.device = device
         self.log = log
         self.batch_size = int(batch_size)
-
         self.criterion = nn.BCEWithLogitsLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-
-        # Contrastive setup (optional)
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = float(contrastive_weight) if contrastive_sampler is not None else 0.0
         self.contrastive_loss_fn = DualContrastiveLoss_CE() if contrastive_sampler is not None else None
 
-    def _iterate_batches(self, z: torch.Tensor) -> float:
-        """
-        One epoch: iterate over all training triples in mini-batches, update params
-        using BCE only. `z` is assumed to be detached node embeddings so that
-        BCE updates only the classifier parameters.
-        Returns average BCE loss.
+
+    def _iterate_batches(self) -> (float, float):
+        """ One epoch: iterate over all training triples in mini-batches, update params.
+        For each batch, encode graph, computes BCE on the batch, optionally computes
+        contrastive loss on the same embeddings, combines them into total loss, backward, and step.
         """
         num_triples = self.heads.size(0)
         perm = torch.randperm(num_triples, device=self.device)
 
-        total_loss = 0.0
+        total_bce = 0.0
+        total_contr = 0.0
         total_examples = 0
 
+        n_type = getattr(self.model, "n_type", "node")
         self.model.train()
+        
+        if self.contrastive_sampler is not None and hasattr(self.contrastive_sampler, "prepare_batch"):
+            self.contrastive_sampler.prepare_batch(self.graph)
+
         for start in range(0, num_triples, self.batch_size):
             end = min(start + self.batch_size, num_triples)
             idx = perm[start:end]
 
-            h = self.heads[idx]
-            t = self.tails[idx]
-            r = self.rels[idx]
-            y = self.labels[idx]
+            h = self.heads[idx].to(self.device)
+            t = self.tails[idx].to(self.device)
+            r = self.rels[idx].to(self.device)
+            y = self.labels[idx].to(self.device)
+            h_dict = self.model.encode(self.graph.to(self.device))
+            z = h_dict[n_type]
 
             edge_index = torch.stack([h, t], dim=0)
             logits, _ = self.model.score_triples(z, edge_index, r)
-            loss = self.criterion(logits, y)
+            bce_loss = self.criterion(logits, y)
+
+            contr_loss_val = 0.0
+            total_loss = bce_loss
+            if self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+                z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(z)
+                contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
+                total_loss = total_loss + self.contrastive_weight * contr_loss
+                contr_loss_val = float(contr_loss.detach().cpu().item())
 
             self.optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             self.optimizer.step()
 
-            total_loss += loss.item() * y.size(0)
-            total_examples += y.size(0)
+            batch_size_eff = y.size(0)
+            total_bce += bce_loss.detach().cpu().item() * batch_size_eff
+            total_contr += contr_loss_val * batch_size_eff
+            total_examples += batch_size_eff
 
-        avg_loss = total_loss / total_examples if total_examples > 0 else 0.0
-        return avg_loss
+        avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
+        avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
+        return avg_bce, avg_contr
+
 
     def run(self) -> float:
-        """
-        Final training loop.
-
-        Per epoch:
-          1) Encode graph -> z_full, detach -> z_cls, run BCE mini-batch training.
-          2) If contrastive_sampler is provided:
-                - re-encode graph,
-                - compute contrastive loss on global embeddings,
-                - take one optimizer step on contrastive loss.
-        Returns:
-            last BCE loss (from the last epoch).
+        """ Final training loop. Per epoch:
+          - Iterate over batches, jointly optimizing BCE + contrastive loss.
         """
         self.graph = self.graph.to(self.device)
         self.heads = self.heads.to(self.device)
@@ -111,64 +109,35 @@ class Train_BestModel:
         self.labels = self.labels.to(self.device)
 
         last_bce_loss = 0.0
-        n_type = getattr(self.model, "n_type", "node")
+        last_contr_loss = 0.0
 
         for epoch in range(1, self.epochs + 1):
-            # ------------------- BCE classification step -------------------
-            # Encode once, then detach so BCE updates only classifier parameters.
-            h_dict = self.model.encode(self.graph)
-            z_full = h_dict[n_type]
-            z_cls = z_full.detach()
-
-            last_bce_loss = self._iterate_batches(z_cls)
-
-            # ------------------- Contrastive step (optional) ---------------
-            if self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-                self.model.train()
-                h_dict_c = self.model.encode(self.graph)
-                z_c = h_dict_c[n_type]
-
-                z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(z_c)
-                contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
-                total_contr_loss = self.contrastive_weight * contr_loss
-
-                self.optimizer.zero_grad()
-                total_contr_loss.backward()
-                self.optimizer.step()
-            else:
-                total_contr_loss = torch.tensor(0.0)
+            bce_loss, contr_loss = self._iterate_batches()
+            last_bce_loss = bce_loss
+            last_contr_loss = contr_loss
 
             if not getattr(self.log, "non_verbose", False):
-                msg = f"[Final Train] Epoch {epoch:03d} | BCE_Loss={last_bce_loss:.4f}"
+                msg = f"[Final Train] Epoch {epoch:03d} | BCE_Loss={bce_loss:.4f}"
                 if self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-                    msg += f" | ConstrLoss={float(total_contr_loss):.4f}"
+                    msg += f" | ConstrLoss={contr_loss:.4f}"
                 self.log.log(msg)
 
         return last_bce_loss
 
 
 class Test_BestModel:
+    """ Test-time evaluation on a global triple-level test set.
+        Positives: provided explicitly as (heads, rel_ids, tails).
+        Negatives: sampled per relation using existing NegativeSampler.
+        - Negative sampling at test time now ALSO excludes *test positives*,
+        in addition to whatever training positives `NegativeSampler` already
+        avoids. This is done via an extra filtering step per relation.
     """
-    Test-time evaluation on a global triple-level test set.
-
-    Positives: provided explicitly as (heads, rel_ids, tails).
-    Negatives: sampled per relation using existing NegativeSampler.
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        graph: HeteroData,
-        test_heads: torch.Tensor,
-        test_rels: torch.Tensor,
-        test_tails: torch.Tensor,
-        id2rel: Dict[int, str],
-        neg_samplers: Dict[str, NegativeSampler],
-        num_neg_per_pos: int,
-        device: torch.device,
-        log,
-        batch_size: int = 4096,
-    ):
+    def __init__(self, model: nn.Module, graph: HeteroData,
+        test_heads: torch.Tensor, test_rels: torch.Tensor,
+        test_tails: torch.Tensor, id2rel: Dict[int, str],
+        neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int,
+        device: torch.device, log, batch_size: int = 4096):
         self.model = model.to(device)
         self.graph = graph
         self.test_heads = test_heads
@@ -180,16 +149,21 @@ class Test_BestModel:
         self.device = device
         self.log = log
         self.batch_size = int(batch_size)
-
         self.metrics = Metrics()
 
-    def _score_triples_in_batches(
-        self,
-        z: torch.Tensor,
-        heads: torch.Tensor,
-        rels: torch.Tensor,
-        tails: torch.Tensor,
-    ) -> torch.Tensor:
+        self.num_nodes = int(graph["node"].num_nodes)
+        self.test_pos_ids_per_rel: Dict[str, set] = {}
+        for rel_id, rel_name in id2rel.items():
+            mask = (test_rels == rel_id)
+            if not mask.any(): continue
+            h = test_heads[mask]
+            t = test_tails[mask]
+            ids = (h.long() * self.num_nodes + t.long()).tolist()
+            self.test_pos_ids_per_rel[rel_name] = set(ids)
+
+
+    def _score_triples_in_batches(self, z: torch.Tensor, heads: torch.Tensor,
+        rels: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
         """
         Compute probabilities for triples in mini-batches to save memory.
         Returns a tensor of shape [N] with probabilities.
@@ -208,6 +182,49 @@ class Test_BestModel:
                 all_probs.append(probs.detach().cpu())
         return torch.cat(all_probs, dim=0) if all_probs else torch.empty(0)
 
+
+    def _sample_negatives_excluding_test(self, sampler: NegativeSampler,
+        rel_name: str, num_to_sample: int) -> torch.Tensor:
+        """
+        Use NegativeSampler to sample candidate negatives, then filter out any
+        edges that coincide with test positives for `rel_name`. Resamples a few
+        times if needed to reach the desired count (best effort).
+        """
+        invalid_ids = self.test_pos_ids_per_rel.get(rel_name, set())
+        if not invalid_ids: return sampler.sample_edge_index(num_to_sample)
+
+        collected = []
+        remaining = num_to_sample
+        max_attempts = 10
+        attempts = 0
+
+        while remaining > 0 and attempts < max_attempts:
+            attempts += 1
+            cand_edge_index = sampler.sample_edge_index(int(remaining * 1.5))
+            if cand_edge_index.numel() == 0: break
+
+            h = cand_edge_index[0]
+            t = cand_edge_index[1]
+            ids = (h.long() * self.num_nodes + t.long()).tolist()
+            keep_mask_list = [id_ not in invalid_ids for id_ in ids]
+
+            if not any(keep_mask_list): continue
+
+            keep_mask = torch.tensor(keep_mask_list, dtype=torch.bool, device=self.device)
+            kept_edges = cand_edge_index[:, keep_mask]
+            if kept_edges.numel() == 0: continue
+
+            collected.append(kept_edges)
+            remaining = num_to_sample - sum(c.size(1) for c in collected)
+
+        if not collected:
+            return torch.empty(2, 0, dtype=torch.long, device=self.device)
+
+        neg_edge_index = torch.cat(collected, dim=1)
+        if neg_edge_index.size(1) > num_to_sample:
+            neg_edge_index = neg_edge_index[:, :num_to_sample]
+        return neg_edge_index
+
     def run(self):
         self.graph = self.graph.to(self.device)
         self.test_heads = self.test_heads.to(self.device)
@@ -218,14 +235,10 @@ class Test_BestModel:
         with torch.no_grad():
             h_dict = self.model.encode(self.graph)
             z = h_dict[getattr(self.model, "n_type", "node")]
-
-            # ----------------- Positives -----------------
             pos_probs = self._score_triples_in_batches(
-                z, self.test_heads, self.test_rels, self.test_tails
-            )
+                z, self.test_heads, self.test_rels, self.test_tails)
             pos_labels = torch.ones_like(pos_probs)
 
-            # ----------------- Negatives -----------------
             neg_heads_list = []
             neg_rels_list = []
             neg_tails_list = []
@@ -234,19 +247,17 @@ class Test_BestModel:
             for rel_id, count in zip(unique_rels.tolist(), counts.tolist()):
                 rel_name = self.id2rel[rel_id]
                 sampler = self.neg_samplers.get(rel_name, None)
-                if sampler is None:
-                    continue
+                if sampler is None: continue
 
                 num_to_sample = count * self.num_neg_per_pos
-                neg_edge_index = sampler.sample_edge_index(num_to_sample)
-                if neg_edge_index.numel() == 0:
-                    continue
+                neg_edge_index = self._sample_negatives_excluding_test(
+                    sampler, rel_name, num_to_sample)
+                if neg_edge_index.numel() == 0: continue
 
                 h_neg = neg_edge_index[0]
                 t_neg = neg_edge_index[1]
                 r_neg = torch.full(
-                    (h_neg.size(0),), rel_id, dtype=torch.long, device=self.device
-                )
+                    (h_neg.size(0),), rel_id, dtype=torch.long, device=self.device)
 
                 neg_heads_list.append(h_neg)
                 neg_tails_list.append(t_neg)
@@ -258,11 +269,9 @@ class Test_BestModel:
                 neg_rels = torch.cat(neg_rels_list, dim=0)
 
                 neg_probs = self._score_triples_in_batches(
-                    z, neg_heads, neg_rels, neg_tails
-                )
+                    z, neg_heads, neg_rels, neg_tails)
                 neg_labels = torch.zeros_like(neg_probs)
 
-                # Stack positives and negatives and evaluate once
                 all_probs = torch.cat([pos_probs, neg_probs], dim=0)
                 all_labels = torch.cat([pos_labels, neg_labels], dim=0)
             else:
@@ -271,7 +280,6 @@ class Test_BestModel:
 
             metrics = self.metrics.update(all_probs, all_labels)
             names = self.metrics.get_names()
-
             self.log.log("=== Test metrics (global) ===")
             for name, val in zip(names, metrics):
                 self.log.log(f"{name}: {val:.4f}")

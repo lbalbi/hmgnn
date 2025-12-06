@@ -3,14 +3,13 @@ def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-
 import json
 def load_config(task, path="config.json"):
     with open(task + "_"+ path, "r") as f:
         return json.load(f)
-    
-class Logger:
 
+
+class Logger:
     def __init__(self, name, dir= "", non_verbose=False):
         self.non_verbose = non_verbose
         self.name = name
@@ -33,8 +32,6 @@ class Logger:
 
     def close(self):
         self.file.close()
-
-
 
 import torch, copy
 class EarlyStopping:
@@ -65,9 +62,7 @@ class EarlyStopping:
         return self.best_state
     
 
-    
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, accuracy_score
-import torch
 class Metrics:
 
     @staticmethod
@@ -135,8 +130,6 @@ class Metrics:
         return ["accuracy", "f1 score", "precision", "recall", "roc auc"]
 
 
-
-# PyG helpers
 def _target_edge_key(model, e_type, n_type_fallback="node"):
     n_type = getattr(model, "n_type", n_type_fallback)
     return (n_type, e_type, n_type), n_type
