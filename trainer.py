@@ -1,314 +1,246 @@
-import copy, torch
-import torch.nn.functional as F
-from torch_geometric.data import Data
-from torch_geometric.utils import add_self_loops
-from utils import Metrics, EarlyStopping, _get_pos_edge_index
-from samplers import (
-    NegativeStatementSampler,
-    PartialStatementSampler,
-    NegativeSampler,
-    RandomStatementSampler,
-)
-from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin, ComposedContrastiveLoss_CE
+# trainer.py
+import torch
+import torch.nn as nn
+from typing import Optional, Tuple
+from torch_geometric.data import HeteroData
+
+from utils import Metrics, EarlyStopping
+from negativestatement_sampler import NegativeStatementSampler
+from dualcontrastive_CE import DualContrastiveLoss_CE
 
 
 class Train:
-    def __init__(self, model, epochs, train_loader, val_loader, full_graph,
-        full_cvgraph, e_type, log, device, task, lrs=[0.001], gda_negs=None,
-        pstatement_sampler=False, nstatement_sampler=False, rstatement_sampler=False,
-        contrastive_weight=0.1, state_list=None, no_contrastive=False,
-        val_edges: torch.Tensor = None, val_edge_batch_size: int = None):
+    """
+    Triple-level trainer for a relation-aware GNN with optional contrastive learning.
 
+    Assumptions about `model`:
+      - has attribute `n_type` (string) for the main node type (default "node").
+      - has method:
+            encode(data: HeteroData) -> Dict[str, Tensor]
+        returning node embeddings per node type.
+      - has method:
+            score_triples(z: Tensor, edge_index: LongTensor[2, B], rel_ids: LongTensor[B])
+        returning (logits: Tensor[B], probs: Tensor[B]).
+
+    This trainer:
+      - splits triples into train/val either internally (random) or via explicit
+        train_idx / val_idx,
+      - optimizes BCE on labeled triples,
+      - optionally adds a contrastive loss term per epoch using a
+        NegativeStatementSampler and DualContrastiveLoss_CE.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        graph: HeteroData,
+        heads: torch.Tensor,
+        rel_ids: torch.Tensor,
+        tails: torch.Tensor,
+        labels: torch.Tensor,
+        lr: float,
+        epochs: int,
+        device: torch.device,
+        log,
+        batch_size: int = 4096,
+        val_ratio: float = 0.1,
+        early_stopping_patience: int = 20,
+        # NEW: explicit indices and contrastive sampler
+        train_idx: Optional[torch.Tensor] = None,
+        val_idx: Optional[torch.Tensor] = None,
+        contrastive_sampler: Optional[NegativeStatementSampler] = None,
+        contrastive_weight: float = 0.1,
+    ):
+        self.model = model.to(device)
+        self.graph = graph
+        self.heads = heads
+        self.rels = rel_ids
+        self.tails = tails
+        self.labels = labels
+
+        self.lr = float(lr)
+        self.epochs = int(epochs)
         self.device = device
         self.log = log
-        self.task = task
-        self.epochs = epochs
-        self.lrs = lrs
-        self.model = model.to(self.device)
-        self._init_state = copy.deepcopy(self.model.state_dict())
-        self.train_loader = list(train_loader)
-        self.val_loader = list(val_loader)
-        self.e_type = e_type
-        self.ppi_etype = getattr(self.model, "ppi_etype", None)
-        self.n_type = getattr(self.model, "n_type", "node")
-        self.fullcv_graph = full_cvgraph.to(self.device)
-        self.val_edges = val_edges
-        self.val_edge_batch_size = val_edge_batch_size
-        self._setup_samplers(full_cvgraph, full_graph, state_list, gda_negs, pstatement_sampler,
-            nstatement_sampler, rstatement_sampler, no_contrastive)
-        self.loss_fn = torch.nn.BCELoss()
-        self.contrastive = DualContrastiveLoss_CE()
-        init_alpha = float(contrastive_weight)
-        if init_alpha <= 0: init_alpha = 0.1
-        self.alpha = torch.nn.Parameter(torch.log(torch.tensor(init_alpha, device=self.device)))
-        self.earlystopper = EarlyStopping()
+        self.batch_size = int(batch_size)
+        self.val_ratio = float(val_ratio)
+
+        self.criterion = nn.BCEWithLogitsLoss()
         self.metrics = Metrics()
-        header = "Setting, Epoch, " + ", ".join(self.metrics.get_names())
-        self.log.log(header)
+        self.early_stopping = EarlyStopping(patience=early_stopping_patience, mode="min")
 
+        # Contrastive setup
+        self.contrastive_sampler = contrastive_sampler
+        self.contrastive_weight = float(contrastive_weight) if contrastive_sampler is not None else 0.0
+        self.contrastive_loss_fn = DualContrastiveLoss_CE() if contrastive_sampler is not None else None
 
+        # Build train/val split over triples
+        num_triples = self.heads.size(0)
+        if train_idx is not None and val_idx is not None:
+            # Use provided indices (e.g., from KFold)
+            self.train_idx = train_idx.to(torch.long)
+            self.val_idx = val_idx.to(torch.long)
+        else:
+            # Fallback: random split
+            perm = torch.randperm(num_triples)
+            split = int(num_triples * (1.0 - self.val_ratio))
+            self.train_idx = perm[:split]
+            self.val_idx = perm[split:]
 
-    def _setup_samplers(self, full_cvgraph, full_graph,
-        state_list, gda_negs, pstatement_sampler,
-        nstatement_sampler, rstatement_sampler, no_contrastive):
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
-        self.no_contrastive = no_contrastive
-        self.rstatement_sampler = rstatement_sampler
-        self.pstatement_sampler = pstatement_sampler
-        self.nstatement_sampler = nstatement_sampler
-        if rstatement_sampler:
-            self.neg_statement_sampler = RandomStatementSampler()
-            self.neg_statement_sampler.prepare_global(full_cvgraph)
-        elif nstatement_sampler:
-            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_statement_sampler.prepare_global(full_cvgraph)
-        elif pstatement_sampler:
-            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_statement_sampler.prepare_global(full_cvgraph,pos_etype="neg_statement",
-                neg_etype="pos_statement")
-        elif not self.no_contrastive:
-            self.neg_statement_sampler = NegativeStatementSampler(anchor_etype=self.e_type)
-            self.neg_statement_sampler.prepare_global(full_cvgraph, negatives=gda_negs if self.task == "gda" else None)
-        #self.neg_sampler = NegativeSampler(full_graph, edge_type=("node", self.e_type, "node"), device=self.device)
-        ppi_key = next(et for et in full_graph.edge_types if et[1] == self.e_type)
-        all_pos_edge_index = full_graph[ppi_key].edge_index
-        self.neg_sampler = NegativeSampler(full_cvgraph, edge_type=("node", self.e_type, "node"),
-            all_pos_edge_index=all_pos_edge_index)
-
-
-
-    def _to_homogeneous_pyg(self, hetero):
-        """ Convert HeteroData -> homogeneous Data and return (hom_data, offsets).
-        offsets[ntype] = starting global id for that node type in concatenated x. """
-
-        node_types = list(hetero.x_dict.keys())
-        offsets = {}
-        running = 0
-        xs = []
-        for nt in node_types:
-            offsets[nt] = running
-            x_nt = hetero.x_dict[nt]
-            xs.append(x_nt)
-            running += x_nt.size(0)
-        hom_x = torch.cat(xs, dim=0) if xs else torch.empty(0, device=self.device)
-
-        hom_edges = []
-        for (src_nt, rel, dst_nt), eidx in hetero.edge_index_dict.items():
-            src_off = offsets[src_nt]
-            dst_off = offsets[dst_nt]
-            remap = eidx.clone()
-            remap[0] = remap[0] + src_off
-            remap[1] = remap[1] + dst_off
-            hom_edges.append(remap)
-        hom_edge_index = (torch.cat(hom_edges, dim=1) if hom_edges
-            else torch.empty(2, 0, dtype=torch.long, device=self.device))
-        hom_edge_index, _ = add_self_loops(hom_edge_index, num_nodes=hom_x.size(0))
-        hom_data = Data(x=hom_x, edge_index=hom_edge_index).to(self.device)
-        return hom_data, offsets
-
-
-
-    def _prepare_pairs_and_labels(self,graph,pos_index: torch.Tensor = None):
+    def _iterate_batches(
+        self,
+        idx: torch.Tensor,
+        z: torch.Tensor,
+        train: bool = True
+    ) -> Tuple[float, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Builds edge_index (pos+neg) and labels given a HeteroData graph to use for samplers / embedding
-        and a pos_index: [2, N_pos] or None. If pos_index is None, positives are taken from the graph adjacency
-        via _get_pos_edge_index (training). If provided, they are used
-        directly (validation/test masked-edge setting).
+        Iterate over batches of triples indexed by `idx`, compute BCE loss and
+        (optionally) collect outputs and labels for metrics.
+
+        `z` is assumed to be node embeddings for the whole graph (for self.model.n_type).
+        If `train=True`, we update the model parameters using BCE only.
+        Contrastive loss is handled separately at the epoch level.
         """
+        total_loss = 0.0
+        total_examples = 0
+        all_probs = []
+        all_labels = []
 
-        if pos_index is None: pos_index = _get_pos_edge_index(self.model, self.e_type, graph)
-        pos_index = pos_index.to(self.device)
-        neg_src, neg_dst = self.neg_sampler.sample(pos_index.size(1))
-        neg_index = torch.stack([neg_src, neg_dst], dim=0)
-        edge_index = torch.cat([pos_index, neg_index], dim=1)
-        labels = torch.cat([torch.ones(pos_index.size(1), device=self.device),
-                torch.zeros(neg_index.size(1), device=self.device),], dim=0)
-        return edge_index, labels, pos_index
+        if train:
+            self.model.train()
+        else:
+            self.model.eval()
 
+        with torch.set_grad_enabled(train):
+            for start in range(0, idx.size(0), self.batch_size):
+                end = min(start + self.batch_size, idx.size(0))
+                b_idx = idx[start:end]
 
+                h = self.heads[b_idx]
+                t = self.tails[b_idx]
+                r = self.rels[b_idx]
+                y = self.labels[b_idx]
 
-    def train_epoch(self):
-        self.model.train()
-        total_loss = total_examples = 0
+                edge_index = torch.stack([h, t], dim=0)
+                logits, probs = self.model.score_triples(z, edge_index, r)
+                loss = self.criterion(logits, y)
 
-        for batch in self.train_loader:
-            batch = batch.to(self.device)
-            self.optimizer.zero_grad()
+                if train:
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
 
-            edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(
-                batch, pos_index=None)
+                total_loss += loss.item() * y.size(0)
+                total_examples += y.size(0)
+                all_probs.append(probs.detach().cpu())
+                all_labels.append(y.detach().cpu())
 
-            if self.rstatement_sampler:
-                self.neg_statement_sampler.prepare_batch(batch, pos_index)
-                neg_stmt_idx = self.neg_statement_sampler.sample()
-            elif self.nstatement_sampler or self.pstatement_sampler:
-                self.neg_statement_sampler.prepare_batch(batch)
-                neg_stmt_idx = self.neg_statement_sampler.sample()
-            elif not self.no_contrastive:
-                self.neg_statement_sampler.prepare_batch(batch)
-
-            if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
-                hom_data, offsets = self._to_homogeneous_pyg(batch)
-                src = edge_index_pairs[0] + offsets[self.n_type]
-                dst = edge_index_pairs[1] + offsets[self.n_type]
-                mapped_pairs = torch.stack([src, dst], dim=0)
-                z, out = self.model(hom_data, mapped_pairs)
-            else: z, out = self.model(batch, edge_index_pairs)
-
-            self._alpha = F.softplus(self.alpha)
-            if not self.no_contrastive:
-                args = (z, neg_stmt_idx) if "neg_stmt_idx" in locals() else (z,)
-                z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
-                loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-                loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-            else: loss = self.loss_fn(out.squeeze(-1), labels)
-
-            loss.backward()
-            self.optimizer.step()
-            total_loss += loss.item() * out.size(0)
-            total_examples += out.size(0)
-        avg_loss = total_loss / total_examples if total_examples else 0.0
-        return avg_loss, (out, labels)
-
-
-
-    def _val_on_graph_and_edges(self, graph, pos_edges: torch.Tensor):
-        """
-        Runs validation on graph with PPI edges not in the adjacency,
-        using an explicit tensor of PPI edges.
-        """
-        total_loss = total_examples = 0
-        last_out, last_labels = None, None
-        pos_edges = pos_edges.to(self.device)
-        num_pos = pos_edges.size(1)
-        batch_size = self.val_edge_batch_size or num_pos
-
-        with torch.no_grad():
-            for start in range(0, num_pos, batch_size):
-                end = min(start + batch_size, num_pos)
-                pos_index = pos_edges[:, start:end]
-                edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(
-                    graph, pos_index=pos_index)
-
-                if self.rstatement_sampler:
-                    self.neg_statement_sampler.prepare_batch(graph, pos_index)
-                    neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif self.nstatement_sampler or self.pstatement_sampler:
-                    self.neg_statement_sampler.prepare_batch(graph)
-                    neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif not self.no_contrastive: self.neg_statement_sampler.prepare_batch(graph)
-
-                if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
-                    hom_data, offsets = self._to_homogeneous_pyg(graph)
-                    src = edge_index_pairs[0] + offsets[self.n_type]
-                    dst = edge_index_pairs[1] + offsets[self.n_type]
-                    mapped_pairs = torch.stack([src, dst], dim=0)
-                    z, out = self.model(hom_data, mapped_pairs)
-                else: z, out = self.model(graph, edge_index_pairs)
-
-                self._alpha = F.softplus(self.alpha)
-                if not self.no_contrastive:
-                    if self.rstatement_sampler or self.nstatement_sampler or self.pstatement_sampler:
-                        z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z, neg_stmt_idx)
-                        loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-                    else:
-                        z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(z)
-                        loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-                    loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-                else: loss = self.loss_fn(out.squeeze(-1), labels)
-
-                total_loss += loss.item() * out.size(0)
-                total_examples += out.size(0)
-                last_out, last_labels = out, labels
-
-        avg_loss = total_loss / total_examples if total_examples else 0.0
-        return avg_loss, (last_out, last_labels)
-
-
-    def validate_epoch(self):
-        
-        self.model.eval()
-        if self.val_edges is not None: return self._val_on_graph_and_edges(self.fullcv_graph, self.val_edges)
-        total_loss = total_examples = 0
-        last_out, last_labels = None, None
-
-        with torch.no_grad():
-            for batch in self.val_loader:
-                batch = batch.to(self.device)
-                edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(batch)
-                if self.rstatement_sampler:
-                    self.neg_statement_sampler.prepare_batch(batch, pos_index)
-                    neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif self.nstatement_sampler or self.pstatement_sampler:
-                    self.neg_statement_sampler.prepare_batch(batch)
-                    neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif not self.no_contrastive:
-                    self.neg_statement_sampler.prepare_batch(batch)
-
-                if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
-                    hom_data, offsets = self._to_homogeneous_pyg(batch)
-                    src = edge_index_pairs[0] + offsets[self.n_type]
-                    dst = edge_index_pairs[1] + offsets[self.n_type]
-                    mapped_pairs = torch.stack([src, dst], dim=0)
-                    z, out = self.model(hom_data, mapped_pairs)
-                else: z, out = self.model(batch, edge_index_pairs)
-
-                self._alpha = F.softplus(self.alpha)
-                if not self.no_contrastive:
-                    args = (z, neg_stmt_idx) if "neg_stmt_idx" in locals() else (z,)
-                    z_pos, z_pos_pos, z_pos_neg = self.neg_statement_sampler.get_contrastive_samples(*args)
-                    loss_contrast = self.contrastive(z_pos, z_pos_pos, z_pos_neg)
-                    loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-                else: loss = self.loss_fn(out.squeeze(-1), labels)
-
-                total_loss += loss.item() * out.size(0)
-                total_examples += out.size(0)
-                last_out, last_labels = out, labels
-
-        avg_loss = total_loss / total_examples if total_examples else 0.0
-        return avg_loss, (last_out, last_labels)
+        avg_loss = total_loss / total_examples if total_examples > 0 else 0.0
+        if all_probs:
+            all_probs = torch.cat(all_probs, dim=0)
+            all_labels = torch.cat(all_labels, dim=0)
+        else:
+            all_probs = None
+            all_labels = None
+        return avg_loss, all_probs, all_labels
 
     def run(self):
-        best_lr = None
-        # best_val_loss = float("inf")
-        best_val_f1 = float("-inf")
+        """
+        Train with a train/val split (either internal or provided) and early stopping
+        on validation BCE loss. If a NegativeStatementSampler is given, we add a
+        contrastive loss term once per epoch.
+
+        Returns:
+            best_val_loss, best_epoch, best_metrics
+        """
+        self.graph = self.graph.to(self.device)
+        self.heads = self.heads.to(self.device)
+        self.rels = self.rels.to(self.device)
+        self.tails = self.tails.to(self.device)
+        self.labels = self.labels.to(self.device)
+
+        best_val_loss = float("inf")
+        best_epoch = -1
         best_metrics = None
+        best_state = None
 
-        for lr_ in self.lrs:
-            best_lr_epoch = None
-            #best_lr_val_loss = float("inf")
-            best_f1_this_lr = float("-inf")
-            best_lr_metrics = None
+        n_type = getattr(self.model, "n_type", "node")
 
-            self.model.load_state_dict(self._init_state)
-            params = list(self.model.parameters()) + [self.alpha]
-            self.optimizer = torch.optim.Adam(params, lr=lr_)
-            for pg in self.optimizer.param_groups:
-                pg["lr"] = lr_
-            self.earlystopper = EarlyStopping()
-            print(f"\n=== Starting sweep with LR = {lr_} ===", flush=True)
+        for epoch in range(1, self.epochs + 1):
+            # ------------------- Classification training -------------------
+            # Encode graph once for BCE; detach so encoder is not updated here.
+            h_dict = self.model.encode(self.graph)
+            z_full = h_dict[n_type]
+            z_cls = z_full.detach()
 
-            for epoch in range(1, self.epochs + 1):
-                train_loss, _ = self.train_epoch()
-                val_loss, (out, lbls) = self.validate_epoch()
+            train_loss, _, _ = self._iterate_batches(self.train_idx, z_cls, train=True)
 
-                print(f"LR={lr_} | Epoch {epoch}/{self.epochs} | "
-                    f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}", flush=True)
-                if self.earlystopper.step(val_loss, self.model):
-                    print(f" -- Early stopping at epoch {epoch}", flush=True)
-                    best_epoch = epoch
-                    break
+            # ------------------- Contrastive training ---------------------
+            if self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+                self.model.train()
+                h_dict_c = self.model.encode(self.graph)
+                z_c = h_dict_c[n_type]
 
-            lr_metrics = self.metrics.update(out.detach().cpu(), lbls.cpu())
-            if lr_metrics[1] > best_f1_this_lr:  # best per LR
-                best_f1_this_lr, best_lr_epoch, best_lr_metrics, best_val_loss = lr_metrics[1], epoch, lr_metrics, val_loss
-                self.log.log(f"Best Metrics: LR={lr_}, {epoch}, " + ", ".join([f"{v:.4f}" for v in best_lr_metrics]))
-            
-            if lr_metrics[1] > best_val_f1:  # best overall
-                best_val_f1, best_lr, best_epoch, best_alpha, best_metrics, best_val_loss = lr_metrics[1], lr_, epoch, self._alpha.item(), lr_metrics, val_loss
-                torch.save(self.model.state_dict(), self.log.dir + "model_" + self.model.__class__.__name__ + ".pth")
+                z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(z_c)
+                contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
+                total_contr_loss = self.contrastive_weight * contr_loss
 
-        print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}, Val F1 = {best_val_f1:.4f}  ***")
-        for name, val in zip(self.metrics.get_names(), best_metrics):
-            print(f"{name}: {val:.4f}")
-        return best_lr, best_val_loss, best_metrics, best_epoch, best_alpha
+                self.optimizer.zero_grad()
+                total_contr_loss.backward()
+                self.optimizer.step()
+            else:
+                total_contr_loss = torch.tensor(0.0)
+
+            # ------------------- Validation (BCE only) --------------------
+            with torch.no_grad():
+                h_dict_val = self.model.encode(self.graph)
+                z_val = h_dict_val[n_type]
+                val_loss, val_probs, val_labels = self._iterate_batches(
+                    self.val_idx, z_val, train=False
+                )
+
+            # Metrics on validation
+            if val_probs is not None and val_labels is not None:
+                val_metrics = self.metrics.update(val_probs, val_labels)
+            else:
+                val_metrics = None
+
+            if not getattr(self.log, "non_verbose", False):
+                msg = (
+                    f"Epoch {epoch:03d} | "
+                    f"TrainLoss(BCE)={train_loss:.4f} | "
+                    f"ValLoss(BCE)={val_loss:.4f}"
+                )
+                if self.contrastive_sampler is not None:
+                    msg += f" | ConstrLoss={float(total_contr_loss):.4f}"
+                if val_metrics is not None:
+                    msg += " | " + ", ".join(
+                        f"{name}={val_metrics[i]:.4f}"
+                        for i, name in enumerate(self.metrics.get_names())
+                    )
+                self.log.log(msg)
+
+            # Early stopping on val_loss (BCE)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                best_metrics = val_metrics
+                best_state = self.model.state_dict()
+            if self.early_stopping.step(val_loss, self.model):
+                if not getattr(self.log, "non_verbose", False):
+                    self.log.log(f"Early stopping at epoch {epoch}.")
+                break
+
+        # Restore best state
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+
+        if not getattr(self.log, "non_verbose", False):
+            self.log.log(f"Best epoch: {best_epoch}, best val loss: {best_val_loss:.4f}")
+            if best_metrics is not None:
+                for name, val in zip(self.metrics.get_names(), best_metrics):
+                    self.log.log(f"  {name}: {val:.4f}")
+
+        return best_val_loss, best_epoch, best_metrics
