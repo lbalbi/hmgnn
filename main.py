@@ -106,6 +106,8 @@ def main():
         help="Use PartialStatementSampler on positive statements removed from the graph.")
     parser.add_argument("--use_rstatement_sampler", action="store_true",
         help="Use RandomStatementSampler for negative statements.")
+    parser.add_argument("--use_contrastive", action="store_true",
+        help="Use contrastive learning with statement samplers.")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -130,7 +132,7 @@ def main():
     k_folds = int(cfg.get("k_folds", 10))
     contrastive_weight = float(cfg.get("contrastive_weight", 0.1))
     subclass_rel = cfg.get("subclass_rel", "subclass_of")
-    instance_rel = cfg.get("instance_rel", "2")  # assumes "2" is instance_of / P31
+    instance_rel = cfg.get("instance_rel", "2")  # assuming "2" is instance_of / P31 relation idx
     contrastive_k = int(cfg.get("contrastive_k", 1))
 
     dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatementsampler,
@@ -218,7 +220,7 @@ def main():
     print(f"Structural edge types in encoder graph: {sorted(struct_edge_types)}", flush=True)
     print(f"#Encoder graph edge types: {len(e_etypes_struct)}", flush=True)
 
-
+    neighbor_sizes = [20, 10]
     num_cls_triples = cls_heads.size(0)
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
     best_epochs: List[int] = []
@@ -246,23 +248,23 @@ def main():
         base_model_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
             out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=list(fold_graph.edge_types),
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
-
         if args.model == "ra_hgcn": model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
         else: model_fold = ModelCls(**base_model_kwargs).to(device)
 
-        if use_random_sampler:
-            random_sampler = RandomStatementSampler(k=contrastive_k, external_negs=external_edges)
-            random_sampler.prepare_global(fold_graph)
-            neg_stmt_sampler = random_sampler
-        elif use_partial_sampler:
-            edges_are_negative = nflag
-            neg_stmt_sampler = PartialStatementSampler(k=contrastive_k, neg_edges=external_edges,
-                edges_are_negative=edges_are_negative)
-            neg_stmt_sampler.prepare_global(fold_graph)
-        else:
-            neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k, subclass_rel=subclass_rel, 
-                neg_prefix="NOT_", instance_rel=instance_rel)
-            neg_stmt_sampler.prepare_global(fold_graph)
+        if args.use_contrastive:
+            if use_random_sampler:
+                random_sampler = RandomStatementSampler(k=contrastive_k, external_negs=external_edges)
+                random_sampler.prepare_global(fold_graph)
+                neg_stmt_sampler = random_sampler
+            elif use_partial_sampler:
+                edges_are_negative = nflag
+                neg_stmt_sampler = PartialStatementSampler(k=contrastive_k, neg_edges=external_edges,
+                    edges_are_negative=edges_are_negative)
+                neg_stmt_sampler.prepare_global(fold_graph)
+            else:
+                neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k, subclass_rel=subclass_rel, 
+                    neg_prefix="NOT_", instance_rel=instance_rel)
+                neg_stmt_sampler.prepare_global(fold_graph)
 
         log_fold = Logger(f"train_cv_fold{fold}", dir=args.output_dir)
         trainer_fold = Train(model=model_fold, graph=fold_graph, heads=cls_heads,
@@ -270,7 +272,7 @@ def main():
             epochs=args.epochs, device=device, log=log_fold, batch_size=args.batch_size,
             val_ratio=0.0, early_stopping_patience=cfg.get("patience", 20), train_idx=train_idx,
             val_idx=val_idx, contrastive_sampler=neg_stmt_sampler, contrastive_weight=contrastive_weight,
-            train_loader=train_loader, val_loader=val_loader)
+            train_loader=train_loader, val_loader=val_loader, use_contrastive = args.use_contrastive)
 
         best_val_loss, best_epoch, best_metrics, best_lr = trainer_fold.run()
         best_epochs.append(int(best_epoch if best_epoch is not None else args.epochs))
@@ -288,6 +290,10 @@ def main():
     print(f"Chosen number of epochs for final training (median): {final_epochs}", flush=True)
     print(f"Chosen learning rate for final training (median):  {final_lr}", flush=True)
 
+    final_nodes = torch.unique(torch.cat([cls_heads, cls_tails], dim=0))
+    final_loader = NeighborLoader(struct_graph, input_nodes=("node", final_nodes),
+        num_neighbors=neighbor_sizes, batch_size=args.batch_size, shuffle=True)
+
     final_base_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
         out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=e_etypes_struct,
         n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
@@ -296,24 +302,26 @@ def main():
     else: final_model = ModelCls(**final_base_kwargs).to(device)
     final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
-    if use_random_sampler:
-        final_contrastive_sampler = RandomStatementSampler(
-            k=contrastive_k, external_negs=external_edges)
-        final_contrastive_sampler.prepare_global(struct_graph)
-    elif use_partial_sampler:
-        edges_are_negative = nflag
-        final_contrastive_sampler = PartialStatementSampler(k=contrastive_k,
-            neg_edges=external_edges, edges_are_negative=edges_are_negative)
-        final_contrastive_sampler.prepare_global(struct_graph)
-    else:
-        final_contrastive_sampler = NegativeStatementSampler(
-            k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)
-        final_contrastive_sampler.prepare_global(struct_graph)
+    if args.use_contrastive:
+        if use_random_sampler:
+            final_contrastive_sampler = RandomStatementSampler(
+                k=contrastive_k, external_negs=external_edges)
+            final_contrastive_sampler.prepare_global(struct_graph)
+        elif use_partial_sampler:
+            edges_are_negative = nflag
+            final_contrastive_sampler = PartialStatementSampler(k=contrastive_k,
+                neg_edges=external_edges, edges_are_negative=edges_are_negative)
+            final_contrastive_sampler.prepare_global(struct_graph)
+        else:
+            final_contrastive_sampler = NegativeStatementSampler(
+                k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)
+            final_contrastive_sampler.prepare_global(struct_graph)
 
     final_trainer = Train_BestModel(final_model, graph=struct_graph,
         heads=cls_heads, rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr=final_lr,
         epochs=final_epochs, device=device, log=final_log, batch_size=args.batch_size,
-        contrastive_sampler=final_contrastive_sampler, contrastive_weight=contrastive_weight)
+        contrastive_sampler=final_contrastive_sampler, contrastive_weight=contrastive_weight, loader=final_loader,
+        use_contrastive = args.use_contrastive)
     final_loss = final_trainer.run()
     print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}", flush=True)
 

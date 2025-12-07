@@ -13,7 +13,7 @@ class Train:
         epochs: int, device: torch.device, log, batch_size: int = 1024, val_ratio: float = 0.1,
         early_stopping_patience: int = 20, train_idx: Optional[torch.Tensor] = None,
         val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeStatementSampler] = None,
-        contrastive_weight: float = 0.1, train_loader=None, val_loader=None):
+        contrastive_weight: float = 0.1, train_loader=None, val_loader=None, use_contrastive: bool = False):
 
         self.model = model.to(device)
         self.graph = graph
@@ -30,6 +30,7 @@ class Train:
         self.es_patience = int(early_stopping_patience)
         self.criterion = nn.BCEWithLogitsLoss()
         self.metrics = Metrics()
+        self.use_contrastive = use_contrastive
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
         self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
@@ -58,6 +59,7 @@ class Train:
             h = int(self.heads[idx])
             if 0 <= h < num_nodes: self.node_to_triples[h].append(idx)
 
+
     def _iterate_batches(self, idx: torch.Tensor, z: torch.Tensor,
         train: bool = True) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         total_bce = 0.0
@@ -65,14 +67,11 @@ class Train:
         total_examples = 0
         all_probs = []
         all_labels = []
-
         total_loss_tensor = None
-        if train:
-            total_loss_tensor = torch.zeros((), device=self.device)
+        if train: total_loss_tensor = torch.zeros((), device=self.device)
 
         num_triples = idx.size(0)
-        if num_triples == 0:
-            return 0.0, 0.0, None, None, total_loss_tensor
+        if num_triples == 0: return 0.0, 0.0, None, None, total_loss_tensor
         for start in range(0, num_triples, self.batch_size):
             end = min(start + self.batch_size, num_triples)
             b_idx = idx[start:end]
@@ -87,9 +86,8 @@ class Train:
             loss = bce_loss
             contr_loss_val = 0.0
 
-            if train and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+            if train and self.use_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([h, t], dim=0))
-                # Full-graph mode: no n_id
                 z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=None)
                 contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
@@ -174,7 +172,7 @@ class Train:
             triple_idx = self._get_batch_triple_indices(batch, subset="train")
             if triple_idx.numel() == 0: continue
 
-            if (self.contrastive_sampler is not None
+            if (self.use_contrastive and self.contrastive_sampler is not None
                 and hasattr(self.contrastive_sampler, "prepare_batch")):
                 self.contrastive_sampler.prepare_batch(batch)
 
@@ -190,7 +188,7 @@ class Train:
             loss = bce_loss
             contr_loss_val = 0.0
 
-            if self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+            if self.use_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
                 z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
@@ -221,12 +219,10 @@ class Train:
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = batch.to(self.device)
-
                 triple_idx = self._get_batch_triple_indices(batch, subset="val")
-                if triple_idx.numel() == 0:
-                    continue
+                if triple_idx.numel() == 0: continue
 
-                if (self.contrastive_sampler is not None
+                if (self.use_contrastive and self.contrastive_sampler is not None
                     and hasattr(self.contrastive_sampler, "prepare_batch")):
                     self.contrastive_sampler.prepare_batch(batch)
 
@@ -240,7 +236,7 @@ class Train:
                 loss = bce_loss
                 contr_loss_val = 0.0
 
-                if self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+                if self.use_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                     batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
                     z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
                         z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
@@ -299,7 +295,7 @@ class Train:
                     self.tails = self.tails.to(self.device)
                     self.labels = self.labels.to(self.device)
                     self.model.train()
-                    if (self.contrastive_sampler is not None
+                    if (self.use_contrastive and self.contrastive_sampler is not None
                         and hasattr(self.contrastive_sampler, "prepare_batch")):
                         self.contrastive_sampler.prepare_batch(self.graph)
                     optimizer.zero_grad()
