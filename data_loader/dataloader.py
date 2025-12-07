@@ -57,6 +57,7 @@ class DataLoader:
         if not edge_files: return {}
         dfs = []
         for f in edge_files:
+            print(f)
             if f.endswith(".tsv"): df = pd.read_csv(f, sep="\t")
             else: df = pd.read_csv(f)
             dfs.append(df)

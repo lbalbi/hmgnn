@@ -7,7 +7,7 @@ from models import *
 from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
 from utils import Logger, load_config
-from dataloader import DataLoader
+from data_loader import DataLoader
 from samplers import (PartialStatementSampler,
     NegativeStatementSampler, RandomStatementSampler,
     NegativeSampler)
@@ -152,6 +152,15 @@ def main():
     cfg = load_config(task=args.task)
     ModelCls = eval(args.model.upper()) if args.model != "gae" else eval("GCN_" + args.model.upper())
     mcfg = cfg["models"][ModelCls.__name__ if args.model != "gae" else "GAE"]
+
+    if args.model == "ra_hgcn":
+        in_feats_cfg = mcfg["in_feats"]
+        if isinstance(in_feats_cfg, dict):
+            n_type_cfg = mcfg.get("n_type", "node")
+            in_dim = int(in_feats_cfg.get(n_type_cfg, list(in_feats_cfg.values())[0]))
+        else: in_dim = int(in_feats_cfg)
+    else: in_dim = mcfg["in_feats"]
+
     lr_cfg = cfg.get("lr", 1e-3)
     if isinstance(lr_cfg, (list, tuple)): base_lr = float(lr_cfg[0])
     else: base_lr = float(lr_cfg)
@@ -217,10 +226,12 @@ def main():
             struct_data=struct_data, train_heads=train_heads, train_tails=train_tails,
             train_raw_rels=train_raw_rels, train_idx=train_idx)
 
-        model_fold = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"],
+        base_model_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
             out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=list(fold_graph.edge_types),
-            n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
-            rel2id=rel2id).to(device)
+            n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
+
+        if args.model == "ra_hgcn": model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
+        else: model_fold = ModelCls(**base_model_kwargs).to(device)
 
         if use_random_sampler:
             random_sampler = RandomStatementSampler(k=contrastive_k,
@@ -236,6 +247,11 @@ def main():
             neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k,
                 subclass_rel=subclass_rel,neg_prefix="NOT_", instance_rel=instance_rel)
             neg_stmt_sampler.prepare_global(fold_graph)
+
+        # print(fold_graph)
+        # print()
+        # print(model_fold)
+        # exit()
 
         log_fold = Logger(f"train_cv_fold{fold}", dir=args.output_dir)
         trainer_fold = Train(model=model_fold, graph=fold_graph, heads=train_heads,
@@ -256,10 +272,16 @@ def main():
     print(f"Per-fold best epochs: {best_epochs}")
     print(f"Chosen number of epochs for final training: {final_epochs}")
 
-    final_model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"],
+    final_base_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
         out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=e_etypes,
-        n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
-        rel2id=rel2id).to(device)
+        n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
+    if args.model == "ra_hgcn": final_model = ModelCls(**final_base_kwargs,rel2id=rel2id).to(device)
+    else: final_model = ModelCls(**final_base_kwargs).to(device)
+
+    # final_model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"],
+    #     out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=e_etypes,
+    #     n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
+    #     rel2id=rel2id).to(device)
     final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
     if use_random_sampler:

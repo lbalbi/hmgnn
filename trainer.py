@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 from torch_geometric.data import HeteroData
 
 from utils import Metrics, EarlyStopping
-from negativestatement_sampler import NegativeStatementSampler
-from dualcontrastive_CE import DualContrastiveLoss_CE
+from samplers import NegativeStatementSampler
+from losses import DualContrastiveLoss_CE
 
 
 class Train:
@@ -106,7 +106,7 @@ class Train:
                 r = self.rels[b_idx].to(self.device)
                 y = self.labels[b_idx].to(self.device)
 
-                h_dict = self.model.encode(self.graph.to(self.device))
+                h_dict = self.model.encode(self.graph)
                 z = h_dict[n_type]
 
                 edge_index = torch.stack([h, t], dim=0)

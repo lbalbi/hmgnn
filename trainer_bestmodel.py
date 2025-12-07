@@ -4,9 +4,8 @@ from typing import Dict, Optional
 from torch_geometric.data import HeteroData
 
 from utils import Metrics
-from negative_sampler import NegativeSampler
-from negativestatement_sampler import NegativeStatementSampler
-from dualcontrastive_CE import DualContrastiveLoss_CE
+from samplers import NegativeSampler, NegativeStatementSampler
+from losses import DualContrastiveLoss_CE
 
 
 class Train_BestModel:
@@ -69,7 +68,7 @@ class Train_BestModel:
             t = self.tails[idx].to(self.device)
             r = self.rels[idx].to(self.device)
             y = self.labels[idx].to(self.device)
-            h_dict = self.model.encode(self.graph.to(self.device))
+            h_dict = self.model.encode(self.graph)
             z = h_dict[n_type]
 
             edge_index = torch.stack([h, t], dim=0)
