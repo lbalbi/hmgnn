@@ -1,5 +1,8 @@
-import argparse, os, statistics, torch
-from typing import Dict, List, Tuple
+import argparse
+import os
+import statistics
+from typing import Dict, List
+import torch
 import pandas as pd
 from sklearn.model_selection import KFold
 
@@ -8,8 +11,10 @@ from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
 from utils import Logger, load_config
 from data_loader import DataLoader
-from samplers import (PartialStatementSampler,
-    NegativeStatementSampler, RandomStatementSampler,
+from samplers import (
+    PartialStatementSampler,
+    NegativeStatementSampler,
+    RandomStatementSampler,
     NegativeSampler)
 
 
@@ -20,6 +25,7 @@ def build_triples_from_wikidata(data_dir: str) -> Dict[str, torch.Tensor]:
       - train2id_pos.txt  with columns: source_node,target_node,edge_type
       - train2id_neg.txt  with columns: source_node,target_node,edge_type (e.g. NOT_3)
       - test2id_pos.txt   with columns: source_node,target_node,edge_type
+
     For training:
       - Positives use their edge_type directly  (e.g. '3') with label 1.
       - Negatives with edge_type 'NOT_k' are interpreted as relation k with label 0
@@ -30,7 +36,8 @@ def build_triples_from_wikidata(data_dir: str) -> Dict[str, torch.Tensor]:
     test_pos_path = os.path.join(data_dir, "test2id_pos.txt")
 
     def _read(path: str) -> pd.DataFrame:
-        if not os.path.exists(path): raise FileNotFoundError(f"Expected file not found: {path}")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Expected file not found: {path}")
         df = pd.read_csv(path)
         df.columns = [c.strip() for c in df.columns]
         required = {"source_node", "target_node", "edge_type"}
@@ -64,12 +71,13 @@ def build_triples_from_wikidata(data_dir: str) -> Dict[str, torch.Tensor]:
     neg_tails = torch.tensor(df_train_neg["target_node"].to_numpy(), dtype=torch.long)
     neg_rels = torch.tensor([rel2id[r] for r in neg_rel_names_base], dtype=torch.long)
     neg_labels = torch.zeros_like(neg_heads, dtype=torch.float)
+
     train_heads = torch.cat([pos_heads, neg_heads], dim=0)
     train_tails = torch.cat([pos_tails, neg_tails], dim=0)
     train_rels = torch.cat([pos_rels, neg_rels], dim=0)
     train_labels = torch.cat([pos_labels, neg_labels], dim=0)
 
-    train_raw_rels: List[str] = pos_rel_names + neg_rel_names_raw
+    train_raw_rels = pos_rel_names + neg_rel_names_raw
     if len(train_raw_rels) != train_heads.size(0):
         raise RuntimeError("Length mismatch: train_raw_rels vs train_heads.")
     statement_edge_types_raw = sorted(set(train_raw_rels))
@@ -78,50 +86,19 @@ def build_triples_from_wikidata(data_dir: str) -> Dict[str, torch.Tensor]:
     test_tails = torch.tensor(df_test_pos["target_node"].to_numpy(), dtype=torch.long)
     test_rels = torch.tensor([rel2id[r] for r in test_rel_names], dtype=torch.long)
 
-    return {"train_heads": train_heads, "train_tails": train_tails,
-        "train_rels": train_rels, "train_labels": train_labels,
+    return {
+        "train_heads": train_heads,
+        "train_tails": train_tails,
+        "train_rels": train_rels,
+        "train_labels": train_labels,
         "train_raw_rels": train_raw_rels,
         "statement_edge_types_raw": statement_edge_types_raw,
-        "test_heads": test_heads, "test_tails": test_tails,
-        "test_rels": test_rels, "rel2id": rel2id, "id2rel": id2rel}
-
-
-def build_fold_graph(num_nodes: int, base_x: torch.Tensor,
-    struct_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
-    train_heads: torch.Tensor, train_tails: torch.Tensor,
-    train_raw_rels: List[str], train_idx: torch.Tensor) -> "HeteroData":
-    """
-    Build a HeteroData graph for a given fold, containing:
-      - all structural edges (e.g., subclass_of) from struct_data,
-      - only the statement edges corresponding to the training triples
-        indexed by `train_idx` (no validation triples as edges).
-    """
-    from torch_geometric.data import HeteroData
-    from collections import defaultdict
-
-    g = HeteroData()
-    g["node"].num_nodes = int(num_nodes)
-    g["node"].x = base_x.clone()
-    for etype, (src, tgt) in struct_data.items():
-        if src.numel() == 0: edge_index = torch.empty(2, 0, dtype=torch.long)
-        else: edge_index = torch.stack([src, tgt], dim=0)
-        g[("node", etype, "node")].edge_index = edge_index
-
-    per_type_pairs: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
-    idx_list = train_idx.tolist()
-    for i in idx_list:
-        et = train_raw_rels[i]
-        h = int(train_heads[i].item())
-        t = int(train_tails[i].item())
-        per_type_pairs[et].append((h, t))
-
-    for etype, pairs in per_type_pairs.items():
-        if not pairs: continue
-        src_nodes = torch.tensor([h for (h, _) in pairs], dtype=torch.long)
-        tgt_nodes = torch.tensor([t for (_, t) in pairs], dtype=torch.long)
-        edge_index = torch.stack([src_nodes, tgt_nodes], dim=0)
-        g[("node", etype, "node")].edge_index = edge_index
-    return g
+        "test_heads": test_heads,
+        "test_tails": test_tails,
+        "test_rels": test_rels,
+        "rel2id": rel2id,
+        "id2rel": id2rel,
+    }
 
 
 def main():
@@ -130,9 +107,9 @@ def main():
         help="Task / dataset name (used to load config JSON).")
     parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "hgat", "gcn", "gae"],
         default="hgcn", help="Model to run (RA_HGCN is relation-aware).")
-    parser.add_argument("--epochs", type=int, default=300,
+    parser.add_argument("--epochs", type=int, default=250,
         help="Max epochs per fold / final training.")
-    parser.add_argument("--batch_size", type=int, default=4096,
+    parser.add_argument("--batch_size", type=int, default=1024,
         help="Triple batch size for training and testing.")
     parser.add_argument("--path", type=str, default="wikidata_data",
         help="Path to the dataset directory (containing train2id_*.txt etc.).")
@@ -145,9 +122,10 @@ def main():
     parser.add_argument("--use_pstatementsampler", action="store_true",
         help="Use PartialStatementSampler on positive statements removed from the graph.")
     parser.add_argument("--use_rstatement_sampler", action="store_true",
-    help="Use RandomStatementSampler for negative statements.")
+        help="Use RandomStatementSampler for negative statements.")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
     cfg = load_config(task=args.task)
     ModelCls = eval(args.model.upper()) if args.model != "gae" else eval("GCN_" + args.model.upper())
@@ -162,31 +140,30 @@ def main():
     else: in_dim = mcfg["in_feats"]
 
     lr_cfg = cfg.get("lr", 1e-3)
-    if isinstance(lr_cfg, (list, tuple)): base_lr = float(lr_cfg[0])
-    else: base_lr = float(lr_cfg)
+    if isinstance(lr_cfg, (list, tuple)): lr_candidates = [float(lr) for lr in lr_cfg]
+    else: lr_candidates = [float(lr_cfg)]
+    print(f"Learning rate candidates (per-fold sweep): {lr_candidates}")
 
     k_folds = int(cfg.get("k_folds", 10))
     contrastive_weight = float(cfg.get("contrastive_weight", 0.1))
     subclass_rel = cfg.get("subclass_rel", "subclass_of")
-    instance_rel = cfg.get("instance_rel", None)
+    instance_rel = cfg.get("instance_rel", "2")  # we will assume "2" is instance-of
     contrastive_k = int(cfg.get("contrastive_k", 1))
 
     dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatementsampler,
-        use_nstatement_sampler=args.use_nstatementsampler,
-        use_rstatement_sampler=args.use_rstatement_sampler)
+        use_nstatement_sampler=args.use_nstatementsampler, use_rstatement_sampler=args.use_rstatement_sampler)
     data_dict = dl.get_data()
-    full_graph = dl.make_data_graph(data_dict, orthogonal=False)
-    # use_partial_sampler = args.use_nstatementsampler or args.use_pstatementsampler
+
+    full_graph_all = dl.make_data_graph(data_dict, orthogonal=False)
+    num_nodes = full_graph_all["node"].num_nodes
+    base_x = full_graph_all["node"].x
+    all_e_etypes = list(full_graph_all.edge_types)
     nflag = args.use_nstatementsampler
     pflag = args.use_pstatementsampler
     rflag = args.use_rstatement_sampler
     use_partial_sampler = nflag or pflag
     use_random_sampler = rflag
     external_edges = dl.get_state_list()
-
-    e_etypes = list(full_graph.edge_types)
-    num_nodes = full_graph["node"].num_nodes
-    base_x = full_graph["node"].x
 
     triples = build_triples_from_wikidata(args.path)
     train_heads = triples["train_heads"]
@@ -195,37 +172,91 @@ def main():
     train_labels = triples["train_labels"]
     train_raw_rels = triples["train_raw_rels"]
     statement_edge_types_raw = set(triples["statement_edge_types_raw"])
+
     test_heads = triples["test_heads"]
     test_tails = triples["test_tails"]
     test_rels = triples["test_rels"]
     rel2id = triples["rel2id"]
     id2rel = triples["id2rel"]
 
-    print(f"#Train triples: {train_heads.size(0)} (pos+neg)")
+    print(f"#Train triples (pos+neg, all types): {train_heads.size(0)}")
     print(f"#Test triples: {test_heads.size(0)}")
     print(f"#Relations (base positive): {len(rel2id)}")
 
-    struct_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-    for etype, (src, tgt) in data_dict.items():
-        if etype in statement_edge_types_raw: continue
-        struct_data[etype] = (src, tgt)
+    if instance_rel not in data_dict:
+        raise RuntimeError(f"Expected instance-of relation '{instance_rel}' in data_dict keys, "
+            f"but got keys: {list(data_dict.keys())}")
 
-    num_triples = train_heads.size(0)
-    indices = torch.arange(num_triples, dtype=torch.long)
+    inst_src, _ = data_dict[instance_rel]
+    inst_set = set(inst_src.tolist())
+
+    is_instance = torch.zeros(num_nodes, dtype=torch.bool)
+    if inst_set:
+        inst_idx_tensor = torch.tensor(sorted(inst_set), dtype=torch.long)
+        is_instance[inst_idx_tensor] = True
+
+    head_is_inst = is_instance[train_heads]
+    tail_is_inst = is_instance[train_tails]
+
+    inst_inst_mask = head_is_inst & tail_is_inst
+    inst_class_mask = head_is_inst ^ tail_is_inst
+    cls_idx = torch.nonzero(inst_inst_mask, as_tuple=False).view(-1)
+    cls_heads = train_heads[cls_idx]
+    cls_tails = train_tails[cls_idx]
+    cls_rels = train_rels[cls_idx]
+    cls_labels = train_labels[cls_idx]
+    cls_raw_rels = [train_raw_rels[i] for i in cls_idx.tolist()]
+
+    relation_has_inst_class = set()
+    inst_class_mask_list = inst_class_mask.tolist()
+    for i, flag in enumerate(inst_class_mask_list):
+        if flag: relation_has_inst_class.add(train_raw_rels[i])
+
+    struct_edge_types = set()
+    if instance_rel in data_dict: struct_edge_types.add(instance_rel)
+    not2_name = f"NOT_{instance_rel}"
+    if not2_name in data_dict: struct_edge_types.add(not2_name)
+    struct_edge_types.update(relation_has_inst_class)
+
+    if subclass_rel in data_dict: struct_edge_types.add(subclass_rel)
+
+    from torch_geometric.data import HeteroData
+    struct_graph = HeteroData()
+    struct_graph["node"].num_nodes = int(num_nodes)
+    struct_graph["node"].x = base_x.clone()
+
+    for etype in struct_edge_types:
+        if etype not in data_dict: continue
+        src, tgt = data_dict[etype]
+        if src.numel() == 0: edge_index = torch.empty(2, 0, dtype=torch.long)
+        else: edge_index = torch.stack([src, tgt], dim=0)
+        struct_graph[("node", etype, "node")].edge_index = edge_index
+    e_etypes_struct = list(struct_graph.edge_types)
+
+
+    print("\n=== Classification vs structural split ===")
+    print(f"Total training triples:      {train_heads.size(0)}", flush=True)
+    print(f"Classification triples (inst-inst): {cls_heads.size(0)}", flush=True)
+    print(f"Structural edge types in encoder graph: {sorted(struct_edge_types)}", flush=True)
+    print(f"#Encoder graph edge types: {len(e_etypes_struct)}", flush=True)
+
+
+    num_cls_triples = cls_heads.size(0)
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
-
     best_epochs: List[int] = []
+    best_lrs: List[float] = []
     cv_metrics: List[torch.Tensor] = []
-    for fold, (train_idx_np, val_idx_np) in enumerate(kf.split(range(num_triples)), start=1):
+
+    for fold, (train_idx_np, val_idx_np) in enumerate(
+        kf.split(range(num_cls_triples)), start=1):
         train_idx = torch.tensor(train_idx_np, dtype=torch.long)
         val_idx = torch.tensor(val_idx_np, dtype=torch.long)
 
-        print(f"\n=== Fold {fold}/{k_folds} ===")
-        print(f"  Train triples: {train_idx.numel()} | Val triples: {val_idx.numel()}")
-        fold_graph = build_fold_graph(num_nodes=num_nodes, base_x=base_x,
-            struct_data=struct_data, train_heads=train_heads, train_tails=train_tails,
-            train_raw_rels=train_raw_rels, train_idx=train_idx)
+        print(f"\n=== Fold {fold}/{k_folds} ===", flush=True)
+        print(f"  Train classification triples: {train_idx.numel()} | "
+            f"Val classification triples: {val_idx.numel()}", flush=True)
 
+        fold_graph = struct_graph
         base_model_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
             out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=list(fold_graph.edge_types),
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
@@ -234,87 +265,85 @@ def main():
         else: model_fold = ModelCls(**base_model_kwargs).to(device)
 
         if use_random_sampler:
-            random_sampler = RandomStatementSampler(k=contrastive_k,
-                external_negs=external_edges)
+            random_sampler = RandomStatementSampler(
+                k=contrastive_k, external_negs=external_edges)
             random_sampler.prepare_global(fold_graph)
             neg_stmt_sampler = random_sampler
         elif use_partial_sampler:
             edges_are_negative = nflag
-            neg_stmt_sampler = PartialStatementSampler(k=contrastive_k,
-                neg_edges=external_edges, edges_are_negative=edges_are_negative)
+            neg_stmt_sampler = PartialStatementSampler(
+                k=contrastive_k, neg_edges=external_edges,
+                edges_are_negative=edges_are_negative)
             neg_stmt_sampler.prepare_global(fold_graph)
         else:
-            neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k,
-                subclass_rel=subclass_rel,neg_prefix="NOT_", instance_rel=instance_rel)
+            neg_stmt_sampler = NegativeStatementSampler(
+                k=contrastive_k, subclass_rel=subclass_rel, neg_prefix="NOT_",
+                instance_rel=instance_rel)
             neg_stmt_sampler.prepare_global(fold_graph)
 
-        # print(fold_graph)
-        # print()
-        # print(model_fold)
-        # exit()
-
         log_fold = Logger(f"train_cv_fold{fold}", dir=args.output_dir)
-        trainer_fold = Train(model=model_fold, graph=fold_graph, heads=train_heads,
-            rel_ids=train_rels, tails=train_tails, labels=train_labels, lr=base_lr,
+        trainer_fold = Train(model=model_fold, graph=fold_graph, heads=cls_heads,
+            rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr_candidates=lr_candidates,
             epochs=args.epochs, device=device, log=log_fold, batch_size=args.batch_size,
-            val_ratio=0.0, early_stopping_patience=cfg.get("patience", 20),
-            train_idx=train_idx, val_idx=val_idx,
-            contrastive_sampler=neg_stmt_sampler, contrastive_weight=contrastive_weight)
+            val_ratio=0.0, early_stopping_patience=cfg.get("patience", 20), train_idx=train_idx,
+            val_idx=val_idx, contrastive_sampler=neg_stmt_sampler, contrastive_weight=contrastive_weight)
 
-        best_val_loss, best_epoch, best_metrics = trainer_fold.run()
+        best_val_loss, best_epoch, best_metrics, best_lr = trainer_fold.run()
         best_epochs.append(int(best_epoch if best_epoch is not None else args.epochs))
+        best_lrs.append(float(best_lr) if best_lr is not None else lr_candidates[0])
         if best_metrics is not None: cv_metrics.append(best_metrics)
 
     if best_epochs: final_epochs = int(statistics.median(best_epochs))
     else: final_epochs = args.epochs
+    if best_lrs: final_lr = float(statistics.median(best_lrs))
+    else: final_lr = lr_candidates[0]
 
-    print("\n=== Cross-validation summary ===")
-    print(f"Per-fold best epochs: {best_epochs}")
-    print(f"Chosen number of epochs for final training: {final_epochs}")
+    print("\n=== Cross-validation summary ===", flush=True)
+    print(f"Per-fold best epochs: {best_epochs}", flush=True)
+    print(f"Per-fold best learning rates: {best_lrs}", flush=True)
+    print(f"Chosen number of epochs for final training (median): {final_epochs}", flush=True)
+    print(f"Chosen learning rate for final training (median):  {final_lr}", flush=True)
 
     final_base_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
-        out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=e_etypes,
+        out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=e_etypes_struct,
         n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
-    if args.model == "ra_hgcn": final_model = ModelCls(**final_base_kwargs,rel2id=rel2id).to(device)
-    else: final_model = ModelCls(**final_base_kwargs).to(device)
 
-    # final_model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"],
-    #     out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=e_etypes,
-    #     n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
-    #     rel2id=rel2id).to(device)
+    if args.model == "ra_hgcn": final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+    else: final_model = ModelCls(**final_base_kwargs).to(device)
     final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
     if use_random_sampler:
-        final_contrastive_sampler = RandomStatementSampler(k=contrastive_k,
-            external_negs=external_edges)
-        final_contrastive_sampler.prepare_global(full_graph)
+        final_contrastive_sampler = RandomStatementSampler(
+            k=contrastive_k, external_negs=external_edges)
+        final_contrastive_sampler.prepare_global(struct_graph)
     elif use_partial_sampler:
         edges_are_negative = nflag
         final_contrastive_sampler = PartialStatementSampler(k=contrastive_k,
             neg_edges=external_edges, edges_are_negative=edges_are_negative)
-        final_contrastive_sampler.prepare_global(full_graph)
+        final_contrastive_sampler.prepare_global(struct_graph)
     else:
-        final_contrastive_sampler = NegativeStatementSampler(k=contrastive_k,
-            subclass_rel=subclass_rel, neg_prefix="NOT_", instance_rel=instance_rel)
-        final_contrastive_sampler.prepare_global(full_graph)
+        final_contrastive_sampler = NegativeStatementSampler(
+            k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)
+        final_contrastive_sampler.prepare_global(struct_graph)
 
-    final_trainer = Train_BestModel(final_model, graph=full_graph, heads=train_heads,
-        rel_ids=train_rels, tails=train_tails, labels=train_labels, lr=base_lr,
+    final_trainer = Train_BestModel(final_model, graph=struct_graph,
+        heads=cls_heads, rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr=final_lr,
         epochs=final_epochs, device=device, log=final_log, batch_size=args.batch_size,
         contrastive_sampler=final_contrastive_sampler, contrastive_weight=contrastive_weight)
     final_loss = final_trainer.run()
-    print(f"[Final Train] Loss after {final_epochs} epochs: {final_loss:.4f}")
+    print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}", flush=True)
+
 
     neg_samplers: Dict[str, NegativeSampler] = {}
     for rel_name in rel2id.keys():
-        key = next((et for et in e_etypes if et[1] == rel_name), None)
+        key = next((et for et in all_e_etypes if et[1] == rel_name), None)
         if key is None: continue
-        all_pos_edge_index = full_graph[key].edge_index
-        neg_samplers[rel_name] = NegativeSampler(full_graph,
+        all_pos_edge_index = full_graph_all[key].edge_index
+        neg_samplers[rel_name] = NegativeSampler(full_graph_all,
             edge_type=key, all_pos_edge_index=all_pos_edge_index)
 
     test_log = Logger("test_global", dir=args.output_dir)
-    tester = Test_BestModel(model=final_model, graph=full_graph,
+    tester = Test_BestModel(model=final_model, graph=struct_graph,
         test_heads=test_heads, test_rels=test_rels, test_tails=test_tails,
         id2rel=id2rel, neg_samplers=neg_samplers, num_neg_per_pos=args.num_neg_test,
         device=device, log=test_log, batch_size=args.batch_size)

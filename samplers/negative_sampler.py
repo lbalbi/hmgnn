@@ -3,7 +3,6 @@ from torch import Tensor
 from typing import Tuple, Optional
 from torch_geometric.data import HeteroData
 
-
 class NegativeSampler:
     """ Negative sampler for an edge type, draws negatives by stratifying over training positive sources.
     Forbids sampling any edge that appears in `all_pos_edge_index` (e.g. union of train+val+test PPI edges), 
@@ -19,7 +18,7 @@ class NegativeSampler:
                             If None, falls back to using graph[edge_type].edge_index
                             (i.e. old behavior). """
 
-    def __init__(self, graph: HeteroData, edge_type: tuple, oversample_factor: float = 2.0,
+    def __init__(self, graph: HeteroData, edge_type: tuple, oversample_factor: float = 1.0,
         device: Optional[torch.device] = None, all_pos_edge_index: Optional[Tensor] = None):
 
         self.graph = graph

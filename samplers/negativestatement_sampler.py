@@ -134,24 +134,43 @@ class NegativeStatementSampler:
         """
         return
 
-    def get_contrastive_samples(self, z: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Build contrastive triples (z_pos, z_pos_pos, z_pos_neg).
-        Args: z: [N, D] node embeddings for *all* nodes ("node" type), where
+
+    def get_contrastive_samples(self, z: Tensor, anchor_nodes: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """ Build contrastive triples (z_pos, z_pos_pos, z_pos_neg).
+        Args:
+            z: [N, D] node embeddings for *all* nodes ("node" type), where
                index i corresponds to node i used in prepare_global().
+            anchor_nodes: optional LongTensor of node indices to use as anchors
+                          (e.g., nodes from the current triple batch). Only those
+                          that are in self.anchors (instance anchors) are used.
+                          If None or intersection is empty, falls back to all
+                          self.anchors (or all nodes if self.anchors is empty).
         """
         device = z.device
         N, D = z.shape
 
-        if not self.anchors: anchors = list(range(N))
-        else: anchors = self.anchors
+        if anchor_nodes is not None:
+            anchor_nodes = anchor_nodes.detach().long()
+            if anchor_nodes.numel() > 0:
+                batch_nodes = torch.unique(anchor_nodes).cpu().tolist()
+                if self.anchors:
+                    anchor_set = set(self.anchors)
+                    filtered = [u for u in batch_nodes if u in anchor_set]
+                else: filtered = batch_nodes
+
+                if filtered: anchors = filtered
+                else: anchors = self.anchors if self.anchors else list(range(N))
+            else: anchors = self.anchors if self.anchors else list(range(N))
+        else: anchors = self.anchors if self.anchors else list(range(N))
+
+        if not anchors: anchors = [0]
 
         B = len(anchors)
         anchor_tensor = torch.tensor(anchors, device=device, dtype=torch.long)
         z_pos = z[anchor_tensor]  # [B, D]
         pos_indices: List[int] = []
         neg_indices: List[List[int]] = []
-
         all_nodes_set = set(range(N))
 
         for u in anchors:
@@ -167,12 +186,10 @@ class NegativeStatementSampler:
                 candidates = list(all_nodes_set - excluded)
                 if not candidates: negs_u = [u] * self.k
                 else:
-                    if len(candidates) >= self.k:
-                        negs_u = random.sample(candidates, self.k)
+                    if len(candidates) >= self.k: negs_u = random.sample(candidates, self.k)
                     else: negs_u = random.choices(candidates, k=self.k)
             else:
-                if len(neg_list) >= self.k:
-                    negs_u = random.sample(neg_list, self.k)
+                if len(neg_list) >= self.k: negs_u = random.sample(neg_list, self.k)
                 else: negs_u = random.choices(neg_list, k=self.k)
             neg_indices.append(negs_u)
 
@@ -180,7 +197,9 @@ class NegativeStatementSampler:
         z_pos_pos = z[pos_idx_tensor]  # [B, D]
         neg_idx_tensor = torch.tensor(neg_indices, device=device, dtype=torch.long)  # [B, k]
         z_pos_neg = z[neg_idx_tensor]  # [B, k, D]
+
         return z_pos, z_pos_pos, z_pos_neg
+
 
     @staticmethod
     def _find_edge_key(g: HeteroData, rel: str, src_ntype: Optional[str] = None,
