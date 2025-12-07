@@ -52,7 +52,6 @@ class RA_HGCN(nn.Module):
         """
         x_dict = data.x_dict
         edge_index_dict = data.edge_index_dict
-
         h_dict = x_dict
         for hetero_conv in self.convs:
             h_dict = hetero_conv(h_dict, edge_index_dict)
@@ -61,19 +60,16 @@ class RA_HGCN(nn.Module):
 
     def score_triples(self, z: torch.Tensor, edge_index: torch.Tensor,
         rel_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ Score triples (u, r, v) given node embeddings and relation IDs.
-        Args:
+        """ Score triples (u, r, v) given node embeddings and relation IDs. Args:
             z: Tensor[num_nodes, hidden_dim] node embeddings for self.n_type.
             edge_index: LongTensor[2, B] with source and target node indices.
             rel_ids: LongTensor[B] with relation IDs in [0, num_rel).
         """
         src, dst = edge_index
-        h_u = z[src]                  # (B, D)
-        h_v = z[dst]                  # (B, D)
-        e_r = self.rel_emb(rel_ids)   # (B, D)
-
-        h_pair = torch.cat([h_u, e_r, h_v], dim=-1)  # (B, 3D)
-        logits = self.classify(h_pair).view(-1)      # (B,)
+        h_u, h_v = z[src], z[dst]             
+        e_r = self.rel_emb(rel_ids)
+        h_pair = torch.cat([h_u, e_r, h_v], dim=-1)
+        logits = self.classify(h_pair).view(-1)
         probs = torch.sigmoid(logits)
         return logits, probs
 

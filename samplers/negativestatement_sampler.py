@@ -158,17 +158,15 @@ class NegativeStatementSampler:
                     anchor_set = set(self.anchors)
                     filtered = [u for u in batch_nodes if u in anchor_set]
                 else: filtered = batch_nodes
-
                 if filtered: anchors = filtered
                 else: anchors = self.anchors if self.anchors else list(range(N))
             else: anchors = self.anchors if self.anchors else list(range(N))
         else: anchors = self.anchors if self.anchors else list(range(N))
 
         if not anchors: anchors = [0]
-
         B = len(anchors)
         anchor_tensor = torch.tensor(anchors, device=device, dtype=torch.long)
-        z_pos = z[anchor_tensor]  # [B, D]
+        z_pos = z[anchor_tensor]
         pos_indices: List[int] = []
         neg_indices: List[List[int]] = []
         all_nodes_set = set(range(N))

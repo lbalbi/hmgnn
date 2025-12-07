@@ -1,20 +1,15 @@
-import argparse
-import os
-import statistics
+import argparse, os, statistics, torch
 from typing import Dict, List
-import torch
 import pandas as pd
 from sklearn.model_selection import KFold
+from torch_geometric.loader import NeighborLoader
 
 from models import *
 from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
 from utils import Logger, load_config
 from data_loader import DataLoader
-from samplers import (
-    PartialStatementSampler,
-    NegativeStatementSampler,
-    RandomStatementSampler,
+from samplers import (PartialStatementSampler, NegativeStatementSampler, RandomStatementSampler,
     NegativeSampler)
 
 
@@ -233,7 +228,6 @@ def main():
         struct_graph[("node", etype, "node")].edge_index = edge_index
     e_etypes_struct = list(struct_graph.edge_types)
 
-
     print("\n=== Classification vs structural split ===")
     print(f"Total training triples:      {train_heads.size(0)}", flush=True)
     print(f"Classification triples (inst-inst): {cls_heads.size(0)}", flush=True)
@@ -252,6 +246,14 @@ def main():
         train_idx = torch.tensor(train_idx_np, dtype=torch.long)
         val_idx = torch.tensor(val_idx_np, dtype=torch.long)
 
+        train_nodes = torch.unique(torch.cat([cls_heads[train_idx], cls_tails[train_idx]], dim=0))
+        val_nodes = torch.unique(torch.cat([cls_heads[val_idx], cls_tails[val_idx]], dim=0))
+        num_neighbors = [20, 10]
+        train_loader = NeighborLoader(struct_graph, input_nodes=("node", train_nodes),
+            num_neighbors=num_neighbors, batch_size=args.batch_size, shuffle=True)
+        val_loader = NeighborLoader(struct_graph, input_nodes=("node", val_nodes),
+            num_neighbors=num_neighbors, batch_size=args.batch_size, shuffle=False)
+
         print(f"\n=== Fold {fold}/{k_folds} ===", flush=True)
         print(f"  Train classification triples: {train_idx.numel()} | "
             f"Val classification triples: {val_idx.numel()}", flush=True)
@@ -265,20 +267,17 @@ def main():
         else: model_fold = ModelCls(**base_model_kwargs).to(device)
 
         if use_random_sampler:
-            random_sampler = RandomStatementSampler(
-                k=contrastive_k, external_negs=external_edges)
+            random_sampler = RandomStatementSampler(k=contrastive_k, external_negs=external_edges)
             random_sampler.prepare_global(fold_graph)
             neg_stmt_sampler = random_sampler
         elif use_partial_sampler:
             edges_are_negative = nflag
-            neg_stmt_sampler = PartialStatementSampler(
-                k=contrastive_k, neg_edges=external_edges,
+            neg_stmt_sampler = PartialStatementSampler(k=contrastive_k, neg_edges=external_edges,
                 edges_are_negative=edges_are_negative)
             neg_stmt_sampler.prepare_global(fold_graph)
         else:
-            neg_stmt_sampler = NegativeStatementSampler(
-                k=contrastive_k, subclass_rel=subclass_rel, neg_prefix="NOT_",
-                instance_rel=instance_rel)
+            neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k, subclass_rel=subclass_rel, 
+                neg_prefix="NOT_", instance_rel=instance_rel)
             neg_stmt_sampler.prepare_global(fold_graph)
 
         log_fold = Logger(f"train_cv_fold{fold}", dir=args.output_dir)
@@ -286,7 +285,8 @@ def main():
             rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr_candidates=lr_candidates,
             epochs=args.epochs, device=device, log=log_fold, batch_size=args.batch_size,
             val_ratio=0.0, early_stopping_patience=cfg.get("patience", 20), train_idx=train_idx,
-            val_idx=val_idx, contrastive_sampler=neg_stmt_sampler, contrastive_weight=contrastive_weight)
+            val_idx=val_idx, contrastive_sampler=neg_stmt_sampler, contrastive_weight=contrastive_weight,
+            train_loader=train_loader, val_loader=val_loader)
 
         best_val_loss, best_epoch, best_metrics, best_lr = trainer_fold.run()
         best_epochs.append(int(best_epoch if best_epoch is not None else args.epochs))
