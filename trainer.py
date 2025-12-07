@@ -13,7 +13,7 @@ class Train:
         epochs: int, device: torch.device, log, batch_size: int = 1024, val_ratio: float = 0.1,
         early_stopping_patience: int = 20, train_idx: Optional[torch.Tensor] = None,
         val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeStatementSampler] = None,
-        contrastive_weight: float = 0.1, train_loader=None, val_loader=None, use_contrastive: bool = False):
+        contrastive_weight: float = 0.1, train_loader=None, val_loader=None, no_contrastive: bool = False):
 
         self.model = model.to(device)
         self.graph = graph
@@ -30,7 +30,7 @@ class Train:
         self.es_patience = int(early_stopping_patience)
         self.criterion = nn.BCEWithLogitsLoss()
         self.metrics = Metrics()
-        self.use_contrastive = use_contrastive
+        self.no_contrastive = no_contrastive
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
         self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
@@ -86,7 +86,7 @@ class Train:
             loss = bce_loss
             contr_loss_val = 0.0
 
-            if train and self.use_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+            if train and not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([h, t], dim=0))
                 z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=None)
@@ -172,7 +172,7 @@ class Train:
             triple_idx = self._get_batch_triple_indices(batch, subset="train")
             if triple_idx.numel() == 0: continue
 
-            if (self.use_contrastive and self.contrastive_sampler is not None
+            if (not self.no_contrastive and self.contrastive_sampler is not None
                 and hasattr(self.contrastive_sampler, "prepare_batch")):
                 self.contrastive_sampler.prepare_batch(batch)
 
@@ -188,7 +188,7 @@ class Train:
             loss = bce_loss
             contr_loss_val = 0.0
 
-            if self.use_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+            if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
                 z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
@@ -222,7 +222,7 @@ class Train:
                 triple_idx = self._get_batch_triple_indices(batch, subset="val")
                 if triple_idx.numel() == 0: continue
 
-                if (self.use_contrastive and self.contrastive_sampler is not None
+                if (not self.no_contrastive and self.contrastive_sampler is not None
                     and hasattr(self.contrastive_sampler, "prepare_batch")):
                     self.contrastive_sampler.prepare_batch(batch)
 
@@ -236,7 +236,7 @@ class Train:
                 loss = bce_loss
                 contr_loss_val = 0.0
 
-                if self.use_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+                if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                     batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
                     z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
                         z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
@@ -295,7 +295,7 @@ class Train:
                     self.tails = self.tails.to(self.device)
                     self.labels = self.labels.to(self.device)
                     self.model.train()
-                    if (self.use_contrastive and self.contrastive_sampler is not None
+                    if (not self.no_contrastive and self.contrastive_sampler is not None
                         and hasattr(self.contrastive_sampler, "prepare_batch")):
                         self.contrastive_sampler.prepare_batch(self.graph)
                     optimizer.zero_grad()

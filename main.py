@@ -92,7 +92,7 @@ def main():
         default="hgcn", help="Model to run (default is relation-aware HGCN)")
     parser.add_argument("--epochs", type=int, default=250,
         help="Max epochs per fold / final training.")
-    parser.add_argument("--batch_size", type=int, default=1024,
+    parser.add_argument("--batch_size", type=int, default=2048,
         help="Triple batch size for training and testing.")
     parser.add_argument("--path", type=str, default="wikidata_data",
         help="Path to the dataset directory (containing train2id_*.txt etc.).")
@@ -106,8 +106,8 @@ def main():
         help="Use PartialStatementSampler on positive statements removed from the graph.")
     parser.add_argument("--use_rstatement_sampler", action="store_true",
         help="Use RandomStatementSampler for negative statements.")
-    parser.add_argument("--use_contrastive", action="store_true",
-        help="Use contrastive learning with statement samplers.")
+    parser.add_argument("--no_contrastive", action="store_true",
+        help="Disable contrastive learning with statement samplers.")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -251,7 +251,7 @@ def main():
         if args.model == "ra_hgcn": model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
         else: model_fold = ModelCls(**base_model_kwargs).to(device)
 
-        if args.use_contrastive:
+        if not args.no_contrastive:
             if use_random_sampler:
                 random_sampler = RandomStatementSampler(k=contrastive_k, external_negs=external_edges)
                 random_sampler.prepare_global(fold_graph)
@@ -272,7 +272,7 @@ def main():
             epochs=args.epochs, device=device, log=log_fold, batch_size=args.batch_size,
             val_ratio=0.0, early_stopping_patience=cfg.get("patience", 20), train_idx=train_idx,
             val_idx=val_idx, contrastive_sampler=neg_stmt_sampler, contrastive_weight=contrastive_weight,
-            train_loader=train_loader, val_loader=val_loader, use_contrastive = args.use_contrastive)
+            train_loader=train_loader, val_loader=val_loader, no_contrastive = args.no_contrastive)
 
         best_val_loss, best_epoch, best_metrics, best_lr = trainer_fold.run()
         best_epochs.append(int(best_epoch if best_epoch is not None else args.epochs))
@@ -302,7 +302,7 @@ def main():
     else: final_model = ModelCls(**final_base_kwargs).to(device)
     final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
-    if args.use_contrastive:
+    if not args.no_contrastive:
         if use_random_sampler:
             final_contrastive_sampler = RandomStatementSampler(
                 k=contrastive_k, external_negs=external_edges)
@@ -321,7 +321,7 @@ def main():
         heads=cls_heads, rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr=final_lr,
         epochs=final_epochs, device=device, log=final_log, batch_size=args.batch_size,
         contrastive_sampler=final_contrastive_sampler, contrastive_weight=contrastive_weight, loader=final_loader,
-        use_contrastive = args.use_contrastive)
+        no_contrastive = args.no_contrastive)
     final_loss = final_trainer.run()
     print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}", flush=True)
 
