@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class DualContrastiveLoss_CE(torch.nn.Module):
+class ContrastiveLoss_CE(torch.nn.Module):
     def __init__(self, temperature: float = 0.5):
         super().__init__()
         self.temperature = temperature

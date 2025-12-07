@@ -4,31 +4,10 @@ from typing import Optional, Tuple, List, Dict
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
 from samplers import NegativeStatementSampler
-from losses import DualContrastiveLoss_CE
+from losses import ContrastiveLoss_CE
 
 
 class Train:
-    """ Triple-level trainer for a relation-aware GNN with optional contrastive learning
-    and an internal learning-rate sweep per CV fold.
-    Two modes:
-      1. **Full-graph mode** (no NeighborLoader):
-         - Encodes the whole graph once per epoch (`model.encode(self.graph)`).
-         - Uses `_iterate_batches(...)` over all triples.
-      2. **NeighborLoader mode** (subgraph batching):
-         - If `train_loader` / `val_loader` are provided, it:
-             • samples k-hop subgraphs from `self.graph`;
-             • runs message passing on subgraphs only;
-             • finds all classification triples whose head & tail are inside
-               the current subgraph (using a precomputed node→triple map);
-             • maps the *global* node indices in those triples to *local*
-               indices in the subgraph before calling `model.score_triples`.
-    Assumptions about `model`:
-      - has attribute `n_type` (string) for the main node type (default "node").
-      - has method: encode(data: HeteroData) -> Dict[str, Tensor] returning node embeddings per node type.
-      - has method: score_triples(z: Tensor, edge_index: LongTensor[2, B], rel_ids: LongTensor[B])
-        returning (logits: Tensor[B], probs: Tensor[B]).
-    """
-
     def __init__(self, model: nn.Module, graph: HeteroData, heads: torch.Tensor,
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr_candidates: List[float],
         epochs: int, device: torch.device, log, batch_size: int = 1024, val_ratio: float = 0.1,
@@ -53,7 +32,7 @@ class Train:
         self.metrics = Metrics()
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
-        self.contrastive_loss_fn = (DualContrastiveLoss_CE() if contrastive_sampler is not None else None)
+        self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
         self.train_loader = train_loader
         self.val_loader = val_loader
 
@@ -81,26 +60,6 @@ class Train:
 
     def _iterate_batches(self, idx: torch.Tensor, z: torch.Tensor,
         train: bool = True) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Original full-graph triple-level batching:
-        Iterate over batches of triples indexed by `idx`, using a **fixed** embedding
-        tensor `z` for the whole epoch.
-        Args:
-            idx: indices of triples (into self.heads / self.rels / self.tails / self.labels).
-            z: node embeddings for the main node type, shape [num_nodes, hidden_dim],
-               computed once per epoch via model.encode(self.graph).
-            train: whether we're in training mode (controls contrastive usage and
-                   whether a combined loss tensor for backprop is returned).
-
-        Returns:
-            avg_bce_loss: float
-            avg_contrastive_loss: float
-            all_probs: Tensor or None (concatenated probabilities for metrics)
-            all_labels: Tensor or None (concatenated labels for metrics)
-            total_loss_tensor: Tensor or None
-                - If train=True: scalar tensor to call backward() on.
-                - If train=False: None (no gradient, used for validation).
-        """
         total_bce = 0.0
         total_contr = 0.0
         total_examples = 0
@@ -108,10 +67,12 @@ class Train:
         all_labels = []
 
         total_loss_tensor = None
-        if train: total_loss_tensor = torch.zeros((), device=self.device)
+        if train:
+            total_loss_tensor = torch.zeros((), device=self.device)
 
         num_triples = idx.size(0)
-        if num_triples == 0: return 0.0, 0.0, None, None, total_loss_tensor
+        if num_triples == 0:
+            return 0.0, 0.0, None, None, total_loss_tensor
         for start in range(0, num_triples, self.batch_size):
             end = min(start + self.batch_size, num_triples)
             b_idx = idx[start:end]
@@ -128,8 +89,9 @@ class Train:
 
             if train and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([h, t], dim=0))
+                # Full-graph mode: no n_id
                 z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
-                    z, anchor_nodes=batch_nodes)
+                    z, anchor_nodes=batch_nodes, n_id=None)
                 contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
@@ -157,16 +119,6 @@ class Train:
 
 
     def _get_batch_triple_indices(self, batch: HeteroData, subset: str) -> torch.Tensor:
-        """
-        Given a subgraph batch from NeighborLoader, return the indices (into
-        self.heads/self.tails/...) of classification triples that:
-          1. belong to `subset` ("train" or "val"), and
-          2. have both head **and** tail nodes present in this subgraph.
-
-        This works purely in global index space, using:
-          - batch["node"].n_id : global node IDs of this subgraph.
-          - node_to_triples[u] : list of triple indices whose head == u.
-        """
         n_id = batch["node"].n_id.cpu().tolist()
         nodes_set = set(n_id)
 
@@ -188,26 +140,14 @@ class Train:
         selected = sorted(selected)
         return torch.tensor(selected, dtype=torch.long)
 
+
     @staticmethod
     def _build_global_to_local(n_id: torch.Tensor) -> Dict[int, int]:
-        """
-        Build a mapping from global node id -> local node index for a subgraph
-        batch, using batch["node"].n_id (global IDs).
-        """
         n_id_list = n_id.cpu().tolist()
         return {int(g): i for i, g in enumerate(n_id_list)}
 
-
     def _build_local_triple_tensors(self, triple_idx: torch.Tensor,
         n_id: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Map global triple indices `triple_idx` to LOCAL edge_index, rel_ids, labels
-        for the current subgraph.
-        Args:
-            triple_idx: LongTensor[K] of global triple indices.
-            n_id: Tensor[num_nodes_subgraph] with global node IDs for this subgraph.
-            device: device for returned tensors.
-        """
         g2l = self._build_global_to_local(n_id)
         heads_global = self.heads[triple_idx].tolist()
         tails_global = self.tails[triple_idx].tolist()
@@ -223,14 +163,6 @@ class Train:
         return edge_index_local, rel_ids, labels
 
     def _train_one_epoch_with_neighbors(self, optimizer, n_type: str) -> Tuple[float, float]:
-        """
-        Train for an epoch using NeighborLoader subgraphs.
-        For each subgraph:
-          - find all train triples fully contained in it,
-          - encode the subgraph with `model.encode`,
-          - compute triple BCE (+ contrastive if enabled),
-          - backprop and update optimizer.
-        """
         assert self.train_loader is not None, "NeighborLoader not provided."
         self.model.train()
         total_bce = 0.0
@@ -261,7 +193,7 @@ class Train:
             if self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
                 z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
-                    z, anchor_nodes=batch_nodes)
+                    z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
                 contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
@@ -276,13 +208,8 @@ class Train:
         avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
         return avg_bce, avg_contr
 
-    def _eval_with_neighbors(self, n_type: str,
-    ) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Validation pass using NeighborLoader subgraphs (no gradient).
-        Aggregates BCE, contrastive loss, and concatenates probs/labels
-        across all val subgraphs.
-        """
+
+    def _eval_with_neighbors(self, n_type:str) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor]]:
         assert self.val_loader is not None, "NeighborLoader not provided."
         self.model.eval()
         total_bce = 0.0
@@ -296,7 +223,8 @@ class Train:
                 batch = batch.to(self.device)
 
                 triple_idx = self._get_batch_triple_indices(batch, subset="val")
-                if triple_idx.numel() == 0: continue
+                if triple_idx.numel() == 0:
+                    continue
 
                 if (self.contrastive_sampler is not None
                     and hasattr(self.contrastive_sampler, "prepare_batch")):
@@ -315,7 +243,7 @@ class Train:
                 if self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                     batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
                     z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
-                        z, anchor_nodes=batch_nodes)
+                        z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
                     contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
                     loss = loss + self.contrastive_weight * contr_loss
                     contr_loss_val = float(contr_loss.detach().cpu().item())
@@ -340,13 +268,6 @@ class Train:
 
 
     def run(self):
-        """
-        Train with a train/val split (either internal or provided), performing a
-        learning-rate sweep inside this method. If NeighborLoader is provided, use 
-        subgraph-based message passing. Else, fall back to full-graph encode-once-per-epoch behaviour.
-
-        Returns overall_best_val_loss, overall_best_epoch, overall_best_metrics, overall_best_lr
-        """
         n_type = getattr(self.model, "n_type", "node")
         overall_best_val_loss = float("inf")
         overall_best_epoch = -1
@@ -369,8 +290,7 @@ class Train:
                 self.log.log(f"=== Starting LR sweep for lr={lr:.3g} ===")
 
             for epoch in range(1, self.max_epochs + 1):
-                if use_neighbor_mode:
-                    train_bce, train_contr = self._train_one_epoch_with_neighbors(
+                if use_neighbor_mode: train_bce, train_contr = self._train_one_epoch_with_neighbors(
                         optimizer, n_type=n_type)
                 else:
                     self.graph = self.graph.to(self.device)
@@ -404,7 +324,8 @@ class Train:
 
                 if val_probs is not None and val_labels is not None:
                     val_metrics = self.metrics.update(val_probs, val_labels)
-                else: val_metrics = None
+                else:
+                    val_metrics = None
 
                 if not getattr(self.log, "non_verbose", False):
                     msg = (f"[lr={lr:.3g}] Epoch {epoch:03d} | "
@@ -420,8 +341,7 @@ class Train:
                     best_val_loss_lr = val_bce
                     best_epoch_lr = epoch
                     best_metrics_lr = val_metrics
-                    best_state_lr = {
-                        k: v.detach().clone() for k, v in self.model.state_dict().items()}
+                    best_state_lr = {k:v.detach().clone() for k,v in self.model.state_dict().items()}
 
                 if lr_early_stopping.step(val_bce, self.model):
                     if not getattr(self.log, "non_verbose", False):
@@ -440,7 +360,9 @@ class Train:
                 self.log.log(f"=== Finished LR={lr:.3g} | best_val_loss={best_val_loss_lr:.4f} "
                     f"at epoch {best_epoch_lr} ===")
 
-        # if overall_best_state is not None: self.model.load_state_dict(overall_best_state)
+        # if overall_best_state is not None:
+        #     self.model.load_state_dict(overall_best_state)
+
         if not getattr(self.log, "non_verbose", False):
             self.log.log(f"[CV Fold] Best overall LR={overall_best_lr:.3g} | "
                 f"Best epoch={overall_best_epoch} | "

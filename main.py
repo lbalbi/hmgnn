@@ -6,7 +6,7 @@ from torch_geometric.loader import NeighborLoader
 
 from models import *
 from trainer import Train
-from trainer_bestmodel import Train_BestModel, Test_BestModel
+from trainer_bestmodel import (Train_BestModel, Test_BestModel)
 from utils import Logger, load_config
 from data_loader import DataLoader
 from samplers import (PartialStatementSampler, NegativeStatementSampler, RandomStatementSampler,
@@ -14,13 +14,11 @@ from samplers import (PartialStatementSampler, NegativeStatementSampler, RandomS
 
 
 def build_triples_from_wikidata(data_dir: str) -> Dict[str, torch.Tensor]:
-    """
-    Read Wikidata-style KG files and build train / test triple tensors.
+    """ Read Wikidata KG files and build train / test triple tensors.
     Expected files inside `data_dir`:
       - train2id_pos.txt  with columns: source_node,target_node,edge_type
       - train2id_neg.txt  with columns: source_node,target_node,edge_type (e.g. NOT_3)
       - test2id_pos.txt   with columns: source_node,target_node,edge_type
-
     For training:
       - Positives use their edge_type directly  (e.g. '3') with label 1.
       - Negatives with edge_type 'NOT_k' are interpreted as relation k with label 0
@@ -31,8 +29,7 @@ def build_triples_from_wikidata(data_dir: str) -> Dict[str, torch.Tensor]:
     test_pos_path = os.path.join(data_dir, "test2id_pos.txt")
 
     def _read(path: str) -> pd.DataFrame:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Expected file not found: {path}")
+        if not os.path.exists(path): raise FileNotFoundError(f"Expected file not found: {path}")
         df = pd.read_csv(path)
         df.columns = [c.strip() for c in df.columns]
         required = {"source_node", "target_node", "edge_type"}
@@ -81,27 +78,18 @@ def build_triples_from_wikidata(data_dir: str) -> Dict[str, torch.Tensor]:
     test_tails = torch.tensor(df_test_pos["target_node"].to_numpy(), dtype=torch.long)
     test_rels = torch.tensor([rel2id[r] for r in test_rel_names], dtype=torch.long)
 
-    return {
-        "train_heads": train_heads,
-        "train_tails": train_tails,
-        "train_rels": train_rels,
-        "train_labels": train_labels,
-        "train_raw_rels": train_raw_rels,
-        "statement_edge_types_raw": statement_edge_types_raw,
-        "test_heads": test_heads,
-        "test_tails": test_tails,
-        "test_rels": test_rels,
-        "rel2id": rel2id,
-        "id2rel": id2rel,
-    }
+    return {"train_heads": train_heads, "train_tails": train_tails, "train_rels": train_rels,
+        "train_labels": train_labels, "train_raw_rels": train_raw_rels,
+        "statement_edge_types_raw": statement_edge_types_raw, "test_heads": test_heads,
+        "test_tails": test_tails, "test_rels": test_rels, "rel2id": rel2id,"id2rel": id2rel}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="wikidata",
         help="Task / dataset name (used to load config JSON).")
-    parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "hgat", "gcn", "gae"],
-        default="hgcn", help="Model to run (RA_HGCN is relation-aware).")
+    parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "gcn", "gae"],
+        default="hgcn", help="Model to run (default is relation-aware HGCN)")
     parser.add_argument("--epochs", type=int, default=250,
         help="Max epochs per fold / final training.")
     parser.add_argument("--batch_size", type=int, default=1024,
@@ -142,7 +130,7 @@ def main():
     k_folds = int(cfg.get("k_folds", 10))
     contrastive_weight = float(cfg.get("contrastive_weight", 0.1))
     subclass_rel = cfg.get("subclass_rel", "subclass_of")
-    instance_rel = cfg.get("instance_rel", "2")  # we will assume "2" is instance-of
+    instance_rel = cfg.get("instance_rel", "2")  # assumes "2" is instance_of / P31
     contrastive_k = int(cfg.get("contrastive_k", 1))
 
     dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatementsampler,
@@ -153,9 +141,7 @@ def main():
     num_nodes = full_graph_all["node"].num_nodes
     base_x = full_graph_all["node"].x
     all_e_etypes = list(full_graph_all.edge_types)
-    nflag = args.use_nstatementsampler
-    pflag = args.use_pstatementsampler
-    rflag = args.use_rstatement_sampler
+    nflag, pflag, rflag = args.use_nstatementsampler, args.use_pstatementsampler, args.use_rstatement_sampler
     use_partial_sampler = nflag or pflag
     use_random_sampler = rflag
     external_edges = dl.get_state_list()
@@ -184,7 +170,6 @@ def main():
 
     inst_src, _ = data_dict[instance_rel]
     inst_set = set(inst_src.tolist())
-
     is_instance = torch.zeros(num_nodes, dtype=torch.bool)
     if inst_set:
         inst_idx_tensor = torch.tensor(sorted(inst_set), dtype=torch.long)
@@ -192,7 +177,6 @@ def main():
 
     head_is_inst = is_instance[train_heads]
     tail_is_inst = is_instance[train_tails]
-
     inst_inst_mask = head_is_inst & tail_is_inst
     inst_class_mask = head_is_inst ^ tail_is_inst
     cls_idx = torch.nonzero(inst_inst_mask, as_tuple=False).view(-1)
@@ -229,7 +213,7 @@ def main():
     e_etypes_struct = list(struct_graph.edge_types)
 
     print("\n=== Classification vs structural split ===")
-    print(f"Total training triples:      {train_heads.size(0)}", flush=True)
+    print(f"Total training triples:  {train_heads.size(0)}", flush=True)
     print(f"Classification triples (inst-inst): {cls_heads.size(0)}", flush=True)
     print(f"Structural edge types in encoder graph: {sorted(struct_edge_types)}", flush=True)
     print(f"#Encoder graph edge types: {len(e_etypes_struct)}", flush=True)
