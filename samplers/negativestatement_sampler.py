@@ -90,16 +90,23 @@ class NegativeStatementSampler:
                     pool.add(c)
             self.neg_pool[u] = list(pool)
 
-        filtered_anchors = [
-            u for u in self.anchors
-            if (len(self.pos_neighbors[u]) > 0 and len(self.neg_pool[u]) > 0)
-        ]
-        if filtered_anchors:
-            self.anchors = filtered_anchors
+        filtered_anchors = [u for u in self.anchors
+            if (len(self.pos_neighbors[u]) > 0 and len(self.neg_pool[u]) > 0)]
+        if filtered_anchors: self.anchors = filtered_anchors
+
+        self.pos_neighbors_t = [torch.as_tensor(nb, dtype=torch.long)
+            if len(nb) > 0 else torch.empty(0, dtype=torch.long)
+            for nb in self.pos_neighbors]
+        self.neg_pool_t = [torch.as_tensor(nb, dtype=torch.long)
+            if len(nb) > 0 else torch.empty(0, dtype=torch.long)
+            for nb in self.neg_pool]
+
+        self._global2local_cpu = None
+        self._in_batch_mask_cpu = None
+
 
     def prepare_batch(self, batch: HeteroData,
         pos_index: Optional[Tensor] = None) -> None:
-        # No per-batch state needed; global structures already built.
         return
 
     def get_contrastive_samples(
@@ -109,8 +116,8 @@ class NegativeStatementSampler:
         n_id: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
-        Build contrastive triples (z_pos, z_pos_pos, z_pos_neg).
-
+        Build contrastive triples (z_pos, z_pos_pos, z_pos_neg) with much lower Python
+        overhead by using tensor masks and a tensor-based global->local mapping.
         Args:
             z: [N, D] node embeddings. If `n_id` is None, row i is node i (global).
                If `n_id` is provided, row i corresponds to global node n_id[i].
@@ -120,111 +127,103 @@ class NegativeStatementSampler:
         device = z.device
         N, D = z.shape
 
-        # Map rows in z to global IDs
-        if n_id is None:
-            global_for_row = torch.arange(N, device=device, dtype=torch.long)
-            global2local = {int(i): int(i) for i in range(N)}
-        else:
-            n_id = n_id.to(device).long()
-            global_for_row = n_id
-            global2local = {int(g): i for i, g in enumerate(global_for_row.cpu().tolist())}
+        if n_id is None: global_for_row = torch.arange(N, dtype=torch.long)
+        else: global_for_row = n_id.detach().long().cpu()
 
-        all_batch_globals = set(int(g) for g in global_for_row.cpu().tolist())
+        if (getattr(self, "_global2local_cpu", None) is None or
+                self._global2local_cpu.numel() < self.num_nodes):
+            self._global2local_cpu = torch.full((self.num_nodes,), -1, dtype=torch.long)
+        global2local = self._global2local_cpu
+        global2local.fill_(-1)
+        global2local[global_for_row] = torch.arange(global_for_row.size(0), dtype=torch.long)
 
-        # Determine candidate anchors in *global* id space
+        if (getattr(self, "_in_batch_mask_cpu", None) is None or
+                self._in_batch_mask_cpu.numel() < self.num_nodes):
+            self._in_batch_mask_cpu = torch.zeros(self.num_nodes, dtype=torch.bool)
+        in_batch = self._in_batch_mask_cpu
+        in_batch.zero_()
+        in_batch[global_for_row] = True
+
         if anchor_nodes is not None and anchor_nodes.numel() > 0:
-            anchor_nodes = anchor_nodes.detach().long().to(device)
-            row_indices = torch.unique(anchor_nodes).cpu().tolist()
-            anchor_globals = [int(global_for_row[i]) for i in row_indices]
+            anchor_local = anchor_nodes.detach().long().cpu().unique()
+            anchor_globals = global_for_row[anchor_local]
         else:
-            anchor_globals = self.anchors if self.anchors else list(range(self.num_nodes))
+            if self.anchors: anchor_globals = torch.as_tensor(self.anchors, dtype=torch.long)
+            else: anchor_globals = torch.arange(self.num_nodes, dtype=torch.long)
+        anchor_globals = anchor_globals[in_batch[anchor_globals]]
 
-        # If we're in subgraph mode, restrict anchors to nodes present in the batch
-        anchor_globals = [u for u in anchor_globals if u in all_batch_globals]
+        if self.anchors and anchor_nodes is not None and anchor_nodes.numel() > 0:
+            anchor_filter = torch.as_tensor(self.anchors, dtype=torch.long)
+            mask = torch.isin(anchor_globals, anchor_filter)
+            if mask.any(): anchor_globals = anchor_globals[mask]
 
-        # Optionally restrict to "instance" anchors (self.anchors)
-        if self.anchors:
-            anchor_set = set(self.anchors)
-            filtered = [u for u in anchor_globals if u in anchor_set]
-            if filtered:
-                anchor_globals = filtered
+        if anchor_globals.numel() == 0: anchor_globals = global_for_row.clone()
+        if anchor_globals.numel() == 0: anchor_globals = torch.tensor([0], dtype=torch.long)
 
-        if not anchor_globals:
-            # Fallback: use all nodes in this batch
-            anchor_globals = list(all_batch_globals)
+        anchor_local_cpu = global2local[anchor_globals]
+        valid = anchor_local_cpu >= 0
+        anchor_local_cpu = anchor_local_cpu[valid]
+        anchor_globals = anchor_globals[valid]
 
-        if not anchor_globals:
-            # Degenerate fallback
-            anchor_globals = [0]
+        if anchor_local_cpu.numel() == 0:
+            num_fallback = min(N, max(self.k, 1))
+            anchor_local_cpu = torch.arange(num_fallback, dtype=torch.long)
+            anchor_globals = global_for_row[anchor_local_cpu]
+        B = anchor_local_cpu.numel()
 
-        z_pos_list = []
-        z_pos_pos_list = []
-        z_pos_neg_list = []
+        if not hasattr(self, "pos_neighbors_t"):
+            self.pos_neighbors_t = [torch.as_tensor(nb, dtype=torch.long)
+                if len(nb) > 0 else torch.empty(0, dtype=torch.long)
+                for nb in self.pos_neighbors]
 
-        # For each anchor (global ID), sample pos/neg neighbors (global IDs),
-        # then map to local row indices for z.
-        for u in anchor_globals:
-            if u not in global2local:
-                continue
-            u_local = global2local[u]
-            z_pos_list.append(z[u_local].unsqueeze(0))
+        if not hasattr(self, "neg_pool_t"):
+            self.neg_pool_t = [torch.as_tensor(nb, dtype=torch.long)
+                if len(nb) > 0 else torch.empty(0, dtype=torch.long)
+                for nb in self.neg_pool]
 
-            # --- Positives (filtered to nodes in this batch) ---
-            pos_candidates_global = [
-                v for v in self.pos_neighbors[u] if v in all_batch_globals
-            ]
-            if pos_candidates_global:
-                v_pos_global = random.choice(pos_candidates_global)
+        pos_neighbors_t = self.pos_neighbors_t
+        neg_pool_t = self.neg_pool_t
+
+        z_pos_pos_idx_local = torch.empty(B, dtype=torch.long)
+        z_pos_neg_idx_local = torch.empty(B, self.k, dtype=torch.long)
+
+        for i, u_global in enumerate(anchor_globals.tolist()):
+            u_local = int(anchor_local_cpu[i].item())
+            neigh = pos_neighbors_t[u_global]
+            if neigh.numel() > 0: neigh_in_batch = neigh[in_batch[neigh]]
+            else: neigh_in_batch = neigh
+
+            if neigh_in_batch.numel() > 0:
+                j = torch.randint(0, neigh_in_batch.numel(), (1,), dtype=torch.long).item()
+                v_pos_global = int(neigh_in_batch[j].item())
+                v_pos_local = int(global2local[v_pos_global].item())
+                if v_pos_local < 0: v_pos_local = u_local
+            else: v_pos_local = u_local
+
+            z_pos_pos_idx_local[i] = v_pos_local
+            neg_neigh = neg_pool_t[u_global]
+            if neg_neigh.numel() > 0: neg_in_batch = neg_neigh[in_batch[neg_neigh]]
+            else: neg_in_batch = neg_neigh
+
+            if neg_in_batch.numel() > 0:
+                if neg_in_batch.numel() >= self.k: choice_idx = torch.randperm(neg_in_batch.numel())[:self.k]
+                else: choice_idx = torch.randint(0, neg_in_batch.numel(), (self.k,), dtype=torch.long)
+                chosen_globals = neg_in_batch[choice_idx]
+                chosen_locals = global2local[chosen_globals]
+                bad_mask = chosen_locals < 0
+                chosen_locals[bad_mask] = u_local
             else:
-                v_pos_global = u
+                if global_for_row.numel() >= self.k:choice_idx = torch.randperm(global_for_row.numel())[:self.k]
+                else:choice_idx = torch.randint(0, global_for_row.numel(), (self.k,), dtype=torch.long)
+                chosen_locals = choice_idx
+            z_pos_neg_idx_local[i] = chosen_locals
 
-            if v_pos_global in global2local:
-                v_pos_local = global2local[v_pos_global]
-            else:
-                v_pos_local = u_local
-            z_pos_pos_list.append(z[v_pos_local].unsqueeze(0))
-
-            # --- Negatives (filtered to nodes in this batch) ---
-            neg_candidates_global = [
-                v for v in self.neg_pool[u] if v in all_batch_globals
-            ]
-            neg_indices_local: List[int] = []
-
-            if neg_candidates_global:
-                if len(neg_candidates_global) >= self.k:
-                    chosen_globals = random.sample(neg_candidates_global, self.k)
-                else:
-                    chosen_globals = random.choices(neg_candidates_global, k=self.k)
-                for v in chosen_globals:
-                    v_local = global2local.get(v, u_local)
-                    neg_indices_local.append(v_local)
-            else:
-                # Fallback: sample negatives from all nodes in this batch
-                batch_locals = list(range(N))
-                if len(batch_locals) >= self.k:
-                    chosen_locals = random.sample(batch_locals, self.k)
-                else:
-                    chosen_locals = random.choices(batch_locals, k=self.k)
-                neg_indices_local = chosen_locals
-
-            neg_idx_tensor = torch.tensor(
-                neg_indices_local, dtype=torch.long, device=device
-            )
-            z_neg_for_u = z[neg_idx_tensor]  # [k, D]
-            z_pos_neg_list.append(z_neg_for_u.unsqueeze(0))  # [1, k, D]
-
-        if not z_pos_list:
-            # Extreme fallback: just take first few rows of z
-            anchor_rows = list(range(min(N, max(self.k, 1))))
-            z_pos = z[anchor_rows]
-            z_pos_pos = z[anchor_rows]
-            z_pos_neg = z[anchor_rows].unsqueeze(1).expand(-1, self.k, -1)
-            return z_pos, z_pos_pos, z_pos_neg
-
-        z_pos = torch.cat(z_pos_list, dim=0)         # [B, D]
-        z_pos_pos = torch.cat(z_pos_pos_list, dim=0) # [B, D]
-        z_pos_neg = torch.cat(z_pos_neg_list, dim=0) # [B, k, D]
+        anchor_local = anchor_local_cpu.to(device)
+        z_pos = z[anchor_local]
+        z_pos_pos = z[z_pos_pos_idx_local.to(device)]
+        z_pos_neg = z[z_pos_neg_idx_local.to(device)]
         return z_pos, z_pos_pos, z_pos_neg
+
 
     @staticmethod
     def _find_edge_key(g: HeteroData, rel: str, src_ntype: Optional[str] = None,

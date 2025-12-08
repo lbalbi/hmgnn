@@ -11,7 +11,7 @@ class Train:
     def __init__(self, model: nn.Module, graph: HeteroData, heads: torch.Tensor,
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr_candidates: List[float],
         epochs: int, device: torch.device, log, batch_size: int = 1024, val_ratio: float = 0.1,
-        early_stopping_patience: int = 20, train_idx: Optional[torch.Tensor] = None,
+        early_stopping_patience: int = 15, train_idx: Optional[torch.Tensor] = None,
         val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeStatementSampler] = None,
         contrastive_weight: float = 0.1, train_loader=None, val_loader=None, no_contrastive: bool = False):
 
@@ -54,6 +54,7 @@ class Train:
             raise ValueError("Train currently assumes a single node type 'node' in the graph.")
         num_nodes = int(self.graph["node"].num_nodes)
         self.num_nodes = num_nodes
+        self.node_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
         self.node_to_triples: List[List[int]] = [[] for _ in range(num_nodes)]
         for idx in range(num_triples):
             h = int(self.heads[idx])
@@ -117,27 +118,24 @@ class Train:
 
 
     def _get_batch_triple_indices(self, batch: HeteroData, subset: str) -> torch.Tensor:
-        n_id = batch["node"].n_id.cpu().tolist()
-        nodes_set = set(n_id)
+        """
+        Returns the indices of triples in the given subset ('train' or 'val')
+        whose head and tail are both inside the current NeighborLoader subgraph.
+        This implementation avoids Python loops by using a boolean node mask.
+        """
+        n_id = batch["node"].n_id
+        if n_id.is_cuda: n_id = n_id.cpu()
 
-        candidate_indices: set = set()
-        for u in nodes_set:
-            if 0 <= u < self.num_nodes: candidate_indices.update(self.node_to_triples[u])
-
-        if subset == "train": allowed = self.train_idx_set
-        elif subset == "val": allowed = self.val_idx_set
+        if subset == "train": subset_idx = self.train_idx
+        elif subset == "val": subset_idx = self.val_idx  
         else: raise ValueError(f"Unknown subset: {subset}")
-
-        selected = []
-        for idx in candidate_indices:
-            if idx not in allowed: continue
-            t_global = int(self.tails[idx])
-            if t_global in nodes_set: selected.append(idx)
-
-        if not selected: return torch.empty(0, dtype=torch.long)
-        selected = sorted(selected)
-        return torch.tensor(selected, dtype=torch.long)
-
+        node_mask = self.node_mask
+        node_mask[n_id] = True
+        heads_sub = self.heads[subset_idx]
+        tails_sub = self.tails[subset_idx]
+        in_batch = node_mask[heads_sub] & node_mask[tails_sub]
+        node_mask[n_id] = False
+        return subset_idx[in_batch]
 
     @staticmethod
     def _build_global_to_local(n_id: torch.Tensor) -> Dict[int, int]:
@@ -284,16 +282,18 @@ class Train:
             best_state_lr = None
             if not getattr(self.log, "non_verbose", False):
                 self.log.log(f"=== Starting LR sweep for lr={lr:.3g} ===")
-
+            
+            if not use_neighbor_mode:
+                self.graph = self.graph.to(self.device)
+                self.heads = self.heads.to(self.device)
+                self.rels = self.rels.to(self.device)
+                self.tails = self.tails.to(self.device)
+                self.labels = self.labels.to(self.device)
+            
             for epoch in range(1, self.max_epochs + 1):
                 if use_neighbor_mode: train_bce, train_contr = self._train_one_epoch_with_neighbors(
                         optimizer, n_type=n_type)
                 else:
-                    self.graph = self.graph.to(self.device)
-                    self.heads = self.heads.to(self.device)
-                    self.rels = self.rels.to(self.device)
-                    self.tails = self.tails.to(self.device)
-                    self.labels = self.labels.to(self.device)
                     self.model.train()
                     if (not self.no_contrastive and self.contrastive_sampler is not None
                         and hasattr(self.contrastive_sampler, "prepare_batch")):

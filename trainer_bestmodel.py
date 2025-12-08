@@ -51,6 +51,7 @@ class Train_BestModel:
             raise ValueError("Train_BestModel assumes a single node type 'node'.")
         num_nodes = int(self.graph["node"].num_nodes)
         self.num_nodes = num_nodes
+        self.node_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
         num_triples = self.heads.size(0)
 
         self.node_to_triples: List[List[int]] = [[] for _ in range(num_nodes)]
@@ -107,22 +108,27 @@ class Train_BestModel:
         n_id_list = n_id.cpu().tolist()
         return {int(g): i for i, g in enumerate(n_id_list)}
 
-    def _get_batch_triple_indices(self, batch: HeteroData) -> torch.Tensor:
-        """All triples whose head/tail are both inside the subgraph."""
-        n_id = batch["node"].n_id.cpu().tolist()
-        nodes_set = set(n_id)
-        candidate_indices: set = set()
-        for u in nodes_set:
-            if 0 <= u < self.num_nodes: candidate_indices.update(self.node_to_triples[u])
 
-        selected = []
-        for idx in candidate_indices:
-            t_global = int(self.tails[idx])
-            if t_global in nodes_set: selected.append(idx)
+    def _get_batch_triple_indices(self, batch: HeteroData, subset: str) -> torch.Tensor:
+        """
+        Returns the indices of triples in the given subset ('train' or 'val')
+        whose head and tail are both inside the current NeighborLoader subgraph.
+        This implementation avoids Python loops by using a boolean node mask.
+        """
+        n_id = batch["node"].n_id
+        if n_id.is_cuda: n_id = n_id.cpu()
 
-        if not selected: return torch.empty(0, dtype=torch.long)
-        selected = sorted(selected)
-        return torch.tensor(selected, dtype=torch.long)
+        if subset == "train": subset_idx = self.train_idx
+        elif subset == "val": subset_idx = self.val_idx  
+        else: raise ValueError(f"Unknown subset: {subset}")
+        node_mask = self.node_mask
+        node_mask[n_id] = True
+        heads_sub = self.heads[subset_idx]
+        tails_sub = self.tails[subset_idx]
+        in_batch = node_mask[heads_sub] & node_mask[tails_sub]
+        node_mask[n_id] = False
+        return subset_idx[in_batch]
+
 
     def _build_local_triple_tensors(self, triple_idx: torch.Tensor, n_id: torch.Tensor,
         device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -194,8 +200,8 @@ class Train_BestModel:
         last_bce_loss = 0.0
         last_contr_loss = 0.0
 
-        self.graph = self.graph.to(self.device)
         if not use_neighbor_mode:
+            self.graph = self.graph.to(self.device)
             self.heads = self.heads.to(self.device)
             self.rels = self.rels.to(self.device)
             self.tails = self.tails.to(self.device)
@@ -225,166 +231,6 @@ class Train_BestModel:
                 self.log.log(msg)
         return last_bce_loss
 
-
-# class Test_BestModel:
-#     """Test-time evaluation on a global triple-level test set.
-#        Positives: provided explicitly as (heads, rel_ids, tails).
-#        Negatives: sampled per relation using existing NegativeSampler.
-#        - Negative sampling at test time now ALSO excludes *test positives*,
-#        in addition to whatever training positives `NegativeSampler` already
-#        avoids. This is done via an extra filtering step per relation.
-#     """
-
-#     def __init__(self, model: nn.Module, graph: HeteroData, test_heads: torch.Tensor,
-#         test_rels: torch.Tensor, test_tails: torch.Tensor, id2rel: Dict[int, str],
-#         neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int, device: torch.device,
-#         log, batch_size: int = 4096):
-#         self.model = model.to(device)
-#         self.graph = graph
-#         self.test_heads = test_heads
-#         self.test_rels = test_rels
-#         self.test_tails = test_tails
-#         self.id2rel = id2rel
-#         self.neg_samplers = neg_samplers
-#         self.num_neg_per_pos = int(num_neg_per_pos)
-#         self.device = device
-#         self.log = log
-#         self.batch_size = int(batch_size)
-#         self.metrics = Metrics()
-
-#         self.num_nodes = int(graph["node"].num_nodes)
-#         self.test_pos_ids_per_rel: Dict[str, set] = {}
-#         for rel_id, rel_name in id2rel.items():
-#             mask = (test_rels == rel_id)
-#             if not mask.any(): continue
-#             h = test_heads[mask]
-#             t = test_tails[mask]
-#             ids = (h.long() * self.num_nodes + t.long()).tolist()
-#             self.test_pos_ids_per_rel[rel_name] = set(ids)
-
-
-#     def _score_triples_in_batches(self, z: torch.Tensor, heads: torch.Tensor,
-#         rels: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
-#         """
-#         Compute probabilities for triples in mini-batches to save memory.
-#         Returns a tensor of shape [N] with probabilities.
-#         """
-#         all_probs = []
-#         self.model.eval()
-#         with torch.no_grad():
-#             num = heads.size(0)
-#             for start in range(0, num, self.batch_size):
-#                 end = min(start + self.batch_size, num)
-#                 h = heads[start:end]
-#                 t = tails[start:end]
-#                 r = rels[start:end]
-#                 edge_index = torch.stack([h, t], dim=0)
-#                 _, probs = self.model.score_triples(z, edge_index, r)
-#                 all_probs.append(probs.detach().cpu())
-#         return torch.cat(all_probs, dim=0) if all_probs else torch.empty(0)
-
-
-#     def _sample_negatives_excluding_test(self, sampler: NegativeSampler, rel_name: str,
-#         num_to_sample: int) -> torch.Tensor:
-#         """
-#         Use NegativeSampler to sample candidate negatives, then filter out any
-#         edges that coincide with test positives for `rel_name`. Resamples a few
-#         times if needed to reach the desired count (best effort).
-#         """
-#         invalid_ids = self.test_pos_ids_per_rel.get(rel_name, set())
-#         if not invalid_ids: return sampler.sample_edge_index(num_to_sample)
-
-#         collected = []
-#         remaining = num_to_sample
-#         max_attempts = 10
-#         attempts = 0
-
-#         while remaining > 0 and attempts < max_attempts:
-#             attempts += 1
-#             cand_edge_index = sampler.sample_edge_index(int(remaining * 1.5))
-#             if cand_edge_index.numel() == 0: break
-
-#             h = cand_edge_index[0]
-#             t = cand_edge_index[1]
-#             ids = (h.long() * self.num_nodes + t.long()).tolist()
-#             keep_mask_list = [id_ not in invalid_ids for id_ in ids]
-
-#             if not any(keep_mask_list): continue
-
-#             keep_mask = torch.tensor(keep_mask_list, dtype=torch.bool, device=self.device)
-#             kept_edges = cand_edge_index[:, keep_mask]
-#             if kept_edges.numel() == 0: continue
-
-#             collected.append(kept_edges)
-#             remaining = num_to_sample - sum(c.size(1) for c in collected)
-
-#         if not collected:
-#             return torch.empty(2, 0, dtype=torch.long, device=self.device)
-
-#         neg_edge_index = torch.cat(collected, dim=1)
-#         if neg_edge_index.size(1) > num_to_sample: neg_edge_index = neg_edge_index[:, :num_to_sample]
-#         return neg_edge_index
-
-#     def run(self):
-#         self.graph = self.graph.to(self.device)
-#         self.test_heads = self.test_heads.to(self.device)
-#         self.test_rels = self.test_rels.to(self.device)
-#         self.test_tails = self.test_tails.to(self.device)
-
-#         self.model.eval()
-#         with torch.no_grad():
-#             h_dict = self.model.encode(self.graph)
-#             z = h_dict[getattr(self.model, "n_type", "node")]
-#             pos_probs = self._score_triples_in_batches(
-#                 z, self.test_heads, self.test_rels, self.test_tails
-#             )
-#             pos_labels = torch.ones_like(pos_probs)
-
-#             neg_heads_list = []
-#             neg_rels_list = []
-#             neg_tails_list = []
-
-#             unique_rels, counts = torch.unique(self.test_rels, return_counts=True)
-#             for rel_id, count in zip(unique_rels.tolist(), counts.tolist()):
-#                 rel_name = self.id2rel[rel_id]
-#                 sampler = self.neg_samplers.get(rel_name, None)
-#                 if sampler is None: continue
-
-#                 num_to_sample = count * self.num_neg_per_pos
-#                 neg_edge_index = self._sample_negatives_excluding_test(
-#                     sampler, rel_name, num_to_sample)
-#                 if neg_edge_index.numel() == 0: continue
-
-#                 h_neg = neg_edge_index[0]
-#                 t_neg = neg_edge_index[1]
-#                 r_neg = torch.full(
-#                     (h_neg.size(0),), rel_id, dtype=torch.long, device=self.device)
-
-#                 neg_heads_list.append(h_neg)
-#                 neg_tails_list.append(t_neg)
-#                 neg_rels_list.append(r_neg)
-
-#             if neg_heads_list:
-#                 neg_heads = torch.cat(neg_heads_list, dim=0)
-#                 neg_tails = torch.cat(neg_tails_list, dim=0)
-#                 neg_rels = torch.cat(neg_rels_list, dim=0)
-
-#                 neg_probs = self._score_triples_in_batches(
-#                     z, neg_heads, neg_rels, neg_tails)
-#                 neg_labels = torch.zeros_like(neg_probs)
-
-#                 all_probs = torch.cat([pos_probs, neg_probs], dim=0)
-#                 all_labels = torch.cat([pos_labels, neg_labels], dim=0)
-#             else:
-#                 all_probs = pos_probs
-#                 all_labels = pos_labels
-
-#             metrics = self.metrics.update(all_probs, all_labels)
-#             names = self.metrics.get_names()
-#             self.log.log("=== Test metrics (global) ===")
-#             for name, val in zip(names, metrics):
-#                 self.log.log(f"{name}: {val:.4f}")
-#         return metrics
 
 class Test_BestModel:
     """Test-time evaluation on a global triple-level test set.
