@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple, List
 from torch_geometric.data import HeteroData
-
 from utils import Metrics
 from samplers import NegativeSampler, NegativeStatementSampler
 from losses import ContrastiveLoss_CE
@@ -109,25 +108,41 @@ class Train_BestModel:
         return {int(g): i for i, g in enumerate(n_id_list)}
 
 
-    def _get_batch_triple_indices(self, batch: HeteroData, subset: str) -> torch.Tensor:
+    # def _get_batch_triple_indices(self, batch: HeteroData, subset: str) -> torch.Tensor:
+    #     """
+    #     Returns the indices of triples in the given subset ('train' or 'val')
+    #     whose head and tail are both inside the current NeighborLoader subgraph.
+    #     This implementation avoids Python loops by using a boolean node mask.
+    #     """
+    #     n_id = batch["node"].n_id
+    #     if n_id.is_cuda: n_id = n_id.cpu()
+
+    #     if subset == "train": subset_idx = self.train_idx
+    #     elif subset == "val": subset_idx = self.val_idx  
+    #     else: raise ValueError(f"Unknown subset: {subset}")
+    #     node_mask = self.node_mask
+    #     node_mask[n_id] = True
+    #     heads_sub = self.heads[subset_idx]
+    #     tails_sub = self.tails[subset_idx]
+    #     in_batch = node_mask[heads_sub] & node_mask[tails_sub]
+    #     node_mask[n_id] = False
+    #     return subset_idx[in_batch]
+    def _get_batch_triple_indices(self, batch: HeteroData) -> torch.Tensor:
         """
-        Returns the indices of triples in the given subset ('train' or 'val')
+        Returns the indices of *all* triples (over self.heads/self.tails/self.rels/self.labels)
         whose head and tail are both inside the current NeighborLoader subgraph.
-        This implementation avoids Python loops by using a boolean node mask.
+        This is simpler than in the CV trainer: there is no 'train'/'val' split here,
+        we are training on the full classification triple set.
         """
         n_id = batch["node"].n_id
         if n_id.is_cuda: n_id = n_id.cpu()
-
-        if subset == "train": subset_idx = self.train_idx
-        elif subset == "val": subset_idx = self.val_idx  
-        else: raise ValueError(f"Unknown subset: {subset}")
         node_mask = self.node_mask
         node_mask[n_id] = True
-        heads_sub = self.heads[subset_idx]
-        tails_sub = self.tails[subset_idx]
+        heads_sub = self.heads
+        tails_sub = self.tails
         in_batch = node_mask[heads_sub] & node_mask[tails_sub]
         node_mask[n_id] = False
-        return subset_idx[in_batch]
+        return torch.nonzero(in_batch, as_tuple=False).view(-1)
 
 
     def _build_local_triple_tensors(self, triple_idx: torch.Tensor, n_id: torch.Tensor,
