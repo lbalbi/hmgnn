@@ -21,9 +21,10 @@ def main():
     parser.add_argument('--use_rstatement_sampler', action='store_true', help="Use random statement sampler to not use \
     statements in sampling")
     parser.add_argument('--no_contrastive', action='store_true', help="Disable contrastive learning")
+    parser.add_argument('--protein_splits', action='store_true',
+    help='Split PPI edges by unique source proteins (train/val/test by source node; no train edges with test sources)')
     parser.add_argument('--path', type=str, default="human_data", help="Path to the dataset directory")
     parser.add_argument('--output_dir', type=str, default="output/", help="Directory to save output logs and models")
-    parser.add_argument('--protein_splits', action='store_true', help='Prot-disjoint PPI split: train PPIs do not touch val/test proteins')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -51,56 +52,24 @@ def main():
     split_helper_train = Pygloader(full_graph, ppi_rel=ppi_rel, 
             batch_size=args.batch_size, val_split=0, device=device)
 
-
     split_id = args.path.split("/")[0]
     split_dir = os.path.join(split_id, "splits_{}".format(args.task))
     os.makedirs(split_dir, exist_ok=True)
-
-    if args.protein_splits:
-        # Node-disjoint split by proteins selected from PPI *source* nodes.
-        # Guarantee: no training PPI edge has a test protein as source OR target.
-        trainval_eids_path = os.path.join(split_dir, "trainval_eids_node_disjoint.pt")
-        test_eids_path = os.path.join(split_dir, "test_eids_node_disjoint.pt")
-        test_nodes_path = os.path.join(split_dir, "test_proteins.pt")
-    else:
-        trainval_eids_path = os.path.join(split_dir, "trainval_eids.pt")
-        test_eids_path = os.path.join(split_dir, "test_eids.pt")
-        test_nodes_path = None
+    # trainval_eids_path = os.path.join(split_dir, "trainval_eids.pt")
+    # test_eids_path = os.path.join(split_dir, "test_eids.pt")
+    trainval_eids_path = os.path.join(split_dir, "trainval_eids_protein.pt" if args.protein_splits else "trainval_eids.pt")
+    test_eids_path = os.path.join(split_dir, "test_eids_protein.pt" if args.protein_splits else "test_eids.pt")
 
     if os.path.exists(trainval_eids_path) and os.path.exists(test_eids_path):
         trainval_eids = torch.load(trainval_eids_path, weights_only=False)
         test_eids = torch.load(test_eids_path, weights_only=False)
-        if args.protein_splits and test_nodes_path is not None and os.path.exists(test_nodes_path):
-            test_proteins = torch.load(test_nodes_path, weights_only=False)
-        else:
-            test_proteins = None
     else:
-        if args.protein_splits:
-            src_all = ppi_ei[0].cpu()
-            dst_all = ppi_ei[1].cpu()
-
-            # choose held-out proteins from unique SOURCE proteins (as you requested)
-            unique_src = torch.unique(src_all)
-            g = torch.Generator().manual_seed(42)
-            unique_src = unique_src[torch.randperm(len(unique_src), generator=g)]
-            n_test = max(1, int(len(unique_src) * 0.15))
-            test_proteins = unique_src[:n_test]
-
-            # any PPI edge that touches a test protein (either end) is assigned to test
-            test_edge_mask = torch.isin(src_all, test_proteins) | torch.isin(dst_all, test_proteins)
-            test_eids = all_eids[test_edge_mask].to(torch.long)
-            trainval_eids = all_eids[~test_edge_mask].to(torch.long)
-
-            torch.save(trainval_eids, trainval_eids_path)
-            torch.save(test_eids, test_eids_path)
-            torch.save(test_proteins, test_nodes_path)
-        else:
-            trainval_eids_np, test_eids_np = train_test_split(
-                all_eids.cpu().numpy(), test_size=0.15, random_state=42, shuffle=True)
-            trainval_eids = torch.tensor(trainval_eids_np, dtype=torch.long)
-            test_eids = torch.tensor(test_eids_np, dtype=torch.long)
-            torch.save(trainval_eids, trainval_eids_path)
-            torch.save(test_eids, test_eids_path)
+        trainval_eids_np, test_eids_np = train_test_split(
+            all_eids.cpu().numpy(), test_size=0.15, random_state=42, shuffle=True)
+        trainval_eids = torch.tensor(trainval_eids_np, dtype=torch.long)
+        test_eids = torch.tensor(test_eids_np, dtype=torch.long)
+        torch.save(trainval_eids, trainval_eids_path)
+        torch.save(test_eids, test_eids_path)
 
     trainval_graph = split_helper_train._create_split_graph(trainval_eids, train=True)
     test_ppis = full_graph[ppi_key].edge_index[:, test_eids]
@@ -115,35 +84,13 @@ def main():
     kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
     best_lrs, best_epochs, best_alphas = [], [], []
 
+    for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
+        print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
 
-    if args.protein_splits:
-        # Node-disjoint CV: choose validation proteins, then remove ALL PPI edges touching them from the fold's train graph.
-        src_all = ppi_ei[0].cpu()
-        dst_all = ppi_ei[1].cpu()
-        trainval_edge_mask = torch.zeros(ppi_ei.size(1), dtype=torch.bool)
-        trainval_edge_mask[trainval_eids.cpu()] = True
-
-        # Split by unique PPI *source* proteins in the trainval PPI edges
-        tv_nodes = torch.unique(src_all[trainval_edge_mask])  # split only by PPI source proteins
-
-        for fold, (train_idx, val_idx) in enumerate(kf.split(tv_nodes.numpy()), 1):
-            print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
-
-            fold_val_nodes = tv_nodes[val_idx]
-            fold_val_mask = trainval_edge_mask & (torch.isin(src_all, fold_val_nodes) | torch.isin(dst_all, fold_val_nodes))
-            fold_val_eids = all_eids[fold_val_mask]
-            fold_train_eids = all_eids[trainval_edge_mask & (~fold_val_mask)]
-
-            fold_train_graph = split_helper_train._create_split_graph(fold_train_eids)
-            fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids,train=False)
-    else:
-        for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
-            print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
-
-            fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
-            fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
-            fold_train_graph = split_helper_train._create_split_graph(fold_train_eids)
-            fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids,train=False)
+        fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
+        fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
+        fold_train_graph = split_helper_train._create_split_graph(fold_train_eids)
+        fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids,train=False)
 
         train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
                                  batch_size=args.batch_size, device=device)
