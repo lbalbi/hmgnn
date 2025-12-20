@@ -7,6 +7,8 @@ from data_loader import DataLoader, Pygloader
 from sklearn.model_selection import KFold, train_test_split
 from statistics import mode
 
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default="human", help="Task to run: human, cerevisae, melanogaster")
@@ -24,7 +26,16 @@ def main():
     parser.add_argument('--path', type=str, default="human_data", help="Path to the dataset directory")
     parser.add_argument('--output_dir', type=str, default="output/", help="Directory to save output logs and models")
     parser.add_argument('--protein_splits', action='store_true', help='Prot-disjoint PPI split: train PPIs do not touch val/test proteins')
+    parser.add_argument('--protein_degree_splits', action='store_true',
+        help='Protein-disjoint PPI split (degree-aware): hold out proteins sampled from PPI sources with bias toward LOW-degree; '
+            'HIGH-degree proteins tend to stay in training.')
+    parser.add_argument('--degree_gamma', type=float,default=10.0,
+         help='Strength of degree bias for --protein_degree_splits. Larger => more high-degree proteins in training.')
     args = parser.parse_args()
+    
+    if args.protein_degree_splits and args.protein_splits:
+        print("[WARN] Both --protein_splits and --protein_degree_splits set; using --protein_degree_splits.", flush=True)
+    use_protein_split = args.protein_splits or args.protein_degree_splits
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ModelCls = eval(args.model.upper()) if args.model != "gae" else eval("GCN_" + args.model.upper())
@@ -43,7 +54,6 @@ def main():
 
     full_graph = dl.make_data_graph(dl.get_data())
     ppi_rel = mcfg["ppi_etype"][1] if isinstance(mcfg["ppi_etype"], (list, tuple)) else mcfg["ppi_etype"]
-
     ppi_key = next((et for et in full_graph.edge_types if et[1] == ppi_rel), None)
     ppi_ei = full_graph[ppi_key].edge_index
     all_eids = torch.arange(ppi_ei.size(1))
@@ -51,14 +61,58 @@ def main():
     split_helper_train = Pygloader(full_graph, ppi_rel=ppi_rel, 
             batch_size=args.batch_size, val_split=0, device=device)
 
-
     split_id = args.path.split("/")[0]
     split_dir = os.path.join(split_id, "splits_{}".format(args.task))
     os.makedirs(split_dir, exist_ok=True)
 
-    if args.protein_splits:
-        # Node-disjoint split by proteins selected from PPI *source* nodes.
-        # Guarantee: no training PPI edge has a test protein as source OR target.
+
+    def describe_ppi_split(ppi_ei: torch.Tensor, eids: torch.Tensor, name: str, ref_nodes: torch.Tensor | None = None):
+        """
+        Print basic stats for a set of PPI edges (selected by eids).
+        If ref_nodes is provided, also reports how many of those nodes appear in these edges.
+        """
+        eids = eids.cpu()
+        sub = ppi_ei[:, eids].cpu()
+        src = sub[0]
+        dst = sub[1]
+        uniq_src = torch.unique(src)
+        uniq_nodes = torch.unique(torch.cat([src, dst], dim=0))
+        msg = (f"[{name}] #PPIs={sub.size(1)} | "
+            f"#unique_src={len(uniq_src)} | "
+            f"#unique_nodes(src∪dst)={len(uniq_nodes)}")
+        if ref_nodes is not None:
+            ref_nodes = ref_nodes.cpu()
+            touched = torch.isin(uniq_nodes, ref_nodes).sum().item()
+            msg += f" | #nodes_in_ref={touched}/{len(ref_nodes)}"
+        print(msg, flush=True)
+
+
+    def sample_test_proteins_degree_aware(src_all: torch.Tensor, dst_all: torch.Tensor,
+            frac: float = 0.2, gamma: float = 1.0, seed: int = 42) -> torch.Tensor:
+        """
+        Pick held-out proteins from UNIQUE PPI SOURCE nodes, biased toward LOW PPI degree.
+        Degree is computed undirected over PPI edges (counts incident edges on either endpoint).
+        """
+        src_all = src_all.cpu()
+        dst_all = dst_all.cpu()
+        unique_src = torch.unique(src_all)
+        max_id = int(torch.max(torch.cat([src_all, dst_all])).item())
+        deg = torch.bincount(src_all, minlength=max_id + 1) + torch.bincount(dst_all, minlength=max_id + 1)
+        deg_unique = deg[unique_src].to(torch.float)
+        weights = 1.0 / torch.pow(deg_unique + 1.0, float(gamma))
+        weights = weights / weights.sum()
+        n_test = max(1, int(len(unique_src) * frac))
+        n_test = min(n_test, len(unique_src))
+        g = torch.Generator().manual_seed(seed)
+        idx = torch.multinomial(weights, n_test, replacement=False, generator=g)
+        test_proteins = unique_src[idx]
+        return torch.sort(test_proteins).values
+
+    if args.protein_degree_splits:
+        trainval_eids_path = os.path.join(split_dir, "trainval_eids_node_disjoint_degree.pt")
+        test_eids_path = os.path.join(split_dir, "test_eids_node_disjoint_degree.pt")
+        test_nodes_path = os.path.join(split_dir, "test_proteins_degree.pt")
+    elif args.protein_splits:
         trainval_eids_path = os.path.join(split_dir, "trainval_eids_node_disjoint.pt")
         test_eids_path = os.path.join(split_dir, "test_eids_node_disjoint.pt")
         test_nodes_path = os.path.join(split_dir, "test_proteins.pt")
@@ -70,27 +124,32 @@ def main():
     if os.path.exists(trainval_eids_path) and os.path.exists(test_eids_path):
         trainval_eids = torch.load(trainval_eids_path, weights_only=False)
         test_eids = torch.load(test_eids_path, weights_only=False)
-        if args.protein_splits and test_nodes_path is not None and os.path.exists(test_nodes_path):
+        if use_protein_split and test_nodes_path is not None and os.path.exists(test_nodes_path):
             test_proteins = torch.load(test_nodes_path, weights_only=False)
-        else:
-            test_proteins = None
+        else: test_proteins = None
     else:
-        if args.protein_splits:
+        if args.protein_degree_splits:
             src_all = ppi_ei[0].cpu()
             dst_all = ppi_ei[1].cpu()
-
-            # choose held-out proteins from unique SOURCE proteins (as you requested)
+            test_proteins = sample_test_proteins_degree_aware(
+                src_all, dst_all, frac=0.2, gamma=args.degree_gamma, seed=42)
+            test_edge_mask = torch.isin(src_all, test_proteins) | torch.isin(dst_all, test_proteins)
+            test_eids = all_eids[test_edge_mask].to(torch.long)
+            trainval_eids = all_eids[~test_edge_mask].to(torch.long)
+            torch.save(trainval_eids, trainval_eids_path)
+            torch.save(test_eids, test_eids_path)
+            torch.save(test_proteins, test_nodes_path)
+        elif args.protein_splits:
+            src_all = ppi_ei[0].cpu()
+            dst_all = ppi_ei[1].cpu()
             unique_src = torch.unique(src_all)
             g = torch.Generator().manual_seed(42)
             unique_src = unique_src[torch.randperm(len(unique_src), generator=g)]
             n_test = max(1, int(len(unique_src) * 0.15))
-            test_proteins = unique_src[:n_test]
-
-            # any PPI edge that touches a test protein (either end) is assigned to test
+            test_proteins = torch.sort(unique_src[:n_test]).values
             test_edge_mask = torch.isin(src_all, test_proteins) | torch.isin(dst_all, test_proteins)
             test_eids = all_eids[test_edge_mask].to(torch.long)
             trainval_eids = all_eids[~test_edge_mask].to(torch.long)
-
             torch.save(trainval_eids, trainval_eids_path)
             torch.save(test_eids, test_eids_path)
             torch.save(test_proteins, test_nodes_path)
@@ -101,6 +160,18 @@ def main():
             test_eids = torch.tensor(test_eids_np, dtype=torch.long)
             torch.save(trainval_eids, trainval_eids_path)
             torch.save(test_eids, test_eids_path)
+
+    # ===== Split diagnostics =====
+    describe_ppi_split(ppi_ei, trainval_eids, "TRAINVAL(+)")
+    describe_ppi_split(ppi_ei, test_eids, "TEST(+)", ref_nodes=test_proteins if 'test_proteins' in locals() else None)
+
+    # Extra checks for protein-disjoint mode
+    if args.protein_splits and test_proteins is not None:
+        tv_nodes = torch.unique(ppi_ei[:, trainval_eids].cpu().reshape(-1))
+        te_nodes = torch.unique(ppi_ei[:, test_eids].cpu().reshape(-1))
+        overlap = torch.intersect1d(tv_nodes, te_nodes).numel()
+        print(f"[CHECK] trainval_nodes ∩ test_nodes = {overlap}", flush=True)
+
 
     trainval_graph = split_helper_train._create_split_graph(trainval_eids, train=True)
     test_ppis = full_graph[ppi_key].edge_index[:, test_eids]
@@ -115,59 +186,84 @@ def main():
     kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
     best_lrs, best_epochs, best_alphas = [], [], []
 
+    def run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold_num: int):
+        """Train one CV fold and store best hyperparams."""
+        train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
+            batch_size=args.batch_size, device=device)
+        val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
+            batch_size=args.batch_size, device=device)
 
-    if args.protein_splits:
-        # Node-disjoint CV: choose validation proteins, then remove ALL PPI edges touching them from the fold's train graph.
+        model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"],
+            out_dim=mcfg["out_dim"], e_etypes=[tuple(e) for e in mcfg["edge_types"]],
+            ppi_etype=ppi_rel).to(device)
+        log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold_num}",
+            dir=args.output_dir)
+
+        gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
+                   (args.path == "gda_data" or args.path == "dp_data") else None
+
+        trainer = Train(model, args.CV_epochs, train_loader, val_loader,
+            e_type=ppi_rel, val_edges=ppi_vei, val_edge_batch_size=args.batch_size,
+            log=log, lrs=cfg["lr"], device=device, full_graph=full_graph, full_cvgraph=fold_train_graph,
+            contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+            pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
+            rstatement_sampler=args.use_rstatement_sampler,
+            task=args.task, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
+
+        lr, loss, _, epoch_, alpha_ = trainer.run()
+        best_epochs.append(epoch_)
+        best_lrs.append(lr)
+        best_alphas.append(alpha_)
+
+    if args.protein_splits or args.protein_degree_splits:
         src_all = ppi_ei[0].cpu()
         dst_all = ppi_ei[1].cpu()
         trainval_edge_mask = torch.zeros(ppi_ei.size(1), dtype=torch.bool)
         trainval_edge_mask[trainval_eids.cpu()] = True
-
-        # Split by unique PPI *source* proteins in the trainval PPI edges
-        tv_nodes = torch.unique(src_all[trainval_edge_mask])  # split only by PPI source proteins
+        tv_nodes = torch.unique(src_all[trainval_edge_mask])
 
         for fold, (train_idx, val_idx) in enumerate(kf.split(tv_nodes.numpy()), 1):
             print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
 
             fold_val_nodes = tv_nodes[val_idx]
-            fold_val_mask = trainval_edge_mask & (torch.isin(src_all, fold_val_nodes) | torch.isin(dst_all, fold_val_nodes))
+            fold_val_mask = trainval_edge_mask & (
+                torch.isin(src_all, fold_val_nodes) | torch.isin(dst_all, fold_val_nodes))
             fold_val_eids = all_eids[fold_val_mask]
             fold_train_eids = all_eids[trainval_edge_mask & (~fold_val_mask)]
 
-            fold_train_graph = split_helper_train._create_split_graph(fold_train_eids)
-            fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids,train=False)
+            if fold_train_eids.numel() == 0 or fold_val_eids.numel() == 0:
+                print(f"[WARN] Skipping fold {fold}: "
+                    f"fold_train_eids={fold_train_eids.numel()}, fold_val_eids={fold_val_eids.numel()}",
+                    flush=True)
+                continue
+
+            fold_train_graph = split_helper_train._create_split_graph(fold_train_eids, train=True)
+            fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids, train=False)
+            run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold)
+
     else:
         for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
             print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
-
             fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
             fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
-            fold_train_graph = split_helper_train._create_split_graph(fold_train_eids)
-            fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids,train=False)
+            if fold_train_eids.numel() == 0 or fold_val_eids.numel() == 0:
+                print(f"[WARN] Skipping fold {fold}: "
+                    f"fold_train_eids={fold_train_eids.numel()}, fold_val_eids={fold_val_eids.numel()}",
+                    flush=True)
+                continue
 
-        train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
-                                 batch_size=args.batch_size, device=device)
-        val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
-                               batch_size=args.batch_size, device=device)
-
-        model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
-            e_etypes=[tuple(e) for e in mcfg["edge_types"]], ppi_etype=ppi_rel).to(device)
-        log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold}", dir=args.output_dir)
-        gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
-                   (args.path == "gda_data" or args.path == "dp_data") else None
-        trainer = Train(model, args.CV_epochs, train_loader, val_loader, e_type=ppi_rel, val_edges=ppi_vei, val_edge_batch_size=args.batch_size, 
-        log=log, lrs=cfg["lr"], device=device, full_graph=full_graph, full_cvgraph=fold_train_graph, contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
-            pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
-            rstatement_sampler=args.use_rstatement_sampler, task=args.task,gda_negs=gda_negs, no_contrastive=args.no_contrastive)
-        lr, loss,  _, epoch_, alpha_ = trainer.run()
-        best_epochs.append(epoch_)
-        best_lrs.append(lr)
-        best_alphas.append(alpha_)
+            fold_train_graph = split_helper_train._create_split_graph(fold_train_eids, train=True)
+            fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids, train=False)
+            run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold)
+    if len(best_lrs) == 0:
+        raise RuntimeError("Cross-validation produced no trained folds (best_lrs is empty). "
+            "This usually happens if every fold was skipped because the fold's "
+            "train/val PPI edge set became empty under the current splitting rule. "
+            "Try lowering k_folds.") # degree-aware protein split
 
     best_lr = mode(best_lrs)
     best_epoch = mode(best_epochs)
     best_alpha = mode(best_alphas)
-
     final_model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                 e_etypes=[tuple(e) for e in mcfg["edge_types"]],ppi_etype=ppi_rel).to(device)
     

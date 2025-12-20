@@ -92,15 +92,15 @@ class NegativeStatementSampler:
                     sup.update(predecessors.get(b, []))
                 if sup: self.two_hop_global[u] = list(sup)
 
-        # self.neg_pools = {}
-        # self.pool_sizes = {}
+        self.neg_pools = {}
+        self.pool_sizes = {}
 
-        # for u in self.anchors_global:
-        #     direct = self.direct_global[u]
-        #     two_hop = self.two_hop_global.get(u, [])
-        #     pool = list({*direct, *two_hop})
-        #     self.neg_pools[u] = pool
-        #     self.pool_sizes[u] = len(pool)
+        for u in self.anchors_global:
+            direct = self.direct_global[u]
+            two_hop = self.two_hop_global.get(u, [])
+            pool = list({*direct, *two_hop})
+            self.neg_pools[u] = pool
+            self.pool_sizes[u] = len(pool)
 
         # self.zero_neg_anchors = [u for u in self.anchors_global if self.pool_sizes[u] == 0]
         # pool_lens = list(self.pool_sizes.values())

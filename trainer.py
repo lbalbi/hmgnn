@@ -264,7 +264,6 @@ class Train:
                 total_loss += loss.item() * out.size(0)
                 total_examples += out.size(0)
                 last_out, last_labels = out, labels
-
         avg_loss = total_loss / total_examples if total_examples else 0.0
         return avg_loss, (last_out, last_labels)
 
