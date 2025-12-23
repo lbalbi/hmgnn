@@ -1,25 +1,22 @@
-import copy, torch
+import copy
+import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops
-from utils import Metrics, EarlyStopping, _get_pos_edge_index
-from samplers import (
-    NegativeStatementSampler, PartialStatementSampler,
-    NegativeSampler, RandomStatementSampler
-)
-from losses import (
-    DualContrastiveLoss_CE, DualContrastiveLoss_Margin,
-    ComposedContrastiveLoss_CE, ComposedContrastiveLoss_Multi
-)
 
+from utils import Metrics, EarlyStopping, _get_pos_edge_index
+from samplers import (NegativeStatementSampler, PartialStatementSampler, PartialProteinSampler,
+    NegativeSampler, RandomStatementSampler, ProteinStatementSampler)
+from losses import (DualContrastiveLoss_CE, DualContrastiveLoss_Margin,
+    ComposedContrastiveLoss_CE, ComposedContrastiveLoss_Multi, ProteinContrastiveLoss)
 
 class Train:
     def __init__(self, model, epochs, train_loader, val_loader, full_graph,
         full_cvgraph, e_type, log, device, task, lrs=[0.001], gda_negs=None,
         pstatement_sampler=False, nstatement_sampler=False, rstatement_sampler=False,
-        contrastive_weight=0.1, state_list=None, no_contrastive=False,
-        val_edges: torch.Tensor = None, val_edge_batch_size: int = None):
-
+        contrastive_weight=0.1, state_list=None, no_contrastive=False, val_edges: torch.Tensor = None,
+        val_edge_batch_size: int = None, protein_contrastive: bool = False, protein_k_neg: int = 1,
+        protein_temperature: float = 0.5):
         self.device = device
         self.log = log
         self.task = task
@@ -35,77 +32,105 @@ class Train:
         self.fullcv_graph = full_cvgraph.to(self.device)
         self.val_edges = val_edges
         self.val_edge_batch_size = val_edge_batch_size
+        self.protein_contrastive = bool(protein_contrastive)
+        self.protein_k_neg = int(protein_k_neg)
+        self.protein_temperature = float(protein_temperature)
 
-        self._setup_samplers(
-            full_cvgraph, full_graph, state_list, gda_negs,
-            pstatement_sampler, nstatement_sampler, rstatement_sampler, no_contrastive
-        )
-
+        self._setup_samplers(full_cvgraph, full_graph, state_list,
+            gda_negs, pstatement_sampler, nstatement_sampler,
+            rstatement_sampler, no_contrastive)
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = None
+        if not self.no_contrastive:
+            if self.protein_contrastive:
 
-        if (not no_contrastive) and (self.neg_statement_sampler is not None):
-            if self.model.__class__.__name__ in {"GCN", "GAT", "HGCN", "GCN_GAE"}:
-                self.contrastive = DualContrastiveLoss_CE(sampler=self.neg_statement_sampler, temperature=0.5)
+                if ProteinStatementSampler is None or ProteinContrastiveLoss is None:
+                    raise ImportError("protein_contrastive=True but ProteinStatementSampler / ProteinContrastiveLoss "
+                        "could not be imported. Ensure you added them to samplers/losses or have the modules available.")
+                if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
+                    raise ValueError("protein_contrastive=True is not supported for homogeneous GCN/GAT/GCN_GAE path "
+                        "because those models return a single embedding.")
+
+                if self.nstatement_sampler:
+                    # graph is missing neg_statement edges; state_list contains those removed neg edges
+                    self.protein_sampler = PartialProteinSampler(
+                        anchor_etype=self.e_type,
+                        pos_etype="pos_statement",
+                        neg_etype="neg_statement",
+                        go_etype="link",
+                        k_neg=self.protein_k_neg,
+                        use_go_expansion_for_neg=True,
+                        seed=42,
+                        external_neg_edges=state_list,
+                    )
+                elif self.pstatement_sampler:
+                    # graph is missing pos_statement edges; state_list contains those removed pos edges
+                    self.protein_sampler = PartialProteinSampler(
+                        anchor_etype=self.e_type,
+                        pos_etype="pos_statement",
+                        neg_etype="neg_statement",
+                        go_etype="link",
+                        k_neg=self.protein_k_neg,
+                        use_go_expansion_for_neg=True,
+                        seed=42,
+                        external_pos_edges=state_list,
+                    )
+                else:
+                    self.protein_sampler = ProteinStatementSampler(anchor_etype=self.e_type,
+                        pos_etype="pos_statement", neg_etype="neg_statement", go_etype="link",
+                        k_neg=self.protein_k_neg, use_go_expansion_for_neg=True, seed=42)
+                self.protein_sampler.prepare_global(self.fullcv_graph)
+                self.contrastive = ProteinContrastiveLoss(sampler=self.protein_sampler,
+                        temperature=self.protein_temperature, w_neg=1.0, w_pos=1.0)
             else:
-                self.contrastive = ComposedContrastiveLoss_Multi(sampler=self.neg_statement_sampler,
-                    temperature=0.5, lambda_neg=1.0)
-
+                if self.neg_statement_sampler is not None:
+                    if self.model.__class__.__name__ in {"GCN", "GAT", "HGCN", "GCN_GAE"}:
+                        self.contrastive = DualContrastiveLoss_CE(
+                            sampler=self.neg_statement_sampler, temperature=0.5)
+                    else:
+                        self.contrastive = ComposedContrastiveLoss_Multi(
+                            sampler=self.neg_statement_sampler,temperature=0.5, lambda_neg=1.0)
 
         init_alpha = float(contrastive_weight)
-        if init_alpha <= 0:
-            init_alpha = 0.1
+        if init_alpha <= 0: init_alpha = 0.1
         self.alpha = torch.nn.Parameter(torch.log(torch.tensor(init_alpha, device=self.device)))
         self.earlystopper = EarlyStopping()
         self.metrics = Metrics()
         header = "Setting, Epoch, " + ", ".join(self.metrics.get_names())
         self.log.log(header)
 
-
-
-    def _setup_samplers(self, full_cvgraph, full_graph,
-        state_list, gda_negs, pstatement_sampler,
-        nstatement_sampler, rstatement_sampler, no_contrastive):
-
+    def _setup_samplers(self, full_cvgraph, full_graph, state_list, gda_negs,
+        pstatement_sampler, nstatement_sampler, rstatement_sampler, no_contrastive):
         self.no_contrastive = no_contrastive
         self.rstatement_sampler = rstatement_sampler
         self.pstatement_sampler = pstatement_sampler
         self.nstatement_sampler = nstatement_sampler
-
         self.neg_statement_sampler = None
 
-        if rstatement_sampler:
-            self.neg_statement_sampler = RandomStatementSampler()
-            self.neg_statement_sampler.prepare_global(full_cvgraph)
-        elif nstatement_sampler:
-            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_statement_sampler.prepare_global(full_cvgraph)
-        elif pstatement_sampler:
-            self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
-            self.neg_statement_sampler.prepare_global(
-                full_cvgraph,
-                pos_etype="neg_statement",
-                neg_etype="pos_statement"
-            )
-        elif not self.no_contrastive:
-            self.neg_statement_sampler = NegativeStatementSampler(anchor_etype=self.e_type)
-            self.neg_statement_sampler.prepare_global(full_cvgraph,
-                negatives=gda_negs if self.task == "gda" else None)
+        if (not self.no_contrastive) and (not self.protein_contrastive):
+            if rstatement_sampler:
+                self.neg_statement_sampler = RandomStatementSampler()
+                self.neg_statement_sampler.prepare_global(full_cvgraph)
+            elif nstatement_sampler:
+                self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
+                self.neg_statement_sampler.prepare_global(full_cvgraph)
+            elif pstatement_sampler:
+                self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
+                self.neg_statement_sampler.prepare_global(full_cvgraph, pos_etype="neg_statement",
+                    neg_etype="pos_statement")
+            else:
+                self.neg_statement_sampler = NegativeStatementSampler(anchor_etype=self.e_type)
+                self.neg_statement_sampler.prepare_global(full_cvgraph,
+                    negatives=gda_negs if self.task == "gda" else None)
 
         ppi_key = next(et for et in full_graph.edge_types if et[1] == self.e_type)
         all_pos_edge_index = full_graph[ppi_key].edge_index
-        self.neg_sampler = NegativeSampler(
-            full_cvgraph,
-            edge_type=("node", self.e_type, "node"),
-            all_pos_edge_index=all_pos_edge_index
-        )
-
-
+        self.neg_sampler = NegativeSampler(full_cvgraph, edge_type=("node", self.e_type, "node"),
+            all_pos_edge_index=all_pos_edge_index)
 
     def _to_homogeneous_pyg(self, hetero):
-        """ Convert HeteroData -> homogeneous Data and return (hom_data, offsets).
-        offsets[ntype] = starting global id for that node type in concatenated x. """
-
+        """Convert HeteroData -> homogeneous Data and return (hom_data, offsets).
+        offsets[ntype] = starting global id for that node type in concatenated x."""
         node_types = list(hetero.x_dict.keys())
         offsets = {}
         running = 0
@@ -131,48 +156,46 @@ class Train:
         hom_data = Data(x=hom_x, edge_index=hom_edge_index).to(self.device)
         return hom_data, offsets
 
-
-
     def _prepare_pairs_and_labels(self, graph, pos_index: torch.Tensor = None):
+        """  Builds edge_index (pos+neg) and labels given a HeteroData graph for samplers / embedding
+        and a pos_index: [2, N_pos] or None.
         """
-        Builds edge_index (pos+neg) and labels given a HeteroData graph to use for samplers / embedding
-        and a pos_index: [2, N_pos] or None. If pos_index is None, positives are taken from the graph adjacency
-        via _get_pos_edge_index (training). If provided, they are used
-        directly (validation/test masked-edge setting).
-        """
-
-        if pos_index is None:
-            pos_index = _get_pos_edge_index(self.model, self.e_type, graph)
+        if pos_index is None: pos_index = _get_pos_edge_index(self.model, self.e_type, graph)
         pos_index = pos_index.to(self.device)
-        neg_src, neg_dst = self.neg_sampler.sample(pos_index.size(1))
+        # neg_src, neg_dst = self.neg_sampler.sample(pos_index.size(1))
+        neg_src, neg_dst = self.neg_sampler.sample(pos_index.size(1), src_override=pos_index[0])
+        
         neg_index = torch.stack([neg_src, neg_dst], dim=0)
         edge_index = torch.cat([pos_index, neg_index], dim=1)
         labels = torch.cat([torch.ones(pos_index.size(1), device=self.device),
                 torch.zeros(neg_index.size(1), device=self.device)], dim=0)
         return edge_index, labels, pos_index
 
-
-
     def train_epoch(self):
         self.model.train()
         total_loss = total_examples = 0
+        last_out, last_labels = None, None
 
         for batch in self.train_loader:
             batch = batch.to(self.device)
             self.optimizer.zero_grad()
-
-            edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(
-                batch, pos_index=None)
+            edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(batch, pos_index=None)
             neg_stmt_idx = None
+            if (not self.protein_contrastive) and (self.neg_statement_sampler is not None):
+                if self.rstatement_sampler:
+                    self.neg_statement_sampler.prepare_batch(batch, pos_index)
+                    neg_stmt_idx = self.neg_statement_sampler.sample()
+                elif self.nstatement_sampler or self.pstatement_sampler:
+                    self.neg_statement_sampler.prepare_batch(batch)
+                    neg_stmt_idx = self.neg_statement_sampler.sample()
+                else: self.neg_statement_sampler.prepare_batch(batch)
 
-            if self.rstatement_sampler:
-                self.neg_statement_sampler.prepare_batch(batch, pos_index)
-                neg_stmt_idx = self.neg_statement_sampler.sample()
-            elif self.nstatement_sampler or self.pstatement_sampler:
-                self.neg_statement_sampler.prepare_batch(batch)
-                neg_stmt_idx = self.neg_statement_sampler.sample()
-            elif (not self.no_contrastive) and (self.neg_statement_sampler is not None):
-                self.neg_statement_sampler.prepare_batch(batch)
+            if (not self.no_contrastive) and self.protein_contrastive:
+                # self.protein_sampler.prepare_batch(batch)
+                if isinstance(self.protein_sampler, PartialProteinSampler):
+                    anchors = torch.unique(pos_index).tolist()
+                    self.protein_sampler.prepare_batch(batch, anchors=anchors)
+                else: self.protein_sampler.prepare_batch(batch)
 
             if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                 hom_data, offsets = self._to_homogeneous_pyg(batch)
@@ -180,35 +203,33 @@ class Train:
                 dst = edge_index_pairs[1] + offsets[self.n_type]
                 mapped_pairs = torch.stack([src, dst], dim=0)
                 z_single, out = self.model(hom_data, mapped_pairs)
-            else:
-                z_pos, z_neg, out = self.model(batch, edge_index_pairs)
+            else: z_pos, z_neg, out = self.model(batch, edge_index_pairs)
 
             self._alpha = F.softplus(self.alpha)
-            if (not self.no_contrastive) and (self.contrastive is not None):
-                args = (z_single, neg_stmt_idx) if self.model.__class__.__name__ in {"GCN", "GAT",
-                     "GCN_GAE"} else (z_pos, z_neg, neg_stmt_idx)
-                loss_contrast = self.contrastive(*args)
+            use_contrastive = (not self.no_contrastive) and (self.contrastive is not None)
+            if use_contrastive:
+                if self.protein_contrastive: loss_contrast = self.contrastive(z_pos, z_neg)
+                else:
+                    args = ((z_single, neg_stmt_idx) if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}
+                        else (z_pos, z_neg, neg_stmt_idx))
+                    loss_contrast = self.contrastive(*args)
                 loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-            else:
-                loss = self.loss_fn(out.squeeze(-1), labels)
-
+            else: loss = self.loss_fn(out.squeeze(-1), labels)
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item() * out.size(0)
             total_examples += out.size(0)
-
+            last_out, last_labels = out, labels
         avg_loss = total_loss / total_examples if total_examples else 0.0
-        return avg_loss, (out, labels)
-
-
+        return avg_loss, (last_out, last_labels)
 
     def _val_on_graph_and_edges(self, graph, pos_edges: torch.Tensor):
-        """
-        Runs validation on graph with PPI edges not in the adjacency,
-        using an explicit tensor of PPI edges.
+        """Runs validation on a fixed encoder graph with an explicit list of positive edges.
+        Validation is classification-only, no contrastive term.
         """
         total_loss = total_examples = 0
         last_out, last_labels = None, None
+
         pos_edges = pos_edges.to(self.device)
         num_pos = pos_edges.size(1)
         batch_size = self.val_edge_batch_size or num_pos
@@ -217,38 +238,17 @@ class Train:
             for start in range(0, num_pos, batch_size):
                 end = min(start + batch_size, num_pos)
                 pos_index = pos_edges[:, start:end]
-                edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(
-                    graph, pos_index=pos_index
-                )
-
-                neg_stmt_idx = None
-                if self.rstatement_sampler:
-                    self.neg_statement_sampler.prepare_batch(graph, pos_index)
-                    neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif self.nstatement_sampler or self.pstatement_sampler:
-                    self.neg_statement_sampler.prepare_batch(graph)
-                    neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif (not self.no_contrastive) and (self.neg_statement_sampler is not None):
-                    self.neg_statement_sampler.prepare_batch(graph)
+                edge_index_pairs, labels, _ = self._prepare_pairs_and_labels(graph, pos_index=pos_index)
 
                 if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                     hom_data, offsets = self._to_homogeneous_pyg(graph)
                     src = edge_index_pairs[0] + offsets[self.n_type]
                     dst = edge_index_pairs[1] + offsets[self.n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
-                    z_single, out = self.model(hom_data, mapped_pairs)
-                else:
-                    z_pos, z_neg, out = self.model(graph, edge_index_pairs)
+                    _, out = self.model(hom_data, mapped_pairs)
+                else: _, _, out = self.model(graph, edge_index_pairs)
 
-                self._alpha = F.softplus(self.alpha)
-                if (not self.no_contrastive) and (self.contrastive is not None):
-                    args = (z_single, neg_stmt_idx) if self.model.__class__.__name__ in  {"GCN",
-                     "GAT", "GCN_GAE"} else (z_pos, z_neg, neg_stmt_idx)
-                    loss_contrast = self.contrastive(*args)
-                    loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-                else:
-                    loss = self.loss_fn(out.squeeze(-1), labels)
-
+                loss = self.loss_fn(out.squeeze(-1), labels)
                 total_loss += loss.item() * out.size(0)
                 total_examples += out.size(0)
                 last_out, last_labels = out, labels
@@ -256,49 +256,87 @@ class Train:
         avg_loss = total_loss / total_examples if total_examples else 0.0
         return avg_loss, (last_out, last_labels)
 
+    # def _val_on_graph_and_edges(self, graph, pos_edges: torch.Tensor):
+    #     """Runs validation on graph with masked edges via explicit pos_edges tensor."""
+    #     total_loss = total_examples = 0
+    #     last_out, last_labels = None, None
+    #     pos_edges = pos_edges.to(self.device)
+    #     num_pos = pos_edges.size(1)
+    #     batch_size = self.val_edge_batch_size or num_pos
+
+    #     with torch.no_grad():
+    #         for start in range(0, num_pos, batch_size):
+    #             end = min(start + batch_size, num_pos)
+    #             pos_index = pos_edges[:, start:end]
+    #             edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(graph, pos_index=pos_index)
+    #             neg_stmt_idx = None
+
+    #             if (not self.protein_contrastive) and (self.neg_statement_sampler is not None):
+    #                 if self.rstatement_sampler:
+    #                     self.neg_statement_sampler.prepare_batch(graph, pos_index)
+    #                     neg_stmt_idx = self.neg_statement_sampler.sample()
+    #                 elif self.nstatement_sampler or self.pstatement_sampler:
+    #                     self.neg_statement_sampler.prepare_batch(graph)
+    #                     neg_stmt_idx = self.neg_statement_sampler.sample()
+    #                 else: self.neg_statement_sampler.prepare_batch(graph)
+
+    #             if (not self.no_contrastive) and self.protein_contrastive:
+    #                 # self.protein_sampler.prepare_batch(graph)
+    #                 if isinstance(self.protein_sampler, PartialProteinSampler):
+    #                     anchors = torch.unique(pos_index).tolist()
+    #                     self.protein_sampler.prepare_batch(graph, anchors=anchors)
+    #                 else: self.protein_sampler.prepare_batch(graph)
+
+    #             if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
+    #                 hom_data, offsets = self._to_homogeneous_pyg(graph)
+    #                 src = edge_index_pairs[0] + offsets[self.n_type]
+    #                 dst = edge_index_pairs[1] + offsets[self.n_type]
+    #                 mapped_pairs = torch.stack([src, dst], dim=0)
+    #                 z_single, out = self.model(hom_data, mapped_pairs)
+    #             else: z_pos, z_neg, out = self.model(graph, edge_index_pairs)
+
+    #             self._alpha = F.softplus(self.alpha)
+    #             use_contrastive = (not self.no_contrastive) and (self.contrastive is not None)
+    #             if use_contrastive:
+    #                 if self.protein_contrastive: loss_contrast = self.contrastive(z_pos, z_neg)
+    #                 else:
+    #                     args = ((z_single, neg_stmt_idx) if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}
+    #                         else (z_pos, z_neg, neg_stmt_idx))
+    #                     loss_contrast = self.contrastive(*args)
+    #                 loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
+    #             else: loss = self.loss_fn(out.squeeze(-1), labels)
+    #             total_loss += loss.item() * out.size(0)
+    #             total_examples += out.size(0)
+    #             last_out, last_labels = out, labels
+    #     avg_loss = total_loss / total_examples if total_examples else 0.0
+    #     return avg_loss, (last_out, last_labels)
 
 
     def validate_epoch(self):
-
+        """Validation step (classification-only BCE)"""
         self.model.eval()
+
         if self.val_edges is not None:
             return self._val_on_graph_and_edges(self.fullcv_graph, self.val_edges)
+
         total_loss = total_examples = 0
         last_out, last_labels = None, None
 
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = batch.to(self.device)
-                edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(batch)
-
-                neg_stmt_idx = None
-                if self.rstatement_sampler:
-                    self.neg_statement_sampler.prepare_batch(batch, pos_index)
-                    neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif self.nstatement_sampler or self.pstatement_sampler:
-                    self.neg_statement_sampler.prepare_batch(batch)
-                    neg_stmt_idx = self.neg_statement_sampler.sample()
-                elif (not self.no_contrastive) and (self.neg_statement_sampler is not None):
-                    self.neg_statement_sampler.prepare_batch(batch)
+                edge_index_pairs, labels, _ = self._prepare_pairs_and_labels(batch)
 
                 if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
                     hom_data, offsets = self._to_homogeneous_pyg(batch)
                     src = edge_index_pairs[0] + offsets[self.n_type]
                     dst = edge_index_pairs[1] + offsets[self.n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
-                    z_single, out = self.model(hom_data, mapped_pairs)
+                    _, out = self.model(hom_data, mapped_pairs)
                 else:
-                    z_pos, z_neg, out = self.model(batch, edge_index_pairs)
+                    _, _, out = self.model(batch, edge_index_pairs)
 
-                self._alpha = F.softplus(self.alpha)
-                if (not self.no_contrastive) and (self.contrastive is not None):
-                    args = (z_single, neg_stmt_idx) if self.model.__class__.__name__ in {"GCN", 
-                     "GAT", "GCN_GAE"} else (z_pos, z_neg, neg_stmt_idx)
-                    loss_contrast = self.contrastive(*args)
-                    loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
-                else:
-                    loss = self.loss_fn(out.squeeze(-1), labels)
-
+                loss = self.loss_fn(out.squeeze(-1), labels)
                 total_loss += loss.item() * out.size(0)
                 total_examples += out.size(0)
                 last_out, last_labels = out, labels
@@ -306,18 +344,68 @@ class Train:
         avg_loss = total_loss / total_examples if total_examples else 0.0
         return avg_loss, (last_out, last_labels)
 
+    # def validate_epoch(self):
+    #     self.model.eval()
+    #     if self.val_edges is not None:
+    #         return self._val_on_graph_and_edges(self.fullcv_graph, self.val_edges)
+
+    #     total_loss = total_examples = 0
+    #     last_out, last_labels = None, None
+    #     with torch.no_grad():
+    #         for batch in self.val_loader:
+    #             batch = batch.to(self.device)
+    #             edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(batch)
+
+    #             neg_stmt_idx = None
+    #             if (not self.protein_contrastive) and (self.neg_statement_sampler is not None):
+    #                 if self.rstatement_sampler:
+    #                     self.neg_statement_sampler.prepare_batch(batch, pos_index)
+    #                     neg_stmt_idx = self.neg_statement_sampler.sample()
+    #                 elif self.nstatement_sampler or self.pstatement_sampler:
+    #                     self.neg_statement_sampler.prepare_batch(batch)
+    #                     neg_stmt_idx = self.neg_statement_sampler.sample()
+    #                 else: self.neg_statement_sampler.prepare_batch(batch)
+
+    #             if (not self.no_contrastive) and self.protein_contrastive:
+    #                 if isinstance(self.protein_sampler, PartialProteinSampler):
+    #                     anchors = torch.unique(pos_index).tolist()
+    #                     self.protein_sampler.prepare_batch(batch, anchors=anchors)
+    #                 else: self.protein_sampler.prepare_batch(batch)
+    #                 # self.protein_sampler.prepare_batch(batch)
+
+    #             if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}:
+    #                 hom_data, offsets = self._to_homogeneous_pyg(batch)
+    #                 src = edge_index_pairs[0] + offsets[self.n_type]
+    #                 dst = edge_index_pairs[1] + offsets[self.n_type]
+    #                 mapped_pairs = torch.stack([src, dst], dim=0)
+    #                 z_single, out = self.model(hom_data, mapped_pairs)
+    #             else: z_pos, z_neg, out = self.model(batch, edge_index_pairs)
+
+    #             self._alpha = F.softplus(self.alpha)
+    #             use_contrastive = (not self.no_contrastive) and (self.contrastive is not None)
+    #             if use_contrastive:
+    #                 if self.protein_contrastive:loss_contrast = self.contrastive(z_pos, z_neg)
+    #                 else:
+    #                     args = ((z_single, neg_stmt_idx) if self.model.__class__.__name__ in {"GCN", "GAT", "GCN_GAE"}
+    #                         else (z_pos, z_neg, neg_stmt_idx))
+    #                     loss_contrast = self.contrastive(*args)
+    #                 loss = self._alpha * loss_contrast + self.loss_fn(out.squeeze(-1), labels)
+    #             else: loss = self.loss_fn(out.squeeze(-1), labels)
+    #             total_loss += loss.item() * out.size(0)
+    #             total_examples += out.size(0)
+    #             last_out, last_labels = out, labels
+    #     avg_loss = total_loss / total_examples if total_examples else 0.0
+    #     return avg_loss, (last_out, last_labels)
+
     def run(self):
         best_lr = None
-        # best_val_loss = float("inf")
         best_val_f1 = float("-inf")
         best_metrics = None
 
         for lr_ in self.lrs:
             best_lr_epoch = None
-            #best_lr_val_loss = float("inf")
             best_f1_this_lr = float("-inf")
             best_lr_metrics = None
-
             self.model.load_state_dict(self._init_state)
             params = list(self.model.parameters()) + [self.alpha]
             self.optimizer = torch.optim.Adam(params, lr=lr_)
@@ -325,11 +413,9 @@ class Train:
                 pg["lr"] = lr_
             self.earlystopper = EarlyStopping()
             print(f"\n=== Starting sweep with LR = {lr_} ===", flush=True)
-
             for epoch in range(1, self.epochs + 1):
                 train_loss, _ = self.train_epoch()
                 val_loss, (out, lbls) = self.validate_epoch()
-
                 print(f"LR={lr_} | Epoch {epoch}/{self.epochs} | "
                     f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}", flush=True)
                 if self.earlystopper.step(val_loss, self.model):
@@ -338,15 +424,26 @@ class Train:
                     break
 
             lr_metrics = self.metrics.update(out.detach().cpu(), lbls.cpu())
-            if lr_metrics[1] > best_f1_this_lr:  # best per LR
-                best_f1_this_lr, best_lr_epoch, best_lr_metrics, best_val_loss = lr_metrics[1], epoch, lr_metrics, val_loss
-                self.log.log(f"Best Metrics: LR={lr_}, {epoch}, " + ", ".join([f"{v:.4f}" for v in best_lr_metrics]))
-            
-            if lr_metrics[1] > best_val_f1:  # best overall
-                best_val_f1, best_lr, best_epoch, best_alpha, best_metrics, best_val_loss = lr_metrics[1], lr_, epoch, self._alpha.item(), lr_metrics, val_loss
-                torch.save(self.model.state_dict(), self.log.dir + "model_" + self.model.__class__.__name__ + ".pth")
+            if lr_metrics[1] > best_f1_this_lr:
+                best_f1_this_lr = lr_metrics[1]
+                best_lr_epoch = epoch
+                best_lr_metrics = lr_metrics
+                best_val_loss = val_loss
+                self.log.log(f"Best Metrics: LR={lr_}, {epoch}, "
+                    + ", ".join([f"{v:.4f}" for v in best_lr_metrics]))
 
-        print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}, Val F1 = {best_val_f1:.4f}  ***")
+            if lr_metrics[1] > best_val_f1:
+                best_val_f1 = lr_metrics[1]
+                best_lr = lr_
+                best_epoch = epoch
+                best_alpha = float(F.softplus(self.alpha).item())
+                best_metrics = lr_metrics
+                best_val_loss = val_loss
+                torch.save(self.model.state_dict(),
+                    self.log.dir + "model_" + self.model.__class__.__name__ + ".pth")
+
+        print(f"\n*** Best LR = {best_lr}, Val Loss = {best_val_loss:.4f}, "
+            f"Val F1 = {best_val_f1:.4f}  ***")
         for name, val in zip(self.metrics.get_names(), best_metrics):
             print(f"{name}: {val:.4f}")
         return best_lr, best_val_loss, best_metrics, best_epoch, best_alpha

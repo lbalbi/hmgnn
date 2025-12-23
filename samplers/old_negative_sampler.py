@@ -58,10 +58,9 @@ class NegativeSampler:
         self.invalid_ids = invalid_ids
 
 
-    def sample(self, num_samples: int, src_override: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def sample(self, num_samples: int) -> Tuple[Tensor, Tensor]:
         """ Samples negatives for given positives
         Args: num_samples (int): number of negative edges to sample.
-              src_override (Tensor, optional): LongTensor of source node ids to sample from (instead of training src_pool).
         Returns: neg_src (LongTensor [M]), neg_dst (LongTensor [M])
             where M == num_samples (unless graph is tiny and we exhaust candidates).
         """
@@ -74,11 +73,8 @@ class NegativeSampler:
         while len(neg_ids) < target_count:
             remaining = target_count - len(neg_ids)
             M = max(int(remaining * self.oversample), remaining)
-            src_pool = self.src_pool if src_override is None else src_override.to(self.device).long().view(-1)
-            if src_pool.numel() == 0:
-                break
-            idx = torch.randint(0, src_pool.numel(), (M,), device=self.device)
-            s_cand = src_pool[idx]
+            idx = torch.randint(0, self.src_pool.numel(), (M,), device=self.device)
+            s_cand = self.src_pool[idx]
             d_cand = torch.randint(0, self.num_dst, (M,), device=self.device)
             cand_ids = (s_cand.long() * self.num_dst + d_cand.long()).tolist()
 
