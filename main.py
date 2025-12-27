@@ -167,9 +167,9 @@ def main():
 
     # Extra checks for protein-disjoint mode
     if args.protein_splits and test_proteins is not None:
-        tv_nodes = torch.unique(ppi_ei[:, trainval_eids].cpu().reshape(-1))
-        te_nodes = torch.unique(ppi_ei[:, test_eids].cpu().reshape(-1))
-        overlap = torch.intersect1d(tv_nodes, te_nodes).numel()
+        src_tv = torch.unique(ppi_ei[:, trainval_eids].reshape(-1).cpu())
+        src_te = torch.unique(ppi_ei[:, test_eids].reshape(-1).cpu())
+        overlap = torch.isin(src_tv, src_te).sum().item()
         print(f"[CHECK] trainval_nodes ∩ test_nodes = {overlap}", flush=True)
 
 

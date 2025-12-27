@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=human_perprot_noNegsCL
-#SBATCH --array=1-5
+#SBATCH --array=6-10
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
