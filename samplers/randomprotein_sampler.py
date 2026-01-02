@@ -428,7 +428,6 @@ class RandomProteinSampler:
         z_pos_to_u_neg = z[idx_pos_to_u_neg]
         z_neg_to_u_pos = z[idx_neg_to_u_pos]
         z_shared_pos = z[idx_shared_pos]    
-
         return z_anchor, z_shared_neg, z_pos_to_u_neg, z_neg_to_u_pos, z_shared_pos
 
 
