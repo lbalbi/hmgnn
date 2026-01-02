@@ -5,3 +5,4 @@ from .randomstatement_sampler import RandomStatementSampler
 from .contra_negative_sampler import Contra_NegativeStatementSampler
 from .protein_sampler import ProteinStatementSampler
 from .partialprotein_sampler import PartialProteinSampler
+from .randomprotein_sampler import RandomProteinSampler

@@ -6,7 +6,7 @@ from torch_geometric.utils import add_self_loops
 
 from utils import Metrics, EarlyStopping, _get_pos_edge_index
 from samplers import (NegativeStatementSampler, PartialStatementSampler, PartialProteinSampler,
-    NegativeSampler, RandomStatementSampler, ProteinStatementSampler)
+    NegativeSampler, RandomStatementSampler, ProteinStatementSampler, RandomProteinSampler)
 from losses import (DualContrastiveLoss_CE, DualContrastiveLoss_Margin,
     ComposedContrastiveLoss_CE, ComposedContrastiveLoss_Multi, ProteinContrastiveLoss)
 
@@ -109,7 +109,7 @@ class Train:
 
         if (not self.no_contrastive) and (not self.protein_contrastive):
             if rstatement_sampler:
-                self.neg_statement_sampler = RandomStatementSampler()
+                self.neg_statement_sampler = RandomProteinSampler()
                 self.neg_statement_sampler.prepare_global(full_cvgraph)
             elif nstatement_sampler:
                 self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)

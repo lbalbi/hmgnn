@@ -5,7 +5,7 @@ from torch_geometric.utils import add_self_loops
 
 from utils import Metrics, EarlyStopping, _get_pos_edge_index, _target_edge_key
 from samplers import (NegativeStatementSampler, PartialStatementSampler, PartialProteinSampler,
-    NegativeSampler, RandomStatementSampler, ProteinStatementSampler)
+    NegativeSampler, RandomStatementSampler, ProteinStatementSampler, RandomProteinSampler)
 from losses import (DualContrastiveLoss_CE, DualContrastiveLoss_Margin,
     ComposedContrastiveLoss_CE, ComposedContrastiveLoss_Multi, ProteinContrastiveLoss)
 
