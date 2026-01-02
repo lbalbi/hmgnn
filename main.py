@@ -22,6 +22,7 @@ def main():
         negatives from graph but keep in sampling")
     parser.add_argument('--use_rstatement_sampler', action='store_true', help="Use random statement sampler to not use \
     statements in sampling")
+    parser.add_argument('--patience', type=int, default=20, help="Patience for early stopping")
     parser.add_argument('--no_contrastive', action='store_true', help="Disable contrastive learning")
     parser.add_argument('--path', type=str, default="human_data", help="Path to the dataset directory")
     parser.add_argument('--output_dir', type=str, default="output/", help="Directory to save output logs and models")
@@ -208,7 +209,7 @@ def main():
             contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
             pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
             rstatement_sampler=args.use_rstatement_sampler,
-            task=args.task, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
+            task=args.task, gda_negs=gda_negs, no_contrastive=args.no_contrastive, patience=args.patience)
 
         lr, loss, _, epoch_, alpha_ = trainer.run()
         best_epochs.append(epoch_)
@@ -274,7 +275,8 @@ def main():
         e_type=ppi_rel, log=final_log, device=device, task=args.task, lr=best_lr,
         contrastive_weight=best_alpha, state_list=state_list,
         pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
-        rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive)
+        rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive, 
+        patience=args.patience)
     loss, (pred, _) = final_trainer.run()
     print(f"Final training loss: {loss:.4f}", flush=True)
     

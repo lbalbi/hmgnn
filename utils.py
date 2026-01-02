@@ -44,8 +44,9 @@ class EarlyStopping:
         mode (str): 'min' to stop when metric stops decreasing, 'max' for increasing.
         delta (float): minimum change in the monitored metric to qualify as an improvement.
     """
-    def __init__(self, patience: int = 20, mode: str = 'min', delta: float = 0.0):
-        self.patience = patience
+    def __init__(self, patience_: int = 20, mode: str = 'min', delta: float = 0.0):
+
+        self.patience = patience_
         self.mode = mode
         self.delta = delta
         self.best_score = float('inf') if mode == 'min' else -float('inf')
