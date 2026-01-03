@@ -10,7 +10,6 @@ from losses import (DualContrastiveLoss_CE, DualContrastiveLoss_Margin,
     ComposedContrastiveLoss_CE, ComposedContrastiveLoss_Multi, ProteinContrastiveLoss)
 
 
-
 def _to_homogeneous_pyg(hetero, device):
     """Converts HeteroData -> homogeneous Data and returns (hom_data, offsets)."""
     node_types = list(hetero.x_dict.keys())
@@ -61,7 +60,8 @@ class Train_BestModel:
         self.neg_statement_sampler = None
         if (not self.no_contrastive) and (not self.protein_contrastive):
             if self.rstatement_sampler:
-                self.neg_statement_sampler = RandomStatementSampler()
+                # self.neg_statement_sampler = RandomStatementSampler()
+                self.neg_statement_sampler = RandomProteinSampler()
                 self.neg_statement_sampler.prepare_global(full_cvgraph)
             elif self.nstatement__sampler:
                 self.neg_statement_sampler = PartialStatementSampler(neg_edges=state_list)
