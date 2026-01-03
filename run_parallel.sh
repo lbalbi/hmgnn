@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=human_shgcn_randomNegs_perProt
-#SBATCH --array=1-5
+#SBATCH --array=6-10
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
-#SBATCH --nodelist=liseda-01
+#SBATCH --nodelist=liseda-03
 #SBATCH --partition=tier3
 
 set -euo pipefail
