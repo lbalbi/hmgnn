@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=human_perPPI_randomNegs_hgcn
-#SBATCH --array=1-10
+#SBATCH --array=5-10
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
