@@ -4,7 +4,7 @@ from typing import Optional, Tuple, List, Dict
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
 from samplers import NegativeStatementSampler
-from losses import ContrastiveLoss_CE
+from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss
 
 
 class Train:
@@ -33,7 +33,8 @@ class Train:
         self.no_contrastive = no_contrastive
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
-        self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
+        # self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
+        self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
         self.train_loader = train_loader
         self.val_loader = val_loader
 
@@ -89,9 +90,9 @@ class Train:
 
             if train and not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([h, t], dim=0))
-                z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
+                samples = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=None)
-                contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
+                contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
             batch_size_eff = y.size(0)
@@ -188,9 +189,9 @@ class Train:
 
             if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
-                z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
+                samples = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
-                contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
+                contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
             loss.backward()
@@ -220,9 +221,9 @@ class Train:
                 triple_idx = self._get_batch_triple_indices(batch, subset="val")
                 if triple_idx.numel() == 0: continue
 
-                if (not self.no_contrastive and self.contrastive_sampler is not None
-                    and hasattr(self.contrastive_sampler, "prepare_batch")):
-                    self.contrastive_sampler.prepare_batch(batch)
+                # if (not self.no_contrastive and self.contrastive_sampler is not None
+                #     and hasattr(self.contrastive_sampler, "prepare_batch")):
+                #     self.contrastive_sampler.prepare_batch(batch)
 
                 h_dict = self.model.encode(batch)
                 z = h_dict[n_type]
@@ -234,13 +235,13 @@ class Train:
                 loss = bce_loss
                 contr_loss_val = 0.0
 
-                if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-                    batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
-                    z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
-                        z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
-                    contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
-                    loss = loss + self.contrastive_weight * contr_loss
-                    contr_loss_val = float(contr_loss.detach().cpu().item())
+                # if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+                #     batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
+                #     z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
+                #         z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
+                #     contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
+                #     loss = loss + self.contrastive_weight * contr_loss
+                #     contr_loss_val = float(contr_loss.detach().cpu().item())
 
                 batch_size_eff = labels.size(0)
                 total_bce += bce_loss.detach().cpu().item() * batch_size_eff

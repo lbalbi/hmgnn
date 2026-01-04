@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple, List
 from torch_geometric.data import HeteroData
-from utils import Metrics
-from samplers import NegativeSampler, NegativeStatementSampler
-from losses import ContrastiveLoss_CE
+from utils import Metrics, EarlyStopping
+from samplers import NegativeSampler, NegativeStatementSampler, NegativeInstanceSampler
+from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss
 
 
 class Train_BestModel:
@@ -26,7 +26,8 @@ class Train_BestModel:
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr: float,
         epochs: int, device: torch.device, log, batch_size: int = 1024,
         contrastive_sampler: Optional[NegativeStatementSampler] = None,
-        contrastive_weight: Optional[float] = 0.1, loader=None, no_contrastive: bool = False):
+        contrastive_weight: Optional[float] = 0.1, loader=None, no_contrastive: bool = False,
+        early_stopping_patience: int = 15):
         self.model = model.to(device)
         self.graph = graph
         self.heads = heads.clone().long()
@@ -43,7 +44,11 @@ class Train_BestModel:
         self.no_contrastive = no_contrastive
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
-        self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
+        # self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
+        self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
+        self.es_patience = int(early_stopping_patience)
+        lr_early_stopping = EarlyStopping(patience=self.es_patience, mode="min")
+
         self.loader = loader
 
         if "node" not in self.graph.node_types:
@@ -85,9 +90,9 @@ class Train_BestModel:
 
             if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([h, t], dim=0))
-                z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
+                samples = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=None)
-                contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
+                contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
 
@@ -191,9 +196,9 @@ class Train_BestModel:
 
             if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
-                z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
+                samples = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
-                contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
+                contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
 
@@ -229,13 +234,47 @@ class Train_BestModel:
                 if (not self.no_contrastive and self.contrastive_sampler is not None
                     and hasattr(self.contrastive_sampler, "prepare_batch")):
                     self.contrastive_sampler.prepare_batch(self.graph)
-
                 self.optimizer.zero_grad()
                 h_dict = self.model.encode(self.graph)
                 z = h_dict[n_type]
                 bce_loss, contr_loss, total_loss = self._epoch_step_fullgraph(z)
                 total_loss.backward()
                 self.optimizer.step()
+
+                self.model.eval()
+                if use_neighbor_mode:
+                    val_bce, _, val_probs, val_labels = self._eval_with_neighbors(n_type=n_type)
+                else:
+                    with torch.no_grad():
+                        h_dict_val = self.model.encode(self.graph)
+                        z_val = h_dict_val[n_type]
+                        val_bce, _, val_probs, val_labels, _ = self._iterate_batches(
+                            self.val_idx, z_val, train=False)
+
+                if val_probs is not None and val_labels is not None:
+                    val_metrics = self.metrics.update(val_probs, val_labels)
+                else: val_metrics = None
+                if not getattr(self.log, "non_verbose", False):
+                    msg = (f"[lr={lr:.3g}] Epoch {epoch:03d} | "
+                        f"TrainLoss(BCE)={bce_loss:.4f} | "
+                        f"TrainLoss(Contr)={contr_loss:.4f} | "
+                        f"ValLoss(BCE)={val_bce:.4f}")
+                    if val_metrics is not None:
+                        msg += " | " + ", ".join(f"{name}={val_metrics[i]:.4f}"
+                            for i, name in enumerate(self.metrics.get_names()))
+                    self.log.log(msg)
+
+                if val_bce < best_val_loss_lr:
+                    best_val_loss_lr = val_bce
+                    best_epoch_lr = epoch
+                    best_metrics_lr = val_metrics
+                    best_state_lr = {k:v.detach().clone() for k,v in self.model.state_dict().items()}
+
+                if lr_early_stopping.step(val_bce, self.model):
+                    if not getattr(self.log, "non_verbose", False):
+                        self.log.log(f"[lr={lr:.3g}] Early stopping at epoch {epoch} "
+                            f"(best val loss so far: {best_val_loss_lr:.4f}).")
+                    break
 
             last_bce_loss = bce_loss
             last_contr_loss = contr_loss

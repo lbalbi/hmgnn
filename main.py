@@ -11,7 +11,7 @@ from trainer_bestmodel import (Train_BestModel, Test_BestModel)
 from utils import Logger, load_config
 from data_loader import DataLoader
 from samplers import (PartialStatementSampler, NegativeStatementSampler, RandomStatementSampler,
-    NegativeSampler)
+    NegativeSampler, NegativeInstanceSampler)
 
 
 def build_hgcn_encoder_graph(struct_graph: HeteroData, subclass_rel: str = "subclass_of",
@@ -133,7 +133,7 @@ def main():
         help="Task / dataset name (used to load config JSON).")
     parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "gcn", "gae"],
         default="hgcn", help="Model to run (default is relation-aware HGCN)")
-    parser.add_argument("--epochs", type=int, default=250,
+    parser.add_argument("--epochs", type=int, default=1,
         help="Max epochs per fold / final training.")
     parser.add_argument("--batch_size", type=int, default=3056,
         help="Triple batch size for training and testing.")
@@ -335,8 +335,10 @@ def main():
                     edges_are_negative=edges_are_negative)
                 neg_stmt_sampler.prepare_global(sampler_graph)
             else:
-                neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k, subclass_rel=subclass_rel, 
-                    neg_prefix="NOT_", instance_rel=instance_rel)
+                # neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k, subclass_rel=subclass_rel, 
+                #    neg_prefix="NOT_", instance_rel=instance_rel)
+                neg_stmt_sampler = NegativeInstanceSampler(k=contrastive_k, subclass_rel=subclass_rel, 
+                   neg_prefix="NOT_", instance_rel=instance_rel)                
                 neg_stmt_sampler.prepare_global(sampler_graph)
         else: neg_stmt_sampler = None
 
@@ -388,8 +390,10 @@ def main():
                 neg_edges=external_edges, edges_are_negative=edges_are_negative)
             final_contrastive_sampler.prepare_global(struct_graph)
         else:
-            final_contrastive_sampler = NegativeStatementSampler(
-                k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)
+            final_contrastive_sampler = NegativeInstanceSampler(
+                k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)            
+            # final_contrastive_sampler = NegativeStatementSampler(
+            #     k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)
             final_contrastive_sampler.prepare_global(struct_graph)
     else: final_contrastive_sampler = None
 
