@@ -11,7 +11,7 @@ from trainer_bestmodel import (Train_BestModel, Test_BestModel)
 from utils import Logger, load_config
 from data_loader import DataLoader
 from samplers import (PartialStatementSampler, NegativeStatementSampler, RandomStatementSampler,
-    NegativeSampler, NegativeInstanceSampler)
+    NegativeSampler, NegativeInstanceSampler, RandomInstanceSampler)
 
 
 def build_hgcn_encoder_graph(struct_graph: HeteroData, subclass_rel: str = "subclass_of",
@@ -133,9 +133,9 @@ def main():
         help="Task / dataset name (used to load config JSON).")
     parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "gcn", "gae"],
         default="hgcn", help="Model to run (default is relation-aware HGCN)")
-    parser.add_argument("--epochs", type=int, default=1,
+    parser.add_argument("--epochs", type=int, default=250,
         help="Max epochs per fold / final training.")
-    parser.add_argument("--batch_size", type=int, default=3056,
+    parser.add_argument("--batch_size", type=int, default=3024,
         help="Triple batch size for training and testing.")
     parser.add_argument("--path", type=str, default="wikidata_data",
         help="Path to the dataset directory (containing train2id_*.txt etc.).")
@@ -415,6 +415,12 @@ def main():
             edge_type=key, all_pos_edge_index=all_pos_edge_index)
 
     test_log = Logger("test_global", dir=args.output_dir)
+
+    del final_loader, final_trainer, train_loader, val_loader, trainer_fold
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
     tester = Test_BestModel(model=final_model, graph=encoder_graph,
         test_heads=test_heads, test_rels=test_rels, test_tails=test_tails,
         id2rel=id2rel, neg_samplers=neg_samplers, num_neg_per_pos=args.num_neg_test,

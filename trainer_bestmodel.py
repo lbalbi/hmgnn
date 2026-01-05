@@ -327,6 +327,7 @@ class Test_BestModel:
         Compute probabilities for triples in mini-batches to save memory.
         Returns a tensor of shape [N] with probabilities.
         """
+        
         all_probs = []
         self.model.eval()
         with torch.no_grad():
@@ -337,6 +338,9 @@ class Test_BestModel:
                 t = tails[start:end]
                 r = rels[start:end]
                 edge_index = torch.stack([h, t], dim=0)
+                device = z.device
+                edge_index = edge_index.to(device)
+                r = r.to(device)
                 _, probs = self.model.score_triples(z, edge_index, r)
                 all_probs.append(probs.detach().cpu())
         return torch.cat(all_probs, dim=0) if all_probs else torch.empty(0)
@@ -385,11 +389,15 @@ class Test_BestModel:
         self.test_rels = self.test_rels.to(self.device)
         self.test_tails = self.test_tails.to(self.device)
 
+        self.model = self.model.cpu()
+        graph_cpu = self.graph.cpu()
+        
         self.model.eval()
-        with torch.no_grad():
-            h_dict = self.model.encode(self.graph)
+        # with torch.no_grad():
+        with torch.inference_mode():
+            h_dict = self.model.encode(graph_cpu)
             z = h_dict[getattr(self.model, "n_type", "node")]
-
+            del h_dict
             pos_probs = self._score_triples_in_batches(
                 z, self.test_heads, self.test_rels, self.test_tails)
             pos_labels = torch.ones_like(pos_probs)

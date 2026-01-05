@@ -3,3 +3,4 @@ from .negativestatement_sampler import NegativeStatementSampler
 from .partialstatement_sampler import PartialStatementSampler
 from .randomstatement_sampler import RandomStatementSampler
 from .negativeinstance_sampler import NegativeInstanceSampler
+from .randominstance_sampler import RandomInstanceSampler
