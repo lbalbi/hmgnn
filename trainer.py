@@ -3,8 +3,11 @@ import torch.nn as nn
 from typing import Optional, Tuple, List, Dict
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
-from samplers import NegativeStatementSampler
+from samplers import (NegativeInstanceSampler,
+    PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss
+
+import subprocess
 
 
 class Train:
@@ -12,10 +15,11 @@ class Train:
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr_candidates: List[float],
         epochs: int, device: torch.device, log, batch_size: int = 1024, val_ratio: float = 0.1,
         early_stopping_patience: int = 15, train_idx: Optional[torch.Tensor] = None,
-        val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeStatementSampler] = None,
+        val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeInstanceSampler] = None,
         contrastive_weight: float = 0.1, train_loader=None, val_loader=None, no_contrastive: bool = False):
 
         self.model = model.to(device)
+        print(model.__class__.__name__)
         self.graph = graph
         self.device = device
         self.log = log
@@ -174,13 +178,13 @@ class Train:
             if (not self.no_contrastive and self.contrastive_sampler is not None
                 and hasattr(self.contrastive_sampler, "prepare_batch")):
                 self.contrastive_sampler.prepare_batch(batch)
-
             optimizer.zero_grad()
             h_dict = self.model.encode(batch)
             z = h_dict[n_type]
-
+            del h_dict
             edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
                 triple_idx, batch["node"].n_id, self.device)
+
             logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
             bce_loss = self.criterion(logits, labels)
 
@@ -291,7 +295,7 @@ class Train:
                 self.tails = self.tails.to(self.device)
                 self.labels = self.labels.to(self.device)
             
-            for epoch in range(1, self.max_epochs + 1):
+            for epoch in range(1, self.max_epochs + 1):               
                 if use_neighbor_mode: train_bce, train_contr = self._train_one_epoch_with_neighbors(
                         optimizer, n_type=n_type)
                 else:

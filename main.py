@@ -11,7 +11,7 @@ from trainer_bestmodel import (Train_BestModel, Test_BestModel)
 from utils import Logger, load_config
 from data_loader import DataLoader
 from samplers import (PartialStatementSampler, NegativeStatementSampler, RandomStatementSampler,
-    NegativeSampler, NegativeInstanceSampler, RandomInstanceSampler)
+    NegativeSampler, NegativeInstanceSampler, RandomInstanceSampler, PartialInstanceSampler)
 
 
 def build_hgcn_encoder_graph(struct_graph: HeteroData, subclass_rel: str = "subclass_of",
@@ -185,10 +185,6 @@ def main():
     num_nodes = full_graph_all["node"].num_nodes
     base_x = full_graph_all["node"].x
     all_e_etypes = list(full_graph_all.edge_types)
-    # nflag, pflag, rflag = args.use_nstatementsampler, args.use_pstatementsampler, args.use_rstatement_sampler
-    # use_partial_sampler = nflag or pflag
-    # use_random_sampler = rflag
-    # external_edges = dl.get_state_list()
     nflag, pflag, rflag = args.use_nstatementsampler, args.use_pstatementsampler, args.use_rstatement_sampler
     use_partial_sampler = nflag or pflag
     use_random_sampler = rflag
@@ -196,7 +192,7 @@ def main():
     if nflag:
         neg_edges_all = []
         for etype, (src, tgt) in data_dict.items():
-            if isinstance(etype, str) and etype.startswith("NOT_"): neg_edges_all.extend(zip(src.tolist(), tgt.tolist()))
+            if isinstance(etype, str) and etype.startswith("NOT_"): neg_edges_all.extend(zip(src.tolist(), etype, tgt.tolist()))
         if neg_edges_all: external_edges = neg_edges_all
 
 
@@ -322,11 +318,10 @@ def main():
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
         if args.model in ("gcn","ra_hgcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
         else: model_fold = ModelCls(**base_model_kwargs).to(device)
-
         sampler_graph = struct_graph
         if not args.no_contrastive:
             if use_random_sampler:
-                random_sampler = RandomStatementSampler(k=contrastive_k, external_negs=external_edges)
+                random_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
                 random_sampler.prepare_global(sampler_graph)
                 neg_stmt_sampler = random_sampler
             elif use_partial_sampler:
@@ -381,7 +376,7 @@ def main():
 
     if not args.no_contrastive:
         if use_random_sampler:
-            final_contrastive_sampler = RandomStatementSampler(
+            final_contrastive_sampler = RandomInstanceSampler(
                 k=contrastive_k, external_negs=external_edges)
             final_contrastive_sampler.prepare_global(struct_graph)
         elif use_partial_sampler:

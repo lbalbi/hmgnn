@@ -27,6 +27,11 @@ class GCN(nn.Module):
     ):
         super().__init__()
 
+        if isinstance(in_dim, dict):
+            if n_type in in_dim: in_dim = int(in_dim[n_type])
+            else: in_dim = int(next(iter(in_dim.values())))
+        else: in_dim = int(in_dim)
+
         self.n_type = n_type
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
@@ -100,11 +105,7 @@ class GCN(nn.Module):
 
         return {self.n_type: h}
 
-    def score_triples(
-        self,
-        z: torch.Tensor,
-        edge_index: torch.Tensor,
-        rel_ids: torch.Tensor,
+    def score_triples(self, z: torch.Tensor, edge_index: torch.Tensor, rel_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Same signature as RA_HGCN.score_triples.

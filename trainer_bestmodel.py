@@ -3,7 +3,8 @@ import torch.nn as nn
 from typing import Dict, Optional, Tuple, List
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
-from samplers import NegativeSampler, NegativeStatementSampler, NegativeInstanceSampler
+from samplers import (NegativeSampler, NegativeStatementSampler, NegativeInstanceSampler, 
+    PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss
 
 
@@ -25,7 +26,7 @@ class Train_BestModel:
     def __init__(self, model: nn.Module, graph: HeteroData, heads: torch.Tensor,
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr: float,
         epochs: int, device: torch.device, log, batch_size: int = 1024,
-        contrastive_sampler: Optional[NegativeStatementSampler] = None,
+        contrastive_sampler: Optional[NegativeInstanceSampler] = None,
         contrastive_weight: Optional[float] = 0.1, loader=None, no_contrastive: bool = False,
         early_stopping_patience: int = 15):
         self.model = model.to(device)
@@ -388,7 +389,7 @@ class Test_BestModel:
         self.test_heads = self.test_heads.to(self.device)
         self.test_rels = self.test_rels.to(self.device)
         self.test_tails = self.test_tails.to(self.device)
-
+        # passed to cpu because of RA-HGCN
         self.model = self.model.cpu()
         graph_cpu = self.graph.cpu()
         
