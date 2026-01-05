@@ -6,7 +6,7 @@ from torch_geometric.data import HeteroData
 from typing import Dict, List, Tuple, Optional
 
 
-class RA_HGCN(nn.Module):
+class SRA_HGCN(nn.Module):
     """
     Relation-aware HGCN with SHGCN-style *dual-view* node embeddings.
     Encoder has two node embedding streams:
