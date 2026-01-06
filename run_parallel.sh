@@ -4,7 +4,7 @@
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=45:00:00
-#SBATCH --nodelist=liseda-05
+#SBATCH --nodelist=liseda-03
 #SBATCH --partition=tier3
 
 set -euo pipefail
@@ -19,5 +19,7 @@ python -u main.py \
   --path "data/wikidata_data" \
   --task "wikidata" \
   --model "ra_hgcn" \
+  --batch_size 3024 \
+  --epochs 200 \
   --output_dir "wikidata_protCL_NEW/output_wikidata_protCL_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1

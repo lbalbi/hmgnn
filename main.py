@@ -152,6 +152,7 @@ def main():
     parser.add_argument("--no_contrastive", action="store_true",
         help="Disable contrastive learning with statement samplers.")
     args = parser.parse_args()
+    print("output_dir:", args.output_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cfg = load_config(task=args.task)
@@ -418,7 +419,7 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    model_path = os.path.join(args.output_dir, f"final_model_{args.model}.pt")
+    model_path = os.path.join("output/"+ args.output_dir, f"final_model_{args.model}.pt")
     torch.save(final_model.state_dict(), model_path)
 
     tester = Test_BestModel(model=final_model, graph=encoder_graph,
