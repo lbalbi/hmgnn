@@ -98,10 +98,10 @@ class GCN_GAE(nn.Module):
         self.n_type = n_type
         self.ppi_etype = ppi_etype
 
-        if isinstance(in_feats, dict):
-            in_dim = int(in_feats.get(n_type, list(in_feats.values())[0]))
+        if isinstance(in_dim, dict):
+            in_dim_ = int(in_dim.get(n_type, list(in_feats.values())[0]))
         else:
-            in_dim = int(in_feats)
+            in_dim_ = int(in_dim)
 
         self.hidden_dim = int(hidden_dim)
         self.out_dim = int(out_dim)
@@ -112,10 +112,7 @@ class GCN_GAE(nn.Module):
         self.residual = float(residual)
         self.drop_edge_p = float(drop_edge_p)
         self.add_self_loops_flag = bool(add_self_loops_flag)
-
-        # Project input -> hidden
-        self.in_proj = nn.Identity() if in_dim == self.hidden_dim else nn.Linear(in_dim, self.hidden_dim, bias=False)
-
+        self.in_proj = nn.Identity() if in_dim_ == self.hidden_dim else nn.Linear(in_dim_, self.hidden_dim, bias=False)
         # Two convs like your original (conv1 then repeated conv2)
         self.conv1 = GCNConv(self.hidden_dim, self.hidden_dim, add_self_loops=False, normalize=True)
         self.conv2 = GCNConv(self.hidden_dim, self.hidden_dim, add_self_loops=False, normalize=True)
