@@ -133,7 +133,7 @@ class Train_BestModel:
                 else:
                     samples = self.neg_statement_sampler.get_contrastive_samples(z)
                     # samples = self.neg_statement_sampler.get_contrastive_samples(z)
-            loss_contrast = self.contrastive(*samples)
+                loss_contrast = self.contrastive(*samples)
             loss_cls = self.loss_fn(out.squeeze(-1), labels)
 
             loss_total = (self.alpha * loss_contrast + loss_cls if not self.no_contrastive else loss_cls)
