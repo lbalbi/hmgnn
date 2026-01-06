@@ -46,6 +46,8 @@ def main():
     dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatement_sampler,
         use_nstatement_sampler=args.use_nstatement_sampler, use_rstatement_sampler=args.use_rstatement_sampler)
 
+    use_huri_neg_ppi = (args.task.lower() == "huri")
+
     state_list = None
     if args.use_pstatement_sampler or args.use_nstatement_sampler: state_list = dl.get_state_list()
     if args.use_pstatement_sampler and ["node","pos_statement","node"] in mcfg["edge_types"]:
@@ -209,7 +211,8 @@ def main():
             contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
             pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
             rstatement_sampler=args.use_rstatement_sampler,
-            task=args.task, gda_negs=gda_negs, no_contrastive=args.no_contrastive, patience=args.patience)
+            task=args.task, gda_negs=gda_negs, no_contrastive=args.no_contrastive, patience=args.patience,
+            use_huri_neg_ppi=use_huri_neg_ppi)
 
         lr, loss, _, epoch_, alpha_ = trainer.run()
         best_epochs.append(epoch_)
