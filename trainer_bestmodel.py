@@ -5,7 +5,7 @@ from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
 from samplers import (NegativeSampler, NegativeStatementSampler, NegativeInstanceSampler, 
     PartialInstanceSampler, RandomInstanceSampler)
-from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss
+from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 
 
 class Train_BestModel:
@@ -46,10 +46,13 @@ class Train_BestModel:
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
         # self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
-        self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
+        # self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
+        self.dual_view = bool(getattr(self.model, "dual_view", False))
+        if contrastive_sampler is not None:
+            self.contrastive_loss_fn = DualContrastiveInstanceLoss() if self.dual_view else ContrastiveInstanceLoss()
+        else: self.contrastive_loss_fn = None
         self.es_patience = int(early_stopping_patience)
         lr_early_stopping = EarlyStopping(patience=self.es_patience, mode="min")
-
         self.loader = loader
 
         if "node" not in self.graph.node_types:
@@ -59,10 +62,32 @@ class Train_BestModel:
         self.node_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
         num_triples = self.heads.size(0)
 
-        self.node_to_triples: List[List[int]] = [[] for _ in range(num_nodes)]
-        for idx in range(num_triples):
-            h = int(self.heads[idx])
-            if 0 <= h < num_nodes: self.node_to_triples[h].append(idx)
+        # if "node" not in self.graph.node_types:
+        #     raise ValueError("Train_BestModel assumes a single node type 'node'.")
+        # num_nodes = int(self.graph["node"].num_nodes)
+        # self.num_nodes = num_nodes
+        # self.node_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
+        # num_triples = self.heads.size(0)
+
+        # self.node_to_triples: List[List[int]] = [[] for _ in range(num_nodes)]
+        # for idx in range(num_triples):
+        #     h = int(self.heads[idx])
+        #     if 0 <= h < num_nodes: self.node_to_triples[h].append(idx)
+
+
+    def _maybe_switch_to_dual(self, h_dict: Dict[str, torch.Tensor], n_type: str) -> None:
+        if self.contrastive_sampler is None or self.no_contrastive or self.contrastive_weight <= 0.0:
+            return
+        if getattr(self, "dual_view", False):
+            return
+        pos_k = f"{n_type}_pos"
+        neg_k = f"{n_type}_neg"
+        if pos_k in h_dict and neg_k in h_dict and n_type in h_dict:
+            z = h_dict[n_type]
+            zp = h_dict[pos_k]
+            if z.dim() == 2 and zp.dim() == 2 and z.size(1) == 2 * zp.size(1):
+                self.dual_view = True
+                self.contrastive_loss_fn = DualContrastiveInstanceLoss()
 
     def _epoch_step_fullgraph(self, z: torch.Tensor) -> Tuple[float, float, torch.Tensor]:
         num_triples = self.heads.size(0)
@@ -133,6 +158,7 @@ class Train_BestModel:
     #     in_batch = node_mask[heads_sub] & node_mask[tails_sub]
     #     node_mask[n_id] = False
     #     return subset_idx[in_batch]
+
     def _get_batch_triple_indices(self, batch: HeteroData) -> torch.Tensor:
         """
         Returns the indices of *all* triples (over self.heads/self.tails/self.rels/self.labels)
@@ -185,6 +211,7 @@ class Train_BestModel:
                 self.contrastive_sampler.prepare_batch(batch)
             self.optimizer.zero_grad()
             h_dict = self.model.encode(batch)
+            self._maybe_switch_to_dual(h_dict, n_type)
             z = h_dict[n_type]
 
             edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
@@ -237,6 +264,7 @@ class Train_BestModel:
                     self.contrastive_sampler.prepare_batch(self.graph)
                 self.optimizer.zero_grad()
                 h_dict = self.model.encode(self.graph)
+                self._maybe_switch_to_dual(h_dict, n_type)
                 z = h_dict[n_type]
                 bce_loss, contr_loss, total_loss = self._epoch_step_fullgraph(z)
                 total_loss.backward()

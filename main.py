@@ -131,11 +131,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="wikidata",
         help="Task / dataset name (used to load config JSON).")
-    parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "gcn", "gae"],
+    parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "sra_hgcn","gcn", "gae"],
         default="hgcn", help="Model to run (default is relation-aware HGCN)")
     parser.add_argument("--epochs", type=int, default=250,
         help="Max epochs per fold / final training.")
-    parser.add_argument("--batch_size", type=int, default=3024,
+    parser.add_argument("--batch_size", type=int, default=3024*2,
         help="Triple batch size for training and testing.")
     parser.add_argument("--path", type=str, default="wikidata_data",
         help="Path to the dataset directory (containing train2id_*.txt etc.).")
@@ -158,7 +158,7 @@ def main():
     ModelCls = eval(args.model.upper()) if args.model != "gae" else eval("GCN_" + args.model.upper())
     mcfg = cfg["models"][ModelCls.__name__ if args.model != "gae" else "GAE"]
 
-    if args.model == "ra_hgcn":
+    if args.model in ("ra_hgcn", "sra_hgcn"):
         in_feats_cfg = mcfg["in_feats"]
         if isinstance(in_feats_cfg, dict):
             n_type_cfg = mcfg.get("n_type", "node")
@@ -316,7 +316,8 @@ def main():
         base_model_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
             out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=list(fold_graph.edge_types),
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
-        if args.model in ("gcn","ra_hgcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
+        if args.model in ("ra_hgcn", "sra_hgcn", "gcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
+        #if args.model in ("gcn","ra_hgcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
         else: model_fold = ModelCls(**base_model_kwargs).to(device)
         sampler_graph = struct_graph
         if not args.no_contrastive:
@@ -326,7 +327,7 @@ def main():
                 neg_stmt_sampler = random_sampler
             elif use_partial_sampler:
                 edges_are_negative = nflag
-                neg_stmt_sampler = PartialStatementSampler(k=contrastive_k, neg_edges=external_edges,
+                neg_stmt_sampler = PartialInstanceSampler(k=contrastive_k, neg_edges=external_edges,
                     edges_are_negative=edges_are_negative)
                 neg_stmt_sampler.prepare_global(sampler_graph)
             else:
@@ -370,7 +371,8 @@ def main():
         out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=encoder_e_etypes,
         n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
 
-    if args.model in ("ra_hgcn", "gcn"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+    # if args.model in ("ra_hgcn", "gcn"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+    if args.model in ("ra_hgcn", "sra_hgcn", "gcn"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
     else: final_model = ModelCls(**final_base_kwargs).to(device)
     final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
@@ -415,6 +417,9 @@ def main():
     import gc
     gc.collect()
     torch.cuda.empty_cache()
+
+    model_path = os.path.join(args.output_dir, f"final_model_{args.model}.pt")
+    torch.save(final_model.state_dict(), model_path)
 
     tester = Test_BestModel(model=final_model, graph=encoder_graph,
         test_heads=test_heads, test_rels=test_rels, test_tails=test_tails,

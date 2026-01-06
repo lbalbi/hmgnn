@@ -1,5 +1,6 @@
 from typing import List, Optional, Tuple, Union, Any, Dict
 import torch
+from torch import Tensor
 from torch_geometric.data import HeteroData
 from .negativeinstance_sampler import NegativeInstanceSampler
 
@@ -11,54 +12,95 @@ class PartialInstanceSampler(NegativeInstanceSampler):
 
     Same instance-example behavior as NegativeStatementSampler, but replaces ONE polarity
     of statement edges with an external list.
-
-    ✅ Type-aware behavior:
+    Type-aware behavior:
       - Pools are constructed using keys (base_rel, class) rather than class alone.
       - This ensures examples match the SAME statement type (base relation), possibly with
         different polarity, e.g.:
           - shared_pos: A has POS base_rel=T to C and B has POS base_rel=T to C
           - pos_to_u_neg: A has NEG base_rel=T to C and B has POS base_rel=T to C
           - etc.
-
     External input:
       - Recommended: List of triples (src, rel, dst) using the relation name (e.g., "P31" or "NOT_P31")
       - Backward compat: (src, dst) pairs are accepted but treated as rel="__external__"
         (this loses type-awareness relative to graph relations).
-
     Polarity replacement:
       - edges_are_negative=True  : external edges are treated as NEG statements (graph NEG ignored)
       - edges_are_negative=False : external edges are treated as POS statements (graph POS ignored)
     """
 
-    def __init__(
-        self,
-        k: int = 1,
-        go_etype: str = "subclass_of",
+    def __init__(self, k: int = 1, go_etype: str = "subclass_of",
         neg_edges: Optional[List[ExternalStmt]] = None,
-        edges_are_negative: bool = True,
-        instance_rel: str = "2",
-        neg_prefix: str = "NOT_",
-        neg_expansion_hops: int = 1,
-        seed: Optional[int] = None,
-    ):
-        super().__init__(
-            k=k,
-            subclass_rel=go_etype,
+        edges_are_negative: bool = True, instance_rel: str = "2",
+        neg_prefix: str = "NOT_", neg_expansion_hops: int = 1):
+        super().__init__(k=k, subclass_rel=go_etype,
             neg_prefix=neg_prefix,
             instance_rel=instance_rel,
-            neg_expansion_hops=neg_expansion_hops,
-            seed=seed,
-        )
+            neg_expansion_hops=neg_expansion_hops)
         self.external_edges = neg_edges or []
         self.edges_are_negative = bool(edges_are_negative)
-
+        print("In PartialInstanceSampler")
         # typed-key machinery
         self._stride: int = 0
         self._base_rel2id: Dict[str, int] = {}
+        self.seed = 42
 
     # -----------------------
     # typed-key helpers
     # -----------------------
+
+    def _is_neg_rel(self, rel: str) -> bool:
+        """Return True iff this edge relation encodes a NEG statement."""
+        return str(rel).startswith(self.neg_prefix)
+
+    def _is_pos_rel(self, rel: str) -> bool:
+        """Return True iff this edge relation encodes a POS statement."""
+        r = str(rel)
+        if r == self.subclass_rel:
+            return False
+        return not self._is_neg_rel(r)
+
+    @staticmethod
+    def _group_unique_by_key(keys: Tensor, vals: Tensor) -> Dict[int, Tensor]:
+        """Group vals by keys, returning {key: unique(vals)} as CPU tensors.
+
+        This utility is used by Partial/Random instance samplers to build:
+          - parent -> children maps (for subclass expansion), and
+          - key -> instances pools (for contrastive sampling).
+
+        Args:
+            keys: 1D tensor of integer keys (CPU or GPU).
+            vals: 1D tensor of integer values aligned with keys (CPU or GPU).
+
+        Returns:
+            dict mapping int(key) -> 1D torch.long CPU tensor of unique vals for that key.
+        """
+        if keys.numel() == 0:
+            return {}
+        if keys.numel() != vals.numel():
+            raise ValueError(f"keys and vals must have same length, got {keys.numel()} vs {vals.numel()}")
+        k = keys.detach().to(dtype=torch.long, device='cpu')
+        v = vals.detach().to(dtype=torch.long, device='cpu')
+        order = torch.argsort(k)
+        k = k[order]
+        v = v[order]
+        uniq, counts = torch.unique_consecutive(k, return_counts=True)
+        out: Dict[int, Tensor] = {}
+        start = 0
+        for key_i, cnt_i in zip(uniq.tolist(), counts.tolist()):
+            sl = v[start:start + cnt_i]
+            out[int(key_i)] = torch.unique(sl)
+            start += cnt_i
+        return out
+
+    def _expand_neg_classes(
+        self,
+        direct_classes: List[int],
+        parent_to_children: Dict[int, Tensor],
+    ) -> List[int]:
+        """Alias used by typed-key samplers; expands classes via subclass_of."""
+        return self._expand_negs(direct_classes, parent_to_children)
+
+
     def _base_rel(self, rel: str) -> str:
         r = str(rel)
         if r.startswith(self.neg_prefix):

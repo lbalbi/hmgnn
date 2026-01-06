@@ -5,7 +5,7 @@ from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
 from samplers import (NegativeInstanceSampler,
     PartialInstanceSampler, RandomInstanceSampler)
-from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss
+from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 
 import subprocess
 
@@ -38,7 +38,11 @@ class Train:
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
         # self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
-        self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
+        # self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
+        self.dual_view = bool(getattr(self.model, "dual_view", False))
+        if contrastive_sampler is not None:
+            self.contrastive_loss_fn = DualContrastiveInstanceLoss() if self.dual_view else ContrastiveInstanceLoss()
+        else: self.contrastive_loss_fn = None
         self.train_loader = train_loader
         self.val_loader = val_loader
 
@@ -65,6 +69,21 @@ class Train:
             h = int(self.heads[idx])
             if 0 <= h < num_nodes: self.node_to_triples[h].append(idx)
 
+    def _maybe_switch_to_dual(self, h_dict: Dict[str, torch.Tensor], n_type: str) -> None:
+        """If the encoder exposes two per-node views (e.g. SRA-HGCN), switch the
+        contrastive loss to the dual-view objective. Safe to call every batch."""
+        if self.contrastive_sampler is None or self.no_contrastive or self.contrastive_weight <= 0.0:
+            return
+        if self.dual_view:
+            return
+        pos_k = f"{n_type}_pos"
+        neg_k = f"{n_type}_neg"
+        if pos_k in h_dict and neg_k in h_dict and n_type in h_dict:
+            z = h_dict[n_type]
+            zp = h_dict[pos_k]
+            if z.dim() == 2 and zp.dim() == 2 and z.size(1) == 2 * zp.size(1):
+                self.dual_view = True
+                self.contrastive_loss_fn = DualContrastiveInstanceLoss()
 
     def _iterate_batches(self, idx: torch.Tensor, z: torch.Tensor,
         train: bool = True) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -180,6 +199,7 @@ class Train:
                 self.contrastive_sampler.prepare_batch(batch)
             optimizer.zero_grad()
             h_dict = self.model.encode(batch)
+            self._maybe_switch_to_dual(h_dict, n_type)
             z = h_dict[n_type]
             del h_dict
             edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
@@ -305,6 +325,7 @@ class Train:
                         self.contrastive_sampler.prepare_batch(self.graph)
                     optimizer.zero_grad()
                     h_dict = self.model.encode(self.graph)
+                    self._maybe_switch_to_dual(h_dict, n_type)
                     z_train = h_dict[n_type]
 
                     train_bce, train_contr, _, _, train_total_loss = self._iterate_batches(
