@@ -9,7 +9,7 @@ class GCN(nn.Module):
     Homogeneous GCN model for link classification (PyTorch Geometric).
 
     Args:
-        in_feats (Dict[str, int]): Input feature sizes for node type. Only the first value is used.
+        in_dim (Dict[str, int]): Input feature sizes for node type. Only the first value is used.
         hidden_dim (int): Hidden embedding dimension.
         out_dim (int): Output dimension for classification (e.g., number of classes).
         n_layers (int): Number of GCN layers.
@@ -20,7 +20,7 @@ class GCN(nn.Module):
 
     def __init__(
         self,
-        in_feats: Dict[str, int],
+        in_dim: Dict[str, int],
         hidden_dim: int,
         out_dim: int,
         n_layers: int = 2,
@@ -29,7 +29,7 @@ class GCN(nn.Module):
         e_etypes: List[Tuple[str, str, str]] = None,
     ):
         super().__init__()
-        input_dim = list(in_feats.values())[0]
+        input_dim = list(in_dim.values())[0]
         self.n_type = n_type
         self.ppi_etype = ppi_etype
 
