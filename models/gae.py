@@ -1,236 +1,451 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import dgl
-from dgl.nn import GraphConv, SAGEConv, GATConv, GINConv
-from typing import Tuple, List
-class Hadamard_MLPPredictor(nn.Module):
-    def __init__(self, h_feats, dropout, layer=5, res=True, norm=False, scale=False):
-        super().__init__()
-        self.lins = torch.nn.ModuleList()
-        self.lins.append(torch.nn.Linear(h_feats, h_feats))
-        for _ in range(layer - 2):
-            self.lins.append(torch.nn.Linear(h_feats, h_feats))
-        self.lins.append(torch.nn.Linear(h_feats, 1))
-        self.dropout = dropout
-        self.res = res
-        self.scale = scale
-        if scale: self.scale_norm = nn.LayerNorm(h_feats)
-        self.norm = norm
-        if norm:
-            self.norms = torch.nn.ModuleList()
-            for _ in range(layer - 1):
-                self.norms.append(nn.LayerNorm(h_feats))
-        self.act = F.relu
+from torch import Tensor
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.nn import GCNConv
+from torch_geometric.utils import dropout_edge, add_self_loops
+from typing import Dict, List, Optional, Tuple
 
-    def forward(self, x_i, x_j):
-        x = x_i * x_j
-        if self.scale:
-            x = self.scale_norm(x)
-        ori = x
-        for i in range(len(self.lins) - 1):
-            x = self.lins[i](x)
-            if self.res:
-                x += ori
-            if self.norm:
-                x = self.norms[i](x)
-            x = self.act(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.lins[-1](x)
-        return x.squeeze()
-class DotPredictor(nn.Module):
-    def __init__(self):
-        super().__init__()
 
-    def forward(self, x_i, x_j):
-        x = (x_i * x_j).sum(dim=-1)
-        return x.squeeze()
-class LorentzPredictor(nn.Module):
-    def __init__(self):
-        super().__init__()
+def drop_edge_pyg(edge_index: Tensor, num_nodes: int, p: float = 0.2) -> Tensor:
+    """Drop a fraction of edges and add self-loops (PyG)."""
+    if edge_index.numel() == 0:
+        edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+        return edge_index
+    edge_index, _ = dropout_edge(edge_index, p=p, force_undirected=False)
+    edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+    return edge_index
 
-    def forward(self, x_i, x_j):
-        n = x_i.size(1)
-        x = torch.sum(x_i[:, 0:n//2] * x_j[:, 0:n//2], dim=-1) - torch.sum(x_i[:, n//2:] * x_j[:, n//2:], dim=-1)
-        return x.squeeze()
 
-def drop_edge(g, dpe = 0.2):
-    g = g.clone()
-    eids = torch.randperm(g.number_of_edges())[:int(g.number_of_edges() * dpe)].to(g.device)
-    g.remove_edges(eids)
-    g = dgl.add_self_loop(g)
-    return g
 class MLP(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, dropout=0.2,
-                 norm=False, tailact=False, norm_affine=True):
-        super(MLP, self).__init__()
-        self.lins = torch.nn.Sequential()
-        self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        n_layers: int = 2,
+        dropout: float = 0.2,
+        norm: bool = False,
+        tailact: bool = False,
+        norm_affine: bool = True
+    ):
+        super().__init__()        
+        layers: List[nn.Module] = []
+        layers.append(nn.Linear(in_dim, hidden_dim))
         if norm:
-            self.lins.append(nn.LayerNorm(hidden_channels, elementwise_affine=norm_affine))
-        self.lins.append(nn.ReLU())
+            layers.append(nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine))
+        layers.append(nn.ReLU())
         if dropout > 0:
-            self.lins.append(nn.Dropout(dropout))
-        for _ in range(num_layers - 2):
-            self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
-            if norm:
-                self.lins.append(nn.LayerNorm(hidden_channels), elementwise_affine=norm_affine)
-            self.lins.append(nn.ReLU())
-            if dropout > 0:
-                self.lins.append(nn.Dropout(dropout))
-        self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
-        if tailact:
-            self.lins.append(nn.LayerNorm(out_channels), elementwise_affine=norm_affine)
-            self.lins.append(nn.ReLU())
-            self.lins.append(nn.Dropout(dropout))
+            layers.append(nn.Dropout(dropout))
 
-    def forward(self, x):
-        x = self.lins(x)
-        return x.squeeze()
-    
+        for _ in range(max(n_layers - 2, 0)):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            if norm:
+                layers.append(nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        if tailact:
+            layers.append(nn.LayerNorm(out_dim, elementwise_affine=norm_affine))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
 
 
 class GCN_GAE(nn.Module):
     """
-    Refined-GAE model for link classification.
+    PyG version of your DGL Refined-GAE (link classification).
+
+    - Uses GCNConv (PyG) instead of DGL GraphConv
+    - Supports HeteroData or Data input
+    - Works with your trainer style via:
+        encode(data) -> {n_type: z}
+        score_triples(z, edge_index, rel_ids=None) -> (logits, probs)
+
+    Note: Your original DGL code uses GraphConv(input_dim, input_dim) (no change in dim),
+    then classifies concatenated pair embeddings. Here we use hidden_dim embeddings
+    and a classifier over [h_u || h_v].
     """
-    def __init__(self, in_feats, hidden_dim, out_dim: int, n_layers: int = 2,
-                relu=False, linear=False, prop_step=2, dropout=0.2, residual=0.1, 
-                e_etypes: List[Tuple[str, str, str]] = None,
-                ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"), n_type: str = "node"):
-        
-        super(GCN_GAE, self).__init__()
-        input_dim = list(in_feats.values())[0]
+    def __init__(
+        self,
+        in_dim: Dict[str, int],
+        hidden_dim: int,
+        out_dim: int,
+        n_layers: int = 2,
+        prop_step: int = 2,
+        dropout: float = 0.2,
+        residual: float = 0.1,
+        norm: bool = False,
+        relu: bool = True,
+        linear: bool = False,
+        ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"),
+        e_etypes: Optional[List[Tuple[str, str, str]]] = None,
+        n_type: str = "node",
+        tailact: bool = False,
+        norm_affine: bool = True,
+        e_etypes: List[Tuple[str, str, str]] = None,
+        drop_edge_p: float = 0.0,
+        add_self_loops_flag: bool = True,
+    ):
+        super().__init__()
         self.n_type = n_type
         self.ppi_etype = ppi_etype
-        self.conv1 = GraphConv(input_dim, input_dim)
-        self.conv2 = GraphConv(input_dim, input_dim)
-        self.relu = relu
-        self.prop_step = prop_step
-        self.residual = residual
-        self.linear = linear
-        if linear: self.mlps = nn.ModuleList([MLP(hidden_dim, hidden_dim, 2, dropout) for _ in range(prop_step)])
-        self.classify = nn.Linear(hidden_dim, out_dim)
-    
-    def forward(self, g, edge_index):
 
-        f = g.ndata['feat']
-        h = self.conv1(g, f).flatten(1) + self.residual * f
-        for i in range(1, self.prop_step):
-            h = F.relu(h)
-            if self.linear: h = self.mlps[i](h)
-            h = self.conv2(g, h).flatten(1) + self.residual * f
+        if isinstance(in_feats, dict):
+            in_dim = int(in_feats.get(n_type, list(in_feats.values())[0]))
+        else:
+            in_dim = int(in_feats)
 
-        src_ids, dst_ids = edge_index
-        hs = h[src_ids]
-        hd = h[dst_ids]
-        h_pair = torch.cat([hs, hd], dim=1)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        self.relu_flag = bool(relu)
+        self.linear = bool(linear)
+        self.prop_step = int(prop_step)
+        self.dropout = float(dropout)
+        self.residual = float(residual)
+        self.drop_edge_p = float(drop_edge_p)
+        self.add_self_loops_flag = bool(add_self_loops_flag)
+
+        # Project input -> hidden
+        self.in_proj = nn.Identity() if in_dim == self.hidden_dim else nn.Linear(in_dim, self.hidden_dim, bias=False)
+
+        # Two convs like your original (conv1 then repeated conv2)
+        self.conv1 = GCNConv(self.hidden_dim, self.hidden_dim, add_self_loops=False, normalize=True)
+        self.conv2 = GCNConv(self.hidden_dim, self.hidden_dim, add_self_loops=False, normalize=True)
+
+        if self.linear:
+            self.mlps = nn.ModuleList(
+                [MLP(self.hidden_dim, self.hidden_dim, self.hidden_dim, dropout=self.dropout) for _ in range(max(self.prop_step, 1))]
+            )
+        else:
+            self.mlps = None
+
+        # Link classifier over [h_u || h_v]
+        self.classify = nn.Linear(2 * self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim)
+
+    def _get_x_and_edge_index(self, data: Data | HeteroData) -> Tuple[Tensor, Tensor]:
+        # features
+        if isinstance(data, HeteroData):
+            nt = data[self.n_type]
+            x = getattr(nt, "x", None)
+            if x is None:
+                x = getattr(nt, "feat", None)
+            if x is None:
+                raise ValueError(f"{self.__class__.__name__}: expected data['{self.n_type}'].x (or .feat).")
+
+            # edges: prefer PPI
+            if self.ppi_etype in data.edge_types and "edge_index" in data[self.ppi_etype]:
+                eidx = data[self.ppi_etype].edge_index
+                if eidx is not None and eidx.numel() > 0:
+                    return x, eidx
+
+            # fallback: concat all edges
+            parts: List[Tensor] = []
+            for (_, rel, _), store in data.edge_items():
+                if "edge_index" in store and store.edge_index is not None and store.edge_index.numel() > 0:
+                    parts.append(store.edge_index)
+            if not parts:
+                return x, torch.empty((2, 0), dtype=torch.long, device=x.device)
+            return x, torch.cat(parts, dim=1)
+
+        # homogeneous Data
+        x = getattr(data, "x", None)
+        if x is None:
+            x = getattr(data, "feat", None)
+        if x is None:
+            raise ValueError(f"{self.__class__.__name__}: expected data.x (or data.feat) for homogeneous Data.")
+        edge_index = getattr(data, "edge_index", None)
+        if edge_index is None:
+            raise ValueError(f"{self.__class__.__name__}: expected data.edge_index for homogeneous Data.")
+        return x, edge_index
+
+    def encode(self, data: Data | HeteroData) -> Dict[str, Tensor]:
+        x, edge_index = self._get_x_and_edge_index(data)
+        x0 = self.in_proj(x)
+
+        # optional edge dropout + self-loops
+        if self.training and self.drop_edge_p > 0.0 and edge_index.numel() > 0:
+            edge_index, _ = dropout_edge(edge_index, p=self.drop_edge_p, force_undirected=False)
+        if self.add_self_loops_flag and x0.size(0) > 0:
+            edge_index, _ = add_self_loops(edge_index, num_nodes=x0.size(0))
+
+        # conv1
+        h = self.conv1(x0, edge_index) + self.residual * x0
+
+        # repeated conv2 (propagation steps)
+        for i in range(1, max(self.prop_step, 1)):
+            if self.relu_flag:
+                h = F.relu(h)
+            if self.mlps is not None:
+                h = self.mlps[min(i, len(self.mlps) - 1)](h)
+            h = self.conv2(h, edge_index) + self.residual * x0
+
+        return {self.n_type: h}
+
+    def score_triples(
+        self,
+        z: Tensor,
+        edge_index: Tensor,
+        rel_ids: Optional[Tensor] = None,  # ignored
+    ) -> Tuple[Tensor, Tensor]:
+        src, dst = edge_index
+        hs = z[src]
+        hd = z[dst]
+        h_pair = torch.cat([hs, hd], dim=-1)
         logits = self.classify(h_pair)
-        z = h
-        return z, torch.sigmoid(logits)
+
+        if logits.dim() == 2 and logits.size(1) == 1:
+            logits = logits.squeeze(1)
+        probs = torch.sigmoid(logits)
+        return logits, probs
+
+    def forward(self, data: Data | HeteroData, edge_index: Tensor):
+        h_dict = self.encode(data)
+        z = h_dict[self.n_type]
+        logits, probs = self.score_triples(z, edge_index, None)
+        return z, probs
 
 
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# import dgl
+# from dgl.nn import GraphConv, SAGEConv, GATConv, GINConv
+# from typing import Tuple, List
+# class Hadamard_MLPPredictor(nn.Module):
+#     def __init__(self, h_feats, dropout, layer=5, res=True, norm=False, scale=False):
+#         super().__init__()
+#         self.lins = torch.nn.ModuleList()
+#         self.lins.append(torch.nn.Linear(h_feats, h_feats))
+#         for _ in range(layer - 2):
+#             self.lins.append(torch.nn.Linear(h_feats, h_feats))
+#         self.lins.append(torch.nn.Linear(h_feats, 1))
+#         self.dropout = dropout
+#         self.res = res
+#         self.scale = scale
+#         if scale: self.scale_norm = nn.LayerNorm(h_feats)
+#         self.norm = norm
+#         if norm:
+#             self.norms = torch.nn.ModuleList()
+#             for _ in range(layer - 1):
+#                 self.norms.append(nn.LayerNorm(h_feats))
+#         self.act = F.relu
 
-class GCN_multilayers(nn.Module):
+#     def forward(self, x_i, x_j):
+#         x = x_i * x_j
+#         if self.scale:
+#             x = self.scale_norm(x)
+#         ori = x
+#         for i in range(len(self.lins) - 1):
+#             x = self.lins[i](x)
+#             if self.res:
+#                 x += ori
+#             if self.norm:
+#                 x = self.norms[i](x)
+#             x = self.act(x)
+#             x = F.dropout(x, p=self.dropout, training=self.training)
+#         x = self.lins[-1](x)
+#         return x.squeeze()
+# class DotPredictor(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+
+#     def forward(self, x_i, x_j):
+#         x = (x_i * x_j).sum(dim=-1)
+#         return x.squeeze()
+# class LorentzPredictor(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+
+#     def forward(self, x_i, x_j):
+#         n = x_i.size(1)
+#         x = torch.sum(x_i[:, 0:n//2] * x_j[:, 0:n//2], dim=-1) - torch.sum(x_i[:, n//2:] * x_j[:, n//2:], dim=-1)
+#         return x.squeeze()
+
+# def drop_edge(g, dpe = 0.2):
+#     g = g.clone()
+#     eids = torch.randperm(g.number_of_edges())[:int(g.number_of_edges() * dpe)].to(g.device)
+#     g.remove_edges(eids)
+#     g = dgl.add_self_loop(g)
+#     return g
+# class MLP(nn.Module):
+#     def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, dropout=0.2,
+#                  norm=False, tailact=False, norm_affine=True):
+#         super(MLP, self).__init__()
+#         self.lins = torch.nn.Sequential()
+#         self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
+#         if norm:
+#             self.lins.append(nn.LayerNorm(hidden_channels, elementwise_affine=norm_affine))
+#         self.lins.append(nn.ReLU())
+#         if dropout > 0:
+#             self.lins.append(nn.Dropout(dropout))
+#         for _ in range(num_layers - 2):
+#             self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
+#             if norm:
+#                 self.lins.append(nn.LayerNorm(hidden_channels), elementwise_affine=norm_affine)
+#             self.lins.append(nn.ReLU())
+#             if dropout > 0:
+#                 self.lins.append(nn.Dropout(dropout))
+#         self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
+#         if tailact:
+#             self.lins.append(nn.LayerNorm(out_channels), elementwise_affine=norm_affine)
+#             self.lins.append(nn.ReLU())
+#             self.lins.append(nn.Dropout(dropout))
+
+#     def forward(self, x):
+#         x = self.lins(x)
+#         return x.squeeze()
+    
+
+
+# class GCN_GAE(nn.Module):
+#     """
+#     Refined-GAE model for link classification.
+#     """
+#     def __init__(self, in_feats, hidden_dim, out_dim: int, n_layers: int = 2,
+#                 relu=False, linear=False, prop_step=2, dropout=0.2, residual=0.1, 
+#                 e_etypes: List[Tuple[str, str, str]] = None,
+#                 ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"), n_type: str = "node"):
         
-    def __init__(self, in_feats, h_feats, norm=False, dp4norm=0, drop_edge=False, relu=False, linear=False, prop_step=2, dropout=0.2, residual=0, conv='GCN'):
-        super(GCN_multilayers, self).__init__()
-        if conv == 'GCN':
-            self.convs = nn.ModuleList([GraphConv(in_feats, h_feats)])
-            for _ in range(prop_step - 1):
-                self.convs.append(GraphConv(h_feats, h_feats))
-        elif conv == 'SAGE':
-            self.convs = nn.ModuleList([SAGEConv(in_feats, h_feats, 'mean')])
-            for _ in range(prop_step - 1):
-                self.convs.append(SAGEConv(h_feats, h_feats, 'mean'))
-        elif conv == 'GAT':
-            self.convs = nn.ModuleList([GATConv(in_feats, h_feats // 4, 4)])
-            for _ in range(prop_step - 1):
-                self.convs.append(GATConv(h_feats, h_feats // 4, 4))
-        elif conv == 'GIN':
-            self.mlps = nn.ModuleList([MLP(in_feats, h_feats, 2, 0.2)])
-            self.convs = nn.ModuleList([GINConv(self.mlps[0], 'mean')])
-            for _ in range(prop_step - 1):
-                self.mlps.append(MLP(h_feats, h_feats, 2, 0.2))
-                self.convs.append(GINConv(self.mlps[-1], 'mean'))
-        self.norm = norm
-        self.drop_edge = drop_edge
-        self.relu = relu
-        self.prop_step = prop_step
-        self.residual = residual
-        self.linear = linear
-        if norm:
-            self.norms = nn.ModuleList([nn.LayerNorm(h_feats) for _ in range(prop_step)])
-        self.dp = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        if linear:
-            self.mlps = nn.ModuleList([MLP(h_feats, h_feats, 2, dropout) for _ in range(prop_step)])
-
-    def _apply_norm_and_activation(self, x, i):
-        if self.norm:
-            x = self.norms[i](x)
-        if self.relu:
-            x = F.relu(x)
-        x = self.dp(x)
-        return x
+#         super(GCN_GAE, self).__init__()
+#         input_dim = list(in_feats.values())[0]
+#         self.n_type = n_type
+#         self.ppi_etype = ppi_etype
+#         self.conv1 = GraphConv(input_dim, input_dim)
+#         self.conv2 = GraphConv(input_dim, input_dim)
+#         self.relu = relu
+#         self.prop_step = prop_step
+#         self.residual = residual
+#         self.linear = linear
+#         if linear: self.mlps = nn.ModuleList([MLP(hidden_dim, hidden_dim, 2, dropout) for _ in range(prop_step)])
+#         self.classify = nn.Linear(hidden_dim, out_dim)
     
-    def forward(self, g, in_feat):
-        ori = in_feat
-        if self.drop_edge:
-            g = drop_edge(g)
-        h = self.conv1(g, in_feat).flatten(1) + self.residual * ori
-        for i in range(1, self.prop_step):
-            h = self._apply_norm_and_activation(h, i)
-            if self.linear:
-                h = self.mlps[i](h)
-            h = self.conv2(g, h).flatten(1) + self.residual * ori
-        return h
+#     def forward(self, g, edge_index):
+
+#         f = g.ndata['feat']
+#         h = self.conv1(g, f).flatten(1) + self.residual * f
+#         for i in range(1, self.prop_step):
+#             h = F.relu(h)
+#             if self.linear: h = self.mlps[i](h)
+#             h = self.conv2(g, h).flatten(1) + self.residual * f
+
+#         src_ids, dst_ids = edge_index
+#         hs = h[src_ids]
+#         hd = h[dst_ids]
+#         h_pair = torch.cat([hs, hd], dim=1)
+#         logits = self.classify(h_pair)
+#         z = h
+#         return z, torch.sigmoid(logits)
+
+
+
+# class GCN_multilayers(nn.Module):
+        
+#     def __init__(self, in_feats, h_feats, norm=False, dp4norm=0, drop_edge=False, relu=False, linear=False, prop_step=2, dropout=0.2, residual=0, conv='GCN'):
+#         super(GCN_multilayers, self).__init__()
+#         if conv == 'GCN':
+#             self.convs = nn.ModuleList([GraphConv(in_feats, h_feats)])
+#             for _ in range(prop_step - 1):
+#                 self.convs.append(GraphConv(h_feats, h_feats))
+#         elif conv == 'SAGE':
+#             self.convs = nn.ModuleList([SAGEConv(in_feats, h_feats, 'mean')])
+#             for _ in range(prop_step - 1):
+#                 self.convs.append(SAGEConv(h_feats, h_feats, 'mean'))
+#         elif conv == 'GAT':
+#             self.convs = nn.ModuleList([GATConv(in_feats, h_feats // 4, 4)])
+#             for _ in range(prop_step - 1):
+#                 self.convs.append(GATConv(h_feats, h_feats // 4, 4))
+#         elif conv == 'GIN':
+#             self.mlps = nn.ModuleList([MLP(in_feats, h_feats, 2, 0.2)])
+#             self.convs = nn.ModuleList([GINConv(self.mlps[0], 'mean')])
+#             for _ in range(prop_step - 1):
+#                 self.mlps.append(MLP(h_feats, h_feats, 2, 0.2))
+#                 self.convs.append(GINConv(self.mlps[-1], 'mean'))
+#         self.norm = norm
+#         self.drop_edge = drop_edge
+#         self.relu = relu
+#         self.prop_step = prop_step
+#         self.residual = residual
+#         self.linear = linear
+#         if norm:
+#             self.norms = nn.ModuleList([nn.LayerNorm(h_feats) for _ in range(prop_step)])
+#         self.dp = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+#         if linear:
+#             self.mlps = nn.ModuleList([MLP(h_feats, h_feats, 2, dropout) for _ in range(prop_step)])
+
+#     def _apply_norm_and_activation(self, x, i):
+#         if self.norm:
+#             x = self.norms[i](x)
+#         if self.relu:
+#             x = F.relu(x)
+#         x = self.dp(x)
+#         return x
+    
+#     def forward(self, g, in_feat):
+#         ori = in_feat
+#         if self.drop_edge:
+#             g = drop_edge(g)
+#         h = self.conv1(g, in_feat).flatten(1) + self.residual * ori
+#         for i in range(1, self.prop_step):
+#             h = self._apply_norm_and_activation(h, i)
+#             if self.linear:
+#                 h = self.mlps[i](h)
+#             h = self.conv2(g, h).flatten(1) + self.residual * ori
+#         return h
 
     
-class PureGCN(nn.Module):
-    def __init__(self, input_dim, num_layers=2, hidden=256, dp=0, relu=False, norm=False, res=False):
-        super().__init__()
-        self.lin = nn.Linear(input_dim, hidden)
-        self.conv = GraphConv(hidden, hidden, weight=False, bias=False)
-        self.num_layers = num_layers
-        self.dp = dp
-        self.norm = norm
-        self.res = res
-        self.relu = relu
-        if self.norm:
-            self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(num_layers)])
+# class PureGCN(nn.Module):
+#     def __init__(self, input_dim, num_layers=2, hidden=256, dp=0, relu=False, norm=False, res=False):
+#         super().__init__()
+#         self.lin = nn.Linear(input_dim, hidden)
+#         self.conv = GraphConv(hidden, hidden, weight=False, bias=False)
+#         self.num_layers = num_layers
+#         self.dp = dp
+#         self.norm = norm
+#         self.res = res
+#         self.relu = relu
+#         if self.norm:
+#             self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(num_layers)])
 
-    def forward(self, adj_t, x, e_feat=None):
-        x = self.lin(x)
-        ori = x
-        for i in range(self.num_layers):
-            if i != 0 and self.res:
-                x = x + ori
-            if self.norm:
-                x = self.norms[i](x)
-            if self.relu:
-                x = F.relu(x)
-            if self.dp > 0:
-                x = F.dropout(x, p=self.dp, training=self.training)
-            x = self.conv(adj_t, x, edge_weight=e_feat)
-        return x
+#     def forward(self, adj_t, x, e_feat=None):
+#         x = self.lin(x)
+#         ori = x
+#         for i in range(self.num_layers):
+#             if i != 0 and self.res:
+#                 x = x + ori
+#             if self.norm:
+#                 x = self.norms[i](x)
+#             if self.relu:
+#                 x = F.relu(x)
+#             if self.dp > 0:
+#                 x = F.dropout(x, p=self.dp, training=self.training)
+#             x = self.conv(adj_t, x, edge_weight=e_feat)
+#         return x
 
-class PureGCN_no_para(nn.Module):
-    def __init__(self, input_dim, num_layers=2, relu=False, norm=False, res=False):
-        super().__init__()
-        self.conv = GraphConv(input_dim, input_dim, weight=False, bias=False)
-        self.num_layers = num_layers
-        self.norm = norm
-        self.res = res
-        self.relu = relu
+# class PureGCN_no_para(nn.Module):
+#     def __init__(self, input_dim, num_layers=2, relu=False, norm=False, res=False):
+#         super().__init__()
+#         self.conv = GraphConv(input_dim, input_dim, weight=False, bias=False)
+#         self.num_layers = num_layers
+#         self.norm = norm
+#         self.res = res
+#         self.relu = relu
 
-    def forward(self, adj_t, x, e_feat=None):
-        ori = x
-        for i in range(self.num_layers):
-            if i != 0 and self.res:
-                x = x + ori
-            if self.norm:
-                x = F.layer_norm(x, x.shape[1:])
-            if self.relu:
-                x = F.relu(x)
-            x = self.conv(adj_t, x, edge_weight=e_feat)
-        return x       
+#     def forward(self, adj_t, x, e_feat=None):
+#         ori = x
+#         for i in range(self.num_layers):
+#             if i != 0 and self.res:
+#                 x = x + ori
+#             if self.norm:
+#                 x = F.layer_norm(x, x.shape[1:])
+#             if self.relu:
+#                 x = F.relu(x)
+#             x = self.conv(adj_t, x, edge_weight=e_feat)
+#         return x       
