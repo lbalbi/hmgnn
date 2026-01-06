@@ -14,7 +14,7 @@ class Train:
         pstatement_sampler=False, nstatement_sampler=False, rstatement_sampler=False,
         contrastive_weight=0.1, state_list=None, no_contrastive=False,
         val_edges: torch.Tensor = None, val_edge_batch_size: int = None, patience: int = 20,
-        use_huri_neg_ppi=False):
+        neg_ppi_edge_index: torch.Tensor = None):
 
         self.device = device
         self.log = log
@@ -23,7 +23,7 @@ class Train:
         self.lrs = lrs
         self.model = model.to(self.device)
         self._init_state = copy.deepcopy(self.model.state_dict())
-        self.use_huri_neg_ppi = use_huri_neg_ppi
+        self.neg_ppi_edge_index = neg_ppi_edge_index
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
         self.e_type = e_type

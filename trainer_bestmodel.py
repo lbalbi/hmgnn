@@ -38,13 +38,15 @@ class Train_BestModel:
         full_graph, e_type, log, device, task, lr=0.001, mcfg=None, cfg=None,
         pstatement_sampler=False, nstatement_sampler=False, rstatement_sampler=False,
         contrastive_weight=0.1, gda_negs=None, state_list=None, no_contrastive=False,
-        val_edges: torch.Tensor = None, val_edge_batch_size: int = None, patience: int = 20):
+        val_edges: torch.Tensor = None, val_edge_batch_size: int = None, patience: int = 20,
+        neg_ppi_edge_index: torch.Tensor = None):
 
         self.model = model.to(device)
         self.best_lr = lr
         self.train_loader = list(train_loader)
         self.val_loader = list(val_loader)
         self.e_type = e_type
+        self.neg_ppi_edge_index = neg_ppi_edge_index
         self.rstatement_sampler = rstatement_sampler
         self.pstatement_sampler = pstatement_sampler
         self.nstatement__sampler = nstatement_sampler
@@ -356,11 +358,13 @@ class Test_BestModel:
         gda_negs=None,
         test_edges: torch.Tensor = None,
         test_edge_batch_size: int = None,
+        neg_ppi_edge_index: torch.Tensor = None
     ):
         self.model = model.to(device)
         self.test_loader = list(test_loader)
         self.e_type = e_type
         self.log = log
+        self.neg_ppi_edge_index = neg_ppi_edge_index
         self.device = device
         self.task = task
         self.gda_negs = gda_negs

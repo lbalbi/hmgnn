@@ -46,7 +46,18 @@ def main():
     dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatement_sampler,
         use_nstatement_sampler=args.use_nstatement_sampler, use_rstatement_sampler=args.use_rstatement_sampler)
 
-    use_huri_neg_ppi = (args.task.lower() == "huri")
+    neg_ppi_edge_index = None
+    if str(args.task).lower() == "huri":
+        # For HURI we want to *use* neg_PPI for classification, but NOT include it in the message-passing graph.
+        neg = data_dict.pop("neg_PPI", None)
+        if neg is None:
+            print("[WARN] --task huri set but no edge_type=='neg_PPI' found in the data files. Falling back to random negative sampling.", flush=True)
+        else:
+            neg_ppi_edge_index = torch.stack([neg[0], neg[1]], dim=0)
+        # Safety: ensure neg_PPI is not used as a message-passing relation (even if present in config)
+        if ["node", "neg_PPI", "node"] in mcfg.get("edge_types", []):
+            mcfg["edge_types"].remove(["node", "neg_PPI", "node"])
+
 
     state_list = None
     if args.use_pstatement_sampler or args.use_nstatement_sampler: state_list = dl.get_state_list()
@@ -212,7 +223,7 @@ def main():
             pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
             rstatement_sampler=args.use_rstatement_sampler,
             task=args.task, gda_negs=gda_negs, no_contrastive=args.no_contrastive, patience=args.patience,
-            use_huri_neg_ppi=use_huri_neg_ppi)
+            neg_ppi_edge_index=neg_ppi_edge_index)
 
         lr, loss, _, epoch_, alpha_ = trainer.run()
         best_epochs.append(epoch_)
@@ -279,13 +290,13 @@ def main():
         contrastive_weight=best_alpha, state_list=state_list,
         pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
         rstatement_sampler=args.use_rstatement_sampler, gda_negs=gda_negs, no_contrastive=args.no_contrastive, 
-        patience=args.patience)
+        patience=args.patience, neg_ppi_edge_index=neg_ppi_edge_index)
     loss, (pred, _) = final_trainer.run()
     print(f"Final training loss: {loss:.4f}", flush=True)
     
     final_log_test = Logger("final_test", dir=args.output_dir)
     tester = Test_BestModel(final_model, test_loader=test_loader, e_type=ppi_rel, test_edges=test_ppis, test_edge_batch_size=args.batch_size,
-    log=final_log_test, test_graph=test_graph, full_graph=full_graph, device=device, task=args.task, gda_negs=gda_negs)
+    log=final_log_test, test_graph=test_graph, full_graph=full_graph, device=device, task=args.task, gda_negs=gda_negs, neg_ppi_edge_index=neg_ppi_edge_index)
     tester.run()
 
 if __name__ == "__main__":
