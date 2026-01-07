@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=huri_perPPI_hgcn
-#SBATCH --array=2-2
+#SBATCH --array=3-3
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
