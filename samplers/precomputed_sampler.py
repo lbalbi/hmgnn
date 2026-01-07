@@ -41,8 +41,13 @@ class PrecomputedNegativeSampler:
             else (torch.device(device) if device is not None else neg_edge_index.device)
         )
 
-        neg_src = neg_edge_index[0].long().cpu()
-        neg_dst = neg_edge_index[1].long().cpu()
+        # neg_src = neg_edge_index[0].long().cpu()
+        # neg_dst = neg_edge_index[1].long().cpu()
+        # treats neg_PPI as undirected by adding reverse edges
+        neg_src0 = neg_edge_index[0].long().cpu()
+        neg_dst0 = neg_edge_index[1].long().cpu()
+        neg_src = torch.cat([neg_src0, neg_dst0], dim=0)
+        neg_dst = torch.cat([neg_dst0, neg_src0], dim=0)
 
         # Filter out overlaps with positives (and optionally reverse overlaps).
         if all_pos_edge_index is not None and all_pos_edge_index.numel() > 0:
@@ -91,7 +96,52 @@ class PrecomputedNegativeSampler:
             raise ValueError(f"pos_edge_index must have shape [2, N], got {tuple(pos_edge_index.shape)}")
         return self.sample_for_sources(pos_edge_index[0].long().to(self.device))
 
+
     def sample_for_sources(self, pos_src: Tensor) -> Tensor:
+        pos_src = pos_src.long().to(self.device)
+        if pos_src.numel() == 0:
+            return torch.empty(2, 0, dtype=torch.long, device=self.device)
+
+        uniq, counts = torch.unique(pos_src, return_counts=True)
+        sampled_src_parts = []
+        sampled_dst_parts = []
+        missing_sources = []
+
+        for s, c in zip(uniq.tolist(), counts.tolist()):
+            start, end = self._range_for_src(int(s))
+            if start < 0:
+                # STRICT-FREE BEHAVIOR: no precomputed negatives for this source -> skip it
+                missing_sources.append(int(s))
+                continue
+
+            pool_len = end - start
+            idx = torch.randint(0, pool_len, (int(c),), device=self.device)
+            dst = self.dst_sorted[start + idx]
+            sampled_src_parts.append(torch.full((int(c),), int(s), device=self.device, dtype=torch.long))
+            sampled_dst_parts.append(dst)
+
+        if len(sampled_src_parts) == 0:
+            # No negatives available for any source in this batch
+            return torch.empty(2, 0, dtype=torch.long, device=self.device)
+
+        neg_src = torch.cat(sampled_src_parts, dim=0)
+        neg_dst = torch.cat(sampled_dst_parts, dim=0)
+
+        perm = torch.randperm(neg_src.numel(), device=self.device)
+        neg_src = neg_src[perm]
+        neg_dst = neg_dst[perm]
+
+        if missing_sources:
+            print(
+                f"[WARN] Missing neg_PPI for {len(missing_sources)} sources in this batch "
+                f"(example: {missing_sources[:5]}). Using ONLY available neg_PPI edges.",
+                flush=True
+            )
+
+        return torch.stack([neg_src, neg_dst], dim=0)
+
+
+    # def sample_for_sources(self, pos_src: Tensor) -> Tensor:
         """Given a vector of positive sources (length N), sample N negatives from the precomputed pool."""
         pos_src = pos_src.long().to(self.device)
         if pos_src.numel() == 0:

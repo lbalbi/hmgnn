@@ -7,7 +7,6 @@ from samplers import ( NegativeStatementSampler, PartialStatementSampler, Partia
     NegativeSampler, PrecomputedNegativeSampler, RandomStatementSampler, RandomProteinSampler, NegativeProteinSampler)
 from losses import DualContrastiveLoss_CE, DualContrastiveLoss_Margin, ComposedContrastiveLoss_CE, ProteinContrastiveLoss
 
-
 class Train:
     def __init__(self, model, epochs, train_loader, val_loader, full_graph,
         full_cvgraph, e_type, log, device, task, lrs=[0.001], gda_negs=None,
