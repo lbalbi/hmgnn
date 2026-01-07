@@ -21,5 +21,8 @@ python -u main.py \
   --model "ra_hgcn" \
   --batch_size 2096 \
   --epochs 200 \
+  --finaltrain_only \
+  --final_lr 0.005 \
+  --final_epochs 39 \
   --output_dir "wikidata_protCL_NEW/output_wikidata_protCL_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1

@@ -151,6 +151,13 @@ def main():
         help="Use RandomStatementSampler for negative statements.")
     parser.add_argument("--no_contrastive", action="store_true",
         help="Disable contrastive learning with statement samplers.")
+    parser.add_argument("--finaltrain_only", action="store_true",
+        help="Skip cross-validation and run ONLY final training + testing.")
+    parser.add_argument("--final_lr", type=float, default=None,
+        help="Learning rate for final training when --final_only is set.")
+    parser.add_argument("--final_epochs", type=int, default=None,
+        help="Number of epochs for final training when --final_only is set.")
+
     args = parser.parse_args()
     print("output_dir:", args.output_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -290,78 +297,90 @@ def main():
 
     neighbor_sizes = [15, 10]
     num_cls_triples = cls_heads.size(0)
-    kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
     best_epochs: List[int] = []
     best_lrs: List[float] = []
     cv_metrics: List[torch.Tensor] = []
 
-    for fold, (train_idx_np, val_idx_np) in enumerate(
-        kf.split(range(num_cls_triples)), start=1):
-        train_idx = torch.tensor(train_idx_np, dtype=torch.long)
-        val_idx = torch.tensor(val_idx_np, dtype=torch.long)
+    if args.finaltrain_only: # skip CV for final training/testing.
+        if args.final_lr is None or args.final_epochs is None:
+            raise ValueError("When using --final_only you must provide BOTH --final_lr and --final_epochs")
+        final_lr = float(args.final_lr)
+        final_epochs = int(args.final_epochs)
+        print("\n=== Final-only mode (CV skipped) ===", flush=True)
+        print(f"Using user-provided final epochs: {final_epochs}", flush=True)
+        print(f"Using user-provided final lr:     {final_lr}", flush=True)
 
-        train_nodes = torch.unique(torch.cat([cls_heads[train_idx], cls_tails[train_idx]], dim=0))
-        val_nodes = torch.unique(torch.cat([cls_heads[val_idx], cls_tails[val_idx]], dim=0))
-        num_neighbors = [20, 10]
-        train_loader = NeighborLoader(encoder_graph, input_nodes=("node", train_nodes),
-            num_neighbors=num_neighbors, batch_size=args.batch_size, shuffle=True, num_workers=2,
-             persistent_workers=True, pin_memory=(device.type == "cuda"))
-        val_loader = NeighborLoader(encoder_graph, input_nodes=("node", val_nodes),
-            num_neighbors=num_neighbors, batch_size=args.batch_size, shuffle=False, num_workers=2,
-             persistent_workers=True, pin_memory=(device.type == "cuda"))
-        print(f"\n=== Fold {fold}/{k_folds} ===", flush=True)
-        print(f"  Train classification triples: {train_idx.numel()} | "
-            f"Val classification triples: {val_idx.numel()}", flush=True)
+    else:    
+        kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
 
-        fold_graph = encoder_graph
-        base_model_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
-            out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=list(fold_graph.edge_types),
-            n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
-        if args.model in ("ra_hgcn", "sra_hgcn", "gcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
-        #if args.model in ("gcn","ra_hgcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
-        else: model_fold = ModelCls(**base_model_kwargs).to(device)
-        sampler_graph = struct_graph
-        if not args.no_contrastive:
-            if use_random_sampler:
-                random_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                random_sampler.prepare_global(sampler_graph)
-                neg_stmt_sampler = random_sampler
-            elif use_partial_sampler:
-                edges_are_negative = nflag
-                neg_stmt_sampler = PartialInstanceSampler(k=contrastive_k, neg_edges=external_edges,
-                    edges_are_negative=edges_are_negative)
-                neg_stmt_sampler.prepare_global(sampler_graph)
-            else:
-                # neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k, subclass_rel=subclass_rel, 
-                #    neg_prefix="NOT_", instance_rel=instance_rel)
-                neg_stmt_sampler = NegativeInstanceSampler(k=contrastive_k, subclass_rel=subclass_rel, 
-                   neg_prefix="NOT_", instance_rel=instance_rel)                
-                neg_stmt_sampler.prepare_global(sampler_graph)
-        else: neg_stmt_sampler = None
 
-        log_fold = Logger(f"train_cv_fold{fold}", dir=args.output_dir)
-        trainer_fold = Train(model=model_fold, graph=fold_graph, heads=cls_heads,
-            rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr_candidates=lr_candidates,
-            epochs=args.epochs, device=device, log=log_fold, batch_size=args.batch_size,
-            val_ratio=0.0, early_stopping_patience=cfg.get("patience", 15), train_idx=train_idx,
-            val_idx=val_idx, contrastive_sampler=neg_stmt_sampler, contrastive_weight=contrastive_weight,
-            train_loader=train_loader, val_loader=val_loader, no_contrastive = args.no_contrastive)
+        for fold, (train_idx_np, val_idx_np) in enumerate(
+            kf.split(range(num_cls_triples)), start=1):
+            train_idx = torch.tensor(train_idx_np, dtype=torch.long)
+            val_idx = torch.tensor(val_idx_np, dtype=torch.long)
 
-        best_val_loss, best_epoch, best_metrics, best_lr = trainer_fold.run()
-        best_epochs.append(int(best_epoch if best_epoch is not None else args.epochs))
-        best_lrs.append(float(best_lr) if best_lr is not None else lr_candidates[0])
-        if best_metrics is not None: cv_metrics.append(best_metrics)
+            train_nodes = torch.unique(torch.cat([cls_heads[train_idx], cls_tails[train_idx]], dim=0))
+            val_nodes = torch.unique(torch.cat([cls_heads[val_idx], cls_tails[val_idx]], dim=0))
+            num_neighbors = [20, 10]
+            train_loader = NeighborLoader(encoder_graph, input_nodes=("node", train_nodes),
+                num_neighbors=num_neighbors, batch_size=args.batch_size, shuffle=True, num_workers=2,
+                persistent_workers=True, pin_memory=(device.type == "cuda"))
+            val_loader = NeighborLoader(encoder_graph, input_nodes=("node", val_nodes),
+                num_neighbors=num_neighbors, batch_size=args.batch_size, shuffle=False, num_workers=2,
+                persistent_workers=True, pin_memory=(device.type == "cuda"))
+            print(f"\n=== Fold {fold}/{k_folds} ===", flush=True)
+            print(f"  Train classification triples: {train_idx.numel()} | "
+                f"Val classification triples: {val_idx.numel()}", flush=True)
 
-    if best_epochs: final_epochs = int(statistics.median(best_epochs))
-    else: final_epochs = args.epochs
-    if best_lrs: final_lr = float(statistics.median(best_lrs))
-    else: final_lr = lr_candidates[0]
+            fold_graph = encoder_graph
+            base_model_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
+                out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=list(fold_graph.edge_types),
+                n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
+            if args.model in ("ra_hgcn", "sra_hgcn", "gcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
+            #if args.model in ("gcn","ra_hgcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
+            else: model_fold = ModelCls(**base_model_kwargs).to(device)
+            sampler_graph = struct_graph
+            if not args.no_contrastive:
+                if use_random_sampler:
+                    random_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                    random_sampler.prepare_global(sampler_graph)
+                    neg_stmt_sampler = random_sampler
+                elif use_partial_sampler:
+                    edges_are_negative = nflag
+                    neg_stmt_sampler = PartialInstanceSampler(k=contrastive_k, neg_edges=external_edges,
+                        edges_are_negative=edges_are_negative)
+                    neg_stmt_sampler.prepare_global(sampler_graph)
+                else:
+                    # neg_stmt_sampler = NegativeStatementSampler(k=contrastive_k, subclass_rel=subclass_rel, 
+                    #    neg_prefix="NOT_", instance_rel=instance_rel)
+                    neg_stmt_sampler = NegativeInstanceSampler(k=contrastive_k, subclass_rel=subclass_rel, 
+                    neg_prefix="NOT_", instance_rel=instance_rel)                
+                    neg_stmt_sampler.prepare_global(sampler_graph)
+            else: neg_stmt_sampler = None
 
-    print("\n=== Cross-validation summary ===", flush=True)
-    print(f"Per-fold best epochs: {best_epochs}", flush=True)
-    print(f"Per-fold best learning rates: {best_lrs}", flush=True)
-    print(f"Chosen number of epochs for final training (median): {final_epochs}", flush=True)
-    print(f"Chosen learning rate for final training (median):  {final_lr}", flush=True)
+            log_fold = Logger(f"train_cv_fold{fold}", dir=args.output_dir)
+            trainer_fold = Train(model=model_fold, graph=fold_graph, heads=cls_heads,
+                rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr_candidates=lr_candidates,
+                epochs=args.epochs, device=device, log=log_fold, batch_size=args.batch_size,
+                val_ratio=0.0, early_stopping_patience=cfg.get("patience", 15), train_idx=train_idx,
+                val_idx=val_idx, contrastive_sampler=neg_stmt_sampler, contrastive_weight=contrastive_weight,
+                train_loader=train_loader, val_loader=val_loader, no_contrastive = args.no_contrastive)
+
+            best_val_loss, best_epoch, best_metrics, best_lr = trainer_fold.run()
+            best_epochs.append(int(best_epoch if best_epoch is not None else args.epochs))
+            best_lrs.append(float(best_lr) if best_lr is not None else lr_candidates[0])
+            if best_metrics is not None: cv_metrics.append(best_metrics)
+
+        if best_epochs: final_epochs = int(statistics.median(best_epochs))
+        else: final_epochs = args.epochs
+        if best_lrs: final_lr = float(statistics.median(best_lrs))
+        else: final_lr = lr_candidates[0]
+
+        print("\n=== Cross-validation summary ===", flush=True)
+        print(f"Per-fold best epochs: {best_epochs}", flush=True)
+        print(f"Per-fold best learning rates: {best_lrs}", flush=True)
+        print(f"Chosen number of epochs for final training (median): {final_epochs}", flush=True)
+        print(f"Chosen learning rate for final training (median):  {final_lr}", flush=True)
 
     final_nodes = torch.unique(torch.cat([cls_heads, cls_tails], dim=0))
     final_loader = NeighborLoader(encoder_graph, input_nodes=("node", final_nodes),
@@ -384,7 +403,7 @@ def main():
             final_contrastive_sampler.prepare_global(struct_graph)
         elif use_partial_sampler:
             edges_are_negative = nflag
-            final_contrastive_sampler = PartialStatementSampler(k=contrastive_k,
+            final_contrastive_sampler = PartialInstanceSampler(k=contrastive_k,
                 neg_edges=external_edges, edges_are_negative=edges_are_negative)
             final_contrastive_sampler.prepare_global(struct_graph)
         else:
@@ -414,10 +433,12 @@ def main():
 
     test_log = Logger("test_global", dir=args.output_dir)
 
-    del final_loader, final_trainer, train_loader, val_loader, trainer_fold
+    # clean up memory
+    for name in ["final_loader", "final_trainer", "train_loader", "val_loader", "trainer_fold"]:
+        if name in locals(): del locals()[name]
     import gc
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     model_path = os.path.join("output/"+ args.output_dir, f"final_model_{args.model}.pt")
     torch.save(final_model.state_dict(), model_path)
