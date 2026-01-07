@@ -46,6 +46,7 @@ def main():
     dl = DataLoader(args.path + "/", use_pstatement_sampler=args.use_pstatement_sampler,
         use_nstatement_sampler=args.use_nstatement_sampler, use_rstatement_sampler=args.use_rstatement_sampler)
 
+    data_dict = dl.get_data()
     neg_ppi_edge_index = None
     if str(args.task).lower() == "huri":
         # For HURI we want to *use* neg_PPI for classification, but NOT include it in the message-passing graph.
@@ -66,7 +67,7 @@ def main():
     elif args.use_nstatement_sampler and ["node","neg_statement","node"] in mcfg["edge_types"]:
         mcfg["edge_types"].remove(["node","neg_statement","node"])
 
-    full_graph = dl.make_data_graph(dl.get_data())
+    full_graph = dl.make_data_graph(data_dict)
     ppi_rel = mcfg["ppi_etype"][1] if isinstance(mcfg["ppi_etype"], (list, tuple)) else mcfg["ppi_etype"]
     ppi_key = next((et for et in full_graph.edge_types if et[1] == ppi_rel), None)
     ppi_ei = full_graph[ppi_key].edge_index

@@ -75,10 +75,27 @@ class Train:
         #self.neg_sampler = NegativeSampler(full_graph, edge_type=("node", self.e_type, "node"), device=self.device)
         ppi_key = next(et for et in full_graph.edge_types if et[1] == self.e_type)
         all_pos_edge_index = full_graph[ppi_key].edge_index
-        self.neg_sampler = NegativeSampler(full_cvgraph, edge_type=("node", self.e_type, "node"),
-            all_pos_edge_index=all_pos_edge_index)
+        # self.neg_sampler = NegativeSampler(full_cvgraph, edge_type=("node", self.e_type, "node"),
+        #     all_pos_edge_index=all_pos_edge_index)
 
-
+        # === PPI negative sampling ===
+        # For HURI, negatives are provided explicitly in the data as edge_type == 'neg_PPI'.
+        self.use_precomputed_negatives = (str(self.task).lower() == 'huri' and self.neg_ppi_edge_index is not None)
+        if self.use_precomputed_negatives:
+            ntype = self.n_type if hasattr(full_graph, 'node_types') and self.n_type in full_graph.node_types else 'node'
+            num_nodes = int(getattr(full_graph[ntype], 'num_nodes', 0) or (full_graph[ntype].x.size(0) if 'x' in full_graph[ntype] else 0))
+            self.neg_sampler = PrecomputedNegativeSampler(
+                self.neg_ppi_edge_index,
+                num_nodes=num_nodes,
+                device=self.device,
+                all_pos_edge_index=all_pos_edge_index,
+            )
+        else:
+            self.neg_sampler = NegativeSampler(
+                full_cvgraph,
+                edge_type=("node", self.e_type, "node"),
+                all_pos_edge_index=all_pos_edge_index,
+            )
 
     def _to_homogeneous_pyg(self, hetero):
         """ Convert HeteroData -> homogeneous Data and return (hom_data, offsets).
@@ -121,8 +138,12 @@ class Train:
 
         if pos_index is None: pos_index = _get_pos_edge_index(self.model, self.e_type, graph)
         pos_index = pos_index.to(self.device)
-        neg_src, neg_dst = self.neg_sampler.sample(pos_index.size(1))
-        neg_index = torch.stack([neg_src, neg_dst], dim=0)
+        if getattr(self, 'use_precomputed_negatives', False):
+            # Source-split safe: sample negatives only for sources present in this positive batch.
+            neg_index = self.neg_sampler.sample_like(pos_index)
+        else:
+            neg_src, neg_dst = self.neg_sampler.sample(pos_index.size(1))
+            neg_index = torch.stack([neg_src, neg_dst], dim=0)
         edge_index = torch.cat([pos_index, neg_index], dim=1)
         labels = torch.cat([torch.ones(pos_index.size(1), device=self.device),
                 torch.zeros(neg_index.size(1), device=self.device),], dim=0)

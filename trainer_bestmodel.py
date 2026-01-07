@@ -78,10 +78,23 @@ class Train_BestModel:
         ppi_key = next(et for et in self.full_graph.edge_types if et[1] == e_type)
         all_pos_edge_index = self.full_graph[ppi_key].edge_index
 
-        self.neg_sampler = NegativeSampler(self.full_cvgraph, edge_type=("node", e_type, "node"),
-            all_pos_edge_index=all_pos_edge_index)    
-        #self.neg_sampler = NegativeSampler(full_cvgraph, edge_type=("node", e_type, "node"),device=self.device)
-        
+        # === PPI negative sampling ===
+        self.use_precomputed_negatives = (str(task).lower() == 'huri' and self.neg_ppi_edge_index is not None)
+        if self.use_precomputed_negatives:
+            ntype = getattr(self.model, 'n_type', 'node')
+            ntype = ntype if hasattr(self.full_graph, 'node_types') and ntype in self.full_graph.node_types else 'node'
+            num_nodes = int(getattr(self.full_graph[ntype], 'num_nodes', 0) or (self.full_graph[ntype].x.size(0) if 'x' in self.full_graph[ntype] else 0))
+            self.neg_sampler = PrecomputedNegativeSampler(
+                self.neg_ppi_edge_index,
+                num_nodes=num_nodes,
+                device=self.device,
+                all_pos_edge_index=all_pos_edge_index,
+            )
+        else:
+            self.neg_sampler = NegativeSampler(
+                self.full_cvgraph, edge_type=("node", e_type, "node"),
+                all_pos_edge_index=all_pos_edge_index)
+         
         self.loss_fn = torch.nn.BCELoss()
         self.contrastive = ProteinContrastiveLoss()
         # self.contrastive = DualContrastiveLoss_CE()
@@ -111,9 +124,14 @@ class Train_BestModel:
                 # neg_statement_index = self.neg_statement_sampler.sample()
             elif self.no_contrastive: pass
             else: self.neg_statement_sampler.prepare_batch(batch, pos_edge_index)
+            if self.use_precomputed_negatives:
+                neg_edge_index = self.neg_sampler.sample_like(pos_edge_index)
+            else:
+                neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
+                neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
 
-            neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
-            neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+            # neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
+            #neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
             edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
             labels = torch.cat([torch.ones(pos_edge_index.size(1), device=self.device),
                 torch.zeros(neg_edge_index.size(1), device=self.device)],dim=0)
@@ -161,8 +179,14 @@ class Train_BestModel:
                 end = min(start + batch_size, num_pos)
                 pos_edge_index = pos_edges[:, start:end]
 
-                neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
-                neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+                if self.use_precomputed_negatives:
+                    neg_edge_index = self.neg_sampler.sample_like(pos_edge_index)
+                else:
+                    neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
+                    neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+                # neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
+                # neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+
                 edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
                 labels = torch.cat([torch.ones(pos_edge_index.size(1), device=self.device),
                         torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
@@ -253,8 +277,13 @@ class Train_BestModel:
             for batch in self.val_loader:
                 batch = batch.to(self.device)
                 pos_edge_index = _get_pos_edge_index(self.model, self.e_type, batch)
-                neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
-                neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+                if self.use_precomputed_negatives:
+                    neg_edge_index = self.neg_sampler.sample_like(pos_edge_index)
+                else:
+                    neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
+                    neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+                # neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
+                # neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
                 edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
                 labels = torch.cat([torch.ones(pos_edge_index.size(1), device=self.device),
                         torch.zeros(neg_edge_index.size(1), device=self.device)],dim=0)
@@ -368,7 +397,23 @@ class Test_BestModel:
         self.device = device
         self.task = task
         self.gda_negs = gda_negs
-        self.neg_sampler = NegativeSampler(full_graph, edge_type=("node", e_type, "node"),device=self.device)
+        # self.neg_sampler = NegativeSampler(full_graph, edge_type=("node", e_type, "node"),device=self.device)
+        # === PPI negative sampling ===
+        # For HURI, negatives are provided explicitly in the data as edge_type == 'neg_PPI'.
+        self.use_precomputed_negatives = (str(task).lower() == 'huri' and self.neg_ppi_edge_index is not None)
+        if self.use_precomputed_negatives:
+            ppi_key = next(et for et in full_graph.edge_types if et[1] == e_type)
+            all_pos_edge_index = full_graph[ppi_key].edge_index
+            ntype = getattr(model, 'n_type', 'node')
+            ntype = ntype if hasattr(full_graph, 'node_types') and ntype in full_graph.node_types else 'node'
+            num_nodes = int(getattr(full_graph[ntype], 'num_nodes', 0) or (full_graph[ntype].x.size(0) if 'x' in full_graph[ntype] else 0))
+            self.neg_sampler = PrecomputedNegativeSampler(
+                self.neg_ppi_edge_index,
+                num_nodes=num_nodes,
+                device=self.device,
+                all_pos_edge_index=all_pos_edge_index,
+            )
+        else: self.neg_sampler = NegativeSampler(full_graph, edge_type=("node", e_type, "node"), device=self.device)
         self.metrics = Metrics()
         self.graph = test_graph.to(device)
         self.test_edges = test_edges
@@ -389,8 +434,14 @@ class Test_BestModel:
             for start in range(0, num_pos, batch_size):
                 end = min(start + batch_size, num_pos)
                 pos_edge_index = pos_edges[:, start:end]
-                neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
-                neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+                # neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
+                # neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+                if self.use_precomputed_negatives:
+                    neg_edge_index = self.neg_sampler.sample_like(pos_edge_index)
+                else:
+                    neg_src, neg_dst = self.neg_sampler.sample(pos_edge_index.size(1))
+                    neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+
                 edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
                 labels = torch.cat([torch.ones(pos_edge_index.size(1), device=self.device),
                         torch.zeros(neg_edge_index.size(1), device=self.device)], dim=0)
