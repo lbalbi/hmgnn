@@ -303,6 +303,8 @@ class Train_BestModel:
                     if not getattr(self.log, "non_verbose", False):
                         self.log.log(f"[lr={lr:.3g}] Early stopping at epoch {epoch} "
                             f"(best val loss so far: {best_val_loss_lr:.4f}).")
+                else:
+                    print(f"Training Epoch: {epoch} completed.", flush=True)
                     break
 
             last_bce_loss = bce_loss
@@ -465,8 +467,8 @@ class Test_BestModel:
                 all_probs = pos_probs
                 all_labels = pos_labels
 
-            metrics = self.metrics.update(all_probs, all_labels)
-            names = self.metrics.get_names()
+            metrics = self.metrics.update_all(all_probs, all_labels)
+            names = self.metrics.get_allnames()
             self.log.log("=== Test metrics (global) ===")
             for name, val in zip(names, metrics):
                 self.log.log(f"{name}: {val:.4f}")

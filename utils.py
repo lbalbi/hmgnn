@@ -129,6 +129,8 @@ class Metrics:
     def get_names(self):
         return ["accuracy", "f1 score", "precision", "recall", "roc auc"]
 
+    def get_allnames(self):
+        return ["accuracy", "f1 score", "precision (pos)", "recall (pos)", "precision (neg)", "recall (neg)", "roc auc"]
 
 def _target_edge_key(model, e_type, n_type_fallback="node"):
     n_type = getattr(model, "n_type", n_type_fallback)
