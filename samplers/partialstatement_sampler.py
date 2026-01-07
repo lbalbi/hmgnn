@@ -54,6 +54,35 @@ class PartialStatementSampler:
         self._in_batch_mask_cpu: Optional[Tensor] = None
 
 
+    def _iter_uv_pairs(self):
+        """Yield (u, v) pairs from self.external_neg, supporting multiple formats."""
+        edges = self.external_neg
+        if edges is None: return
+        if isinstance(edges, torch.Tensor):
+            e = edges.detach().cpu()
+            if e.dim() != 2:
+                raise ValueError(f"external_neg tensor must be 2D, got {tuple(e.shape)}")
+            if e.size(0) == 2:  # [2, E]
+                src = e[0].tolist()
+                dst = e[1].tolist()
+                for u, v in zip(src, dst):
+                    yield int(u), int(v)
+                return
+            if e.size(1) == 2:  # [E, 2]
+                for row in e.tolist():
+                    yield int(row[0]), int(row[1])
+                return
+            raise ValueError(f"external_neg tensor must be [2, E] or [E, 2], got {tuple(e.shape)}")
+
+        # list/iterable of pairs (or longer tuples)
+        for item in edges:
+            if isinstance(item, torch.Tensor):
+                item = item.detach().cpu().tolist()
+            # allow triples etc: (u, v, ...)
+            u, v = item[0], item[1]
+            yield int(u), int(v)
+
+
     def prepare_global(self, full_g: HeteroData) -> None:
         """Scan the full graph and build positive/negative neighbor structures,
         GO / subclass expansion, anchor set, and per-node negative pools.
@@ -82,10 +111,12 @@ class PartialStatementSampler:
 
         if self.external_neg:
             if self.edges_are_negative:
-                for u, v in self.external_neg:
+                # for u, v in self.external_neg:
+                for u, v in self._iter_uv_pairs():
                     if 0 <= u < N and 0 <= v < N: self.direct_global[u].append(v)
             else:
-                for u, v in self.external_neg:
+                # for u, v in self.external_neg:
+                for u, v in self._iter_uv_pairs():
                     if 0 <= u < N and 0 <= v < N:
                         self.pos_global[u].append(v)
                         self.pos_targets.add(v)
