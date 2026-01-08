@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=wikidata_srahgcn_ProtCL_NEW
-#SBATCH --array=1-1
+#SBATCH --array=3-3
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=45:00:00

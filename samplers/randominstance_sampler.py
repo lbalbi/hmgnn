@@ -752,14 +752,10 @@ class RandomInstanceSampler(NegativeInstanceSampler):
       - Anchor negatives are NOT taken from graph.
       - For each anchor u and each base relation type r, we corrupt u's POS targets under r to
         synthetic NEG targets under the SAME base relation type r (no ontology expansion).
-
     Candidate retrieval is still based on the graph's real NEG edges:
       - shared_neg and neg_to_u_pos are populated using instances that have NEG statements
         of the SAME base relation type to those synthetic classes.
-
-    Performance:
-      - Uses batch-local key->local-instance maps (no O(num_nodes) masks per batch).
-
+    Uses batch-local key->local-instance maps (no O(num_nodes) masks per batch).
     Statement polarity rules (Wiki):
       - POS: rel does NOT start with neg_prefix and rel != subclass_rel
       - NEG: rel DOES start with neg_prefix
