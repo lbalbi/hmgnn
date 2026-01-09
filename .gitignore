@@ -7,3 +7,4 @@ scripts/
 *.json
 *.csv
 slurm_log.txt
+aggregate_results.py
