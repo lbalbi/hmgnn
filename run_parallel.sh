@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=wikidata_srahgcn_ProtCL_NEW
-#SBATCH --array=3-3
+#SBATCH --job-name=wikidata_srahgcn_noCL_NEW
+#SBATCH --array=2-2
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=45:00:00
@@ -10,9 +10,9 @@
 set -euo pipefail
 
 RUN_TAG="run_${SLURM_ARRAY_TASK_ID}"
-LOG_DIR="output/wikidata_srahgcn_ProtCL_NEW"
-OUTDIR="${LOG_DIR}/output_wikidata_srahgcn_ProtCL_NEW_${RUN_TAG}"
-LOGFILE="${LOG_DIR}/output_wikidata_srahgcn_ProtCL_NEW_${RUN_TAG}.txt"
+LOG_DIR="output/wikidata_srahgcn_noCL_NEW"
+OUTDIR="${LOG_DIR}/output_wikidata_srahgcn_noCL_NEW_${RUN_TAG}"
+LOGFILE="${LOG_DIR}/output_wikidata_srahgcn_noCL_NEW_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
 python -u main.py \
@@ -21,7 +21,8 @@ python -u main.py \
   --model "sra_hgcn" \
   --batch_size 3024 \
   --epochs 200 \
-  --output_dir "wikidata_srahgcn_ProtCL_NEW/output_wikidata_srahgcn_ProtCL_NEW_${RUN_TAG}/" \
+  --no_contrastive \
+  --output_dir "wikidata_srahgcn_noCL_NEW/output_wikidata_srahgcn_noCL_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
 
   # --finaltrain_only \
