@@ -6,7 +6,7 @@ import statistics as stats
 BASE_OUTPUT_DIR = "output" # directory that contains experiment folders
 RESULT_TSV_PATH = "experiment_results.tsv"
 N_RUNS = 10    # number of runs
-FINAL_TEST_FILENAMES = ["final_test.log"]
+FINAL_TEST_FILENAMES = ["final_test.log", "test_global.log"]
 
 
 
@@ -65,7 +65,7 @@ def compute_mean_and_std(metrics_per_run):
 
 
 def ensure_tsv_header(path):
-    header = ["Experiment","Heuristic","Accuracy",
+    header1 = ["Experiment","Heuristic","Accuracy",
         "F1 Score (W)","Precision (+)","Recall (+)",
         "Precision (-)","Recall (-)","Roc Auc"]
 
