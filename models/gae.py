@@ -90,7 +90,6 @@ class GCN_GAE(nn.Module):
         n_type: str = "node",
         tailact: bool = False,
         norm_affine: bool = True,
-        e_etypes: List[Tuple[str, str, str]] = None,
         drop_edge_p: float = 0.0,
         add_self_loops_flag: bool = True,
     ):
@@ -99,7 +98,7 @@ class GCN_GAE(nn.Module):
         self.ppi_etype = ppi_etype
 
         if isinstance(in_dim, dict):
-            in_dim_ = int(in_dim.get(n_type, list(in_feats.values())[0]))
+            in_dim_ = int(in_dim.get(n_type, list(in_dim.values())[0]))
         else:
             in_dim_ = int(in_dim)
 

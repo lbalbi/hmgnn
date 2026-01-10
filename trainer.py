@@ -176,7 +176,9 @@ class Train:
                 src = edge_index_pairs[0] + offsets[self.n_type]
                 dst = edge_index_pairs[1] + offsets[self.n_type]
                 mapped_pairs = torch.stack([src, dst], dim=0)
-                z, out = self.model(hom_data.x, mapped_pairs)
+                if "GAE" in self.model.__class__.__name__:
+                    out = self.model(hom_data, mapped_pairs)
+                else: z, out = self.model(hom_data.x, mapped_pairs)
             else: z, out = self.model(batch, edge_index_pairs)
 
             self._alpha = F.softplus(self.alpha)
@@ -226,7 +228,10 @@ class Train:
                     src = edge_index_pairs[0] + offsets[self.n_type]
                     dst = edge_index_pairs[1] + offsets[self.n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
-                    z, out = self.model(hom_data.x, mapped_pairs)
+                    #z, out = self.model(hom_data.x, mapped_pairs)
+                    if "GAE" in self.model.__class__.__name__:
+                        out = self.model(hom_data, mapped_pairs)
+                    else: z, out = self.model(hom_data.x, mapped_pairs)
                 else: z, out = self.model(graph, edge_index_pairs)
 
                 # Validation is classification-only (no contrastive loss).
@@ -305,7 +310,10 @@ class Train:
                     src = edge_index_pairs[0] + offsets[self.n_type]
                     dst = edge_index_pairs[1] + offsets[self.n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
-                    z, out = self.model(hom_data.x, mapped_pairs)
+                    #z, out = self.model(hom_data.x, mapped_pairs)
+                    if "GAE" in self.model.__class__.__name__:
+                        out = self.model(hom_data, mapped_pairs)
+                    else: z, out = self.model(hom_data.x, mapped_pairs)
                 else: z, out = self.model(batch, edge_index_pairs)
 
                 # Validation is classification-only (no contrastive loss).
