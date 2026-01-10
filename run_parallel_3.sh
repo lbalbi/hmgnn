@@ -20,5 +20,6 @@ python -u main.py \
   --task "human" \
   --model "sgnn" \
   --protein_splits \
+  --no_contrastive \
   --output_dir "human_sgnn_perProt_NEW/output_human_sgnn_perProt_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
