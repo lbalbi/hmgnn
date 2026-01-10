@@ -144,7 +144,7 @@ class Train_BestModel:
                 mapped_pairs = torch.stack([src, dst], dim=0)
                 # z, out = self.model(hom_data.x, mapped_pairs)
                 if "GAE" in self.model.__class__.__name__:
-                    out = self.model(hom_data, mapped_pairs)
+                    z, out = self.model(hom_data, mapped_pairs)
                 else: z, out = self.model(hom_data.x, mapped_pairs)
             else: z, out = self.model(batch, edge_index)
 
@@ -201,7 +201,7 @@ class Train_BestModel:
                     dst = edge_index[1] + offsets[n_type]
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     if "GAE" in self.model.__class__.__name__:
-                        out = self.model(hom_data, mapped_pairs)
+                        z, out = self.model(hom_data, mapped_pairs)
                     else: z, out = self.model(hom_data.x, mapped_pairs)
                     # z, out = self.model(hom_data.x, mapped_pairs)
                 else: z, out = self.model(graph, edge_index)
@@ -302,7 +302,7 @@ class Train_BestModel:
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     # z, out = self.model(hom_data.x, mapped_pairs)
                     if "GAE" in self.model.__class__.__name__:
-                        out = self.model(hom_data, mapped_pairs)
+                        z, out = self.model(hom_data, mapped_pairs)
                     else: z, out = self.model(hom_data.x, mapped_pairs)                
                 else: z, out = self.model(batch, edge_index)
                 # Validation is classification-only (no contrastive loss).
@@ -463,7 +463,7 @@ class Test_BestModel:
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     # _, out = self.model(hom_data.x, mapped_pairs)
                     if "GAE" in self.model.__class__.__name__:
-                        out = self.model(hom_data, mapped_pairs)
+                        z, out = self.model(hom_data, mapped_pairs)
                     else: z, out = self.model(hom_data.x, mapped_pairs)
                 else: _, out = self.model(g, edge_index)
 

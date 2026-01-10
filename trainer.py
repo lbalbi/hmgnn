@@ -177,7 +177,7 @@ class Train:
                 dst = edge_index_pairs[1] + offsets[self.n_type]
                 mapped_pairs = torch.stack([src, dst], dim=0)
                 if "GAE" in self.model.__class__.__name__:
-                    out = self.model(hom_data, mapped_pairs)
+                    z, out = self.model(hom_data, mapped_pairs)
                 else: z, out = self.model(hom_data.x, mapped_pairs)
             else: z, out = self.model(batch, edge_index_pairs)
 
@@ -230,7 +230,7 @@ class Train:
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     #z, out = self.model(hom_data.x, mapped_pairs)
                     if "GAE" in self.model.__class__.__name__:
-                        out = self.model(hom_data, mapped_pairs)
+                        z, out = self.model(hom_data, mapped_pairs)
                     else: z, out = self.model(hom_data.x, mapped_pairs)
                 else: z, out = self.model(graph, edge_index_pairs)
 
@@ -312,7 +312,7 @@ class Train:
                     mapped_pairs = torch.stack([src, dst], dim=0)
                     #z, out = self.model(hom_data.x, mapped_pairs)
                     if "GAE" in self.model.__class__.__name__:
-                        out = self.model(hom_data, mapped_pairs)
+                        z, out = self.model(hom_data, mapped_pairs)
                     else: z, out = self.model(hom_data.x, mapped_pairs)
                 else: z, out = self.model(batch, edge_index_pairs)
 
