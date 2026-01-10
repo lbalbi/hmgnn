@@ -1,24 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=huri_perProt_hgcn_ProtCL
+#SBATCH --job-name=human_sgnn_perProt_NEW
 #SBATCH --array=1-1
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
-#SBATCH --nodelist=liseda-t2
+#SBATCH --nodelist=liseda-01
 #SBATCH --partition=tier3
 
 set -euo pipefail
 
 RUN_TAG="run_${SLURM_ARRAY_TASK_ID}"
-LOG_DIR="output/huri_perProt_hgcn_ProtCL"
-OUTDIR="${LOG_DIR}/output_huri_perProt_hgcn_ProtCL_${RUN_TAG}"
-LOGFILE="${LOG_DIR}/output_huri_perProt_hgcn_ProtCL_${RUN_TAG}.txt"
+LOG_DIR="output/human_sgnn_perProt_NEW"
+OUTDIR="${LOG_DIR}/output_human_sgnn_perProt_NEW_${RUN_TAG}"
+LOGFILE="${LOG_DIR}/output_human_sgnn_perProt_NEW_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
 python -u main.py \
-  --path "data/huri_data_withLC" \
-  --task "huri" \
-  --model "hgcn" \
+  --path "data/human_data_withLC" \
+  --task "human" \
+  --model "sgnn" \
   --protein_splits \
-  --output_dir "huri_perProt_hgcn_ProtCL/output_huri_perProt_hgcn_ProtCL_${RUN_TAG}/" \
+  --output_dir "human_sgnn_perProt_NEW/output_human_sgnn_perProt_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1

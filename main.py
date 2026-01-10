@@ -12,7 +12,7 @@ from statistics import mode
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default="human", help="Task to run: human, cerevisae, melanogaster")
-    parser.add_argument('--model', type=str, choices=["hgcn", "hpgcn", "hgat","gcn", "gae"], default="hgcn", help="Model to run")
+    parser.add_argument('--model', type=str, choices=["hgcn", "hpgcn", "hgat","gcn", "gae", "sgnn"], default="hgcn", help="Model to run")
     parser.add_argument('--epochs', type=int, default=300, help="Number of epochs for final training")
     parser.add_argument('--CV_epochs', type=int, default=250, help="Number of epochs for cross-validation")
     parser.add_argument('--batch_size', type=int, default=256*512, help="Batch size for training") 
