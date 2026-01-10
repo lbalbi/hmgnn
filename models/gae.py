@@ -1,10 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# import dgl
-# from dgl.nn import GraphConv, SAGEConv, GATConv, GINConv
-# from typing import Tuple, List
-
 from torch import Tensor
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import GCNConv
@@ -66,7 +62,7 @@ class GCN_GAE(nn.Module):
 
     def __init__(
         self,
-        in_feats: Dict[str, int] | int,
+        in_dim: Dict[str, int] | int,
         hidden_dim: int,
         out_dim: int = 1,
         n_layers: int = 2,
@@ -85,12 +81,12 @@ class GCN_GAE(nn.Module):
         self.n_type = n_type
         self.ppi_etype = ppi_etype
 
-        if isinstance(in_feats, dict):
-            in_dim = int(in_feats.get(n_type, list(in_feats.values())[0]))
+        if isinstance(in_dim, dict):
+            in_dim_ = int(in_dim.get(n_type, list(in_dim.values())[0]))
         else:
-            in_dim = int(in_feats)
+            in_dim_ = int(in_dim)
 
-        self.in_dim = in_dim
+        self.in_dim = in_dim_
         self.hidden_dim = int(hidden_dim)
         self.out_dim = int(out_dim)
         self.n_layers = int(n_layers)
@@ -102,11 +98,11 @@ class GCN_GAE(nn.Module):
         self.add_self_loops_flag = bool(add_self_loops_flag)
 
         # Encoder: simple GCN
-        self.conv1 = GCNConv(in_dim, self.hidden_dim, add_self_loops=False, normalize=True)
+        self.conv1 = GCNConv(in_dim_, self.hidden_dim, add_self_loops=False, normalize=True)
         self.conv2 = GCNConv(self.hidden_dim, self.hidden_dim, add_self_loops=False, normalize=True)
 
         # Residual projection if dims differ
-        self.res_proj = nn.Identity() if in_dim == self.hidden_dim else nn.Linear(in_dim, self.hidden_dim, bias=False)
+        self.res_proj = nn.Identity() if in_dim_ == self.hidden_dim else nn.Linear(in_dim_, self.hidden_dim, bias=False)
 
         # Optional per-step MLP (kept from your original idea, but dimensionally consistent)
         if self.linear:
@@ -223,6 +219,9 @@ class GCN_GAE(nn.Module):
         return z, logits, probs
 
 
+# import dgl
+# from dgl.nn import GraphConv, SAGEConv, GATConv, GINConv
+# from typing import Tuple, List
 
 # class Hadamard_MLPPredictor(nn.Module):
 #     def __init__(self, h_feats, dropout, layer=5, res=True, norm=False, scale=False):
@@ -355,106 +354,106 @@ class GCN_GAE(nn.Module):
 
 
 
-class GCN_multilayers(nn.Module):
+# class GCN_multilayers(nn.Module):
         
-    def __init__(self, in_feats, h_feats, norm=False, dp4norm=0, drop_edge=False, relu=False, linear=False, prop_step=2, dropout=0.2, residual=0, conv='GCN'):
-        super(GCN_multilayers, self).__init__()
-        if conv == 'GCN':
-            self.convs = nn.ModuleList([GraphConv(in_feats, h_feats)])
-            for _ in range(prop_step - 1):
-                self.convs.append(GraphConv(h_feats, h_feats))
-        elif conv == 'SAGE':
-            self.convs = nn.ModuleList([SAGEConv(in_feats, h_feats, 'mean')])
-            for _ in range(prop_step - 1):
-                self.convs.append(SAGEConv(h_feats, h_feats, 'mean'))
-        elif conv == 'GAT':
-            self.convs = nn.ModuleList([GATConv(in_feats, h_feats // 4, 4)])
-            for _ in range(prop_step - 1):
-                self.convs.append(GATConv(h_feats, h_feats // 4, 4))
-        elif conv == 'GIN':
-            self.mlps = nn.ModuleList([MLP(in_feats, h_feats, 2, 0.2)])
-            self.convs = nn.ModuleList([GINConv(self.mlps[0], 'mean')])
-            for _ in range(prop_step - 1):
-                self.mlps.append(MLP(h_feats, h_feats, 2, 0.2))
-                self.convs.append(GINConv(self.mlps[-1], 'mean'))
-        self.norm = norm
-        self.drop_edge = drop_edge
-        self.relu = relu
-        self.prop_step = prop_step
-        self.residual = residual
-        self.linear = linear
-        if norm:
-            self.norms = nn.ModuleList([nn.LayerNorm(h_feats) for _ in range(prop_step)])
-        self.dp = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        if linear:
-            self.mlps = nn.ModuleList([MLP(h_feats, h_feats, 2, dropout) for _ in range(prop_step)])
+#     def __init__(self, in_feats, h_feats, norm=False, dp4norm=0, drop_edge=False, relu=False, linear=False, prop_step=2, dropout=0.2, residual=0, conv='GCN'):
+#         super(GCN_multilayers, self).__init__()
+#         if conv == 'GCN':
+#             self.convs = nn.ModuleList([GraphConv(in_feats, h_feats)])
+#             for _ in range(prop_step - 1):
+#                 self.convs.append(GraphConv(h_feats, h_feats))
+#         elif conv == 'SAGE':
+#             self.convs = nn.ModuleList([SAGEConv(in_feats, h_feats, 'mean')])
+#             for _ in range(prop_step - 1):
+#                 self.convs.append(SAGEConv(h_feats, h_feats, 'mean'))
+#         elif conv == 'GAT':
+#             self.convs = nn.ModuleList([GATConv(in_feats, h_feats // 4, 4)])
+#             for _ in range(prop_step - 1):
+#                 self.convs.append(GATConv(h_feats, h_feats // 4, 4))
+#         elif conv == 'GIN':
+#             self.mlps = nn.ModuleList([MLP(in_feats, h_feats, 2, 0.2)])
+#             self.convs = nn.ModuleList([GINConv(self.mlps[0], 'mean')])
+#             for _ in range(prop_step - 1):
+#                 self.mlps.append(MLP(h_feats, h_feats, 2, 0.2))
+#                 self.convs.append(GINConv(self.mlps[-1], 'mean'))
+#         self.norm = norm
+#         self.drop_edge = drop_edge
+#         self.relu = relu
+#         self.prop_step = prop_step
+#         self.residual = residual
+#         self.linear = linear
+#         if norm:
+#             self.norms = nn.ModuleList([nn.LayerNorm(h_feats) for _ in range(prop_step)])
+#         self.dp = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+#         if linear:
+#             self.mlps = nn.ModuleList([MLP(h_feats, h_feats, 2, dropout) for _ in range(prop_step)])
 
-    def _apply_norm_and_activation(self, x, i):
-        if self.norm:
-            x = self.norms[i](x)
-        if self.relu:
-            x = F.relu(x)
-        x = self.dp(x)
-        return x
+#     def _apply_norm_and_activation(self, x, i):
+#         if self.norm:
+#             x = self.norms[i](x)
+#         if self.relu:
+#             x = F.relu(x)
+#         x = self.dp(x)
+#         return x
     
-    def forward(self, g, in_feat):
-        ori = in_feat
-        if self.drop_edge:
-            g = drop_edge(g)
-        h = self.conv1(g, in_feat).flatten(1) + self.residual * ori
-        for i in range(1, self.prop_step):
-            h = self._apply_norm_and_activation(h, i)
-            if self.linear:
-                h = self.mlps[i](h)
-            h = self.conv2(g, h).flatten(1) + self.residual * ori
-        return h
+#     def forward(self, g, in_feat):
+#         ori = in_feat
+#         if self.drop_edge:
+#             g = drop_edge(g)
+#         h = self.conv1(g, in_feat).flatten(1) + self.residual * ori
+#         for i in range(1, self.prop_step):
+#             h = self._apply_norm_and_activation(h, i)
+#             if self.linear:
+#                 h = self.mlps[i](h)
+#             h = self.conv2(g, h).flatten(1) + self.residual * ori
+#         return h
 
     
-class PureGCN(nn.Module):
-    def __init__(self, input_dim, num_layers=2, hidden=256, dp=0, relu=False, norm=False, res=False):
-        super().__init__()
-        self.lin = nn.Linear(input_dim, hidden)
-        self.conv = GraphConv(hidden, hidden, weight=False, bias=False)
-        self.num_layers = num_layers
-        self.dp = dp
-        self.norm = norm
-        self.res = res
-        self.relu = relu
-        if self.norm:
-            self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(num_layers)])
+# class PureGCN(nn.Module):
+#     def __init__(self, input_dim, num_layers=2, hidden=256, dp=0, relu=False, norm=False, res=False):
+#         super().__init__()
+#         self.lin = nn.Linear(input_dim, hidden)
+#         self.conv = GraphConv(hidden, hidden, weight=False, bias=False)
+#         self.num_layers = num_layers
+#         self.dp = dp
+#         self.norm = norm
+#         self.res = res
+#         self.relu = relu
+#         if self.norm:
+#             self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(num_layers)])
 
-    def forward(self, adj_t, x, e_feat=None):
-        x = self.lin(x)
-        ori = x
-        for i in range(self.num_layers):
-            if i != 0 and self.res:
-                x = x + ori
-            if self.norm:
-                x = self.norms[i](x)
-            if self.relu:
-                x = F.relu(x)
-            if self.dp > 0:
-                x = F.dropout(x, p=self.dp, training=self.training)
-            x = self.conv(adj_t, x, edge_weight=e_feat)
-        return x
+#     def forward(self, adj_t, x, e_feat=None):
+#         x = self.lin(x)
+#         ori = x
+#         for i in range(self.num_layers):
+#             if i != 0 and self.res:
+#                 x = x + ori
+#             if self.norm:
+#                 x = self.norms[i](x)
+#             if self.relu:
+#                 x = F.relu(x)
+#             if self.dp > 0:
+#                 x = F.dropout(x, p=self.dp, training=self.training)
+#             x = self.conv(adj_t, x, edge_weight=e_feat)
+#         return x
 
-class PureGCN_no_para(nn.Module):
-    def __init__(self, input_dim, num_layers=2, relu=False, norm=False, res=False):
-        super().__init__()
-        self.conv = GraphConv(input_dim, input_dim, weight=False, bias=False)
-        self.num_layers = num_layers
-        self.norm = norm
-        self.res = res
-        self.relu = relu
+# class PureGCN_no_para(nn.Module):
+#     def __init__(self, input_dim, num_layers=2, relu=False, norm=False, res=False):
+#         super().__init__()
+#         self.conv = GraphConv(input_dim, input_dim, weight=False, bias=False)
+#         self.num_layers = num_layers
+#         self.norm = norm
+#         self.res = res
+#         self.relu = relu
 
-    def forward(self, adj_t, x, e_feat=None):
-        ori = x
-        for i in range(self.num_layers):
-            if i != 0 and self.res:
-                x = x + ori
-            if self.norm:
-                x = F.layer_norm(x, x.shape[1:])
-            if self.relu:
-                x = F.relu(x)
-            x = self.conv(adj_t, x, edge_weight=e_feat)
-        return x       
+#     def forward(self, adj_t, x, e_feat=None):
+#         ori = x
+#         for i in range(self.num_layers):
+#             if i != 0 and self.res:
+#                 x = x + ori
+#             if self.norm:
+#                 x = F.layer_norm(x, x.shape[1:])
+#             if self.relu:
+#                 x = F.relu(x)
+#             x = self.conv(adj_t, x, edge_weight=e_feat)
+#         return x       

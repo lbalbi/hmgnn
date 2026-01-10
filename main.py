@@ -1,4 +1,5 @@
 import torch.multiprocessing as mp
+# mp.set_sharing_strategy("file_system")
 import argparse, os, statistics, torch
 from typing import Dict, List
 import pandas as pd
@@ -13,6 +14,9 @@ from data_loader import DataLoader
 from samplers import (PartialStatementSampler, NegativeStatementSampler, RandomStatementSampler,
     NegativeSampler, NegativeInstanceSampler, RandomInstanceSampler, PartialInstanceSampler)
 
+import os, resource
+print("RLIMIT_NOFILE:", resource.getrlimit(resource.RLIMIT_NOFILE))
+print("Open FDs now:", len(os.listdir("/proc/self/fd")))
 
 def build_hgcn_encoder_graph(struct_graph: HeteroData, subclass_rel: str = "subclass_of",
     neg_prefix: str = "NOT_") -> HeteroData:
@@ -131,7 +135,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="wikidata",
         help="Task / dataset name (used to load config JSON).")
-    parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "sra_hgcn","gcn", "gae"],
+    parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "sra_hgcn","gcn", "gae", "sgnn"],
         default="hgcn", help="Model to run (default is relation-aware HGCN)")
     parser.add_argument("--epochs", type=int, default=250,
         help="Max epochs per fold / final training.")
