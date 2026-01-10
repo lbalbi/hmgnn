@@ -90,7 +90,7 @@ class SignedGATConv(nn.Module):
         return h_pos, h_neg
 
 
-class SignedGAT(nn.Module):
+class SGAT(nn.Module):
     """
     Signed GAT for your framework.
 
