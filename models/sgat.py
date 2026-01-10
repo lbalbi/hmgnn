@@ -90,7 +90,7 @@ class SignedGATConv(nn.Module):
         return h_pos, h_neg
 
 
-class SGAT(nn.Module):
+class SignedGAT(nn.Module):
     """
     Signed GAT for your framework.
 
@@ -270,10 +270,4 @@ class SGAT(nn.Module):
         h_dict = self.encode(data)
         z = h_dict[self.n_type]
         logits, probs = self.score_triples(z, edge_index, rel_ids)
-
-        # For your older trainer using BCELoss -> return probs
-        # For your newer trainer using BCEWithLogitsLoss -> return logits
-        if self.return_probs_only:
-            return z, probs
-        else:
-            return z, logits, probs
+        return z, torch.sigmoid(logits)

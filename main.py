@@ -135,7 +135,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="wikidata",
         help="Task / dataset name (used to load config JSON).")
-    parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "sra_hgcn","gcn", "gae", "sgnn"],
+    parser.add_argument("--model", type=str, choices=["hgcn", "ra_hgcn", "sra_hgcn","gcn", "gae", "sgnn", "sgat"],
         default="hgcn", help="Model to run (default is relation-aware HGCN)")
     parser.add_argument("--epochs", type=int, default=250,
         help="Max epochs per fold / final training.")
