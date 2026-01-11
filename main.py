@@ -157,6 +157,8 @@ def main():
         help="Disable contrastive learning with statement samplers.")
     parser.add_argument("--finaltrain_only", action="store_true",
         help="Skip cross-validation and run ONLY final training + testing.")
+    parser.add_argument("--test_only", action="store_true",
+        help="Load final model for testing only.")
     parser.add_argument("--final_lr", type=float, default=None,
         help="Learning rate for final training when --final_only is set.")
     parser.add_argument("--final_epochs", type=int, default=None,
@@ -315,10 +317,27 @@ def main():
         print(f"Using user-provided final epochs: {final_epochs}", flush=True)
         print(f"Using user-provided final lr:     {final_lr}", flush=True)
 
+    elif args.test_only:
+        model_path = os.path.join("output/"+ args.output_dir, f"final_model_{args.model}.pt")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file for testing not found: {model_path}")
+        else:
+            final_base_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
+                out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=encoder_e_etypes,
+                n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
+            if args.model in ("ra_hgcn", "sra_hgcn", "gcn","gae"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+            else: final_model = ModelCls(**final_base_kwargs).to(device)
+            
+            state = torch.load(model_path, map_location=device)
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+                missing, unexpected = final_model.load_state_dict(state, strict=False)
+                print("Loaded checkpoint:", ckpt_path)
+                print("  missing keys:", missing)
+                print("  unexpected keys:", unexpected)
+
     else:    
         kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
-
-
         for fold, (train_idx_np, val_idx_np) in enumerate(
             kf.split(range(num_cls_triples)), start=1):
             train_idx = torch.tensor(train_idx_np, dtype=torch.long)
@@ -387,45 +406,46 @@ def main():
         print(f"Chosen number of epochs for final training (median): {final_epochs}", flush=True)
         print(f"Chosen learning rate for final training (median):  {final_lr}", flush=True)
 
-    final_nodes = torch.unique(torch.cat([cls_heads, cls_tails], dim=0))
-    final_loader = NeighborLoader(encoder_graph, input_nodes=("node", final_nodes),
-        num_neighbors=neighbor_sizes, batch_size=args.batch_size, shuffle=True, num_workers=2,
-        persistent_workers=True, pin_memory=(device.type == "cuda"))
+    if not args.test_only:
+        final_nodes = torch.unique(torch.cat([cls_heads, cls_tails], dim=0))
+        final_loader = NeighborLoader(encoder_graph, input_nodes=("node", final_nodes),
+            num_neighbors=neighbor_sizes, batch_size=args.batch_size, shuffle=True, num_workers=2,
+            persistent_workers=True, pin_memory=(device.type == "cuda"))
 
-    final_base_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
-        out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=encoder_e_etypes,
-        n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
+        final_base_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
+            out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=encoder_e_etypes,
+            n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
 
-    # if args.model in ("ra_hgcn", "gcn"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
-    if args.model in ("ra_hgcn", "sra_hgcn", "gcn","gae"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
-    else: final_model = ModelCls(**final_base_kwargs).to(device)
-    final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
+        # if args.model in ("ra_hgcn", "gcn"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+        if args.model in ("ra_hgcn", "sra_hgcn", "gcn","gae"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+        else: final_model = ModelCls(**final_base_kwargs).to(device)
+        final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
-    if not args.no_contrastive:
-        if use_random_sampler:
-            final_contrastive_sampler = RandomInstanceSampler(
-                k=contrastive_k, external_negs=external_edges)
-            final_contrastive_sampler.prepare_global(struct_graph)
-        elif use_partial_sampler:
-            edges_are_negative = nflag
-            final_contrastive_sampler = PartialInstanceSampler(k=contrastive_k,
-                neg_edges=external_edges, edges_are_negative=edges_are_negative)
-            final_contrastive_sampler.prepare_global(struct_graph)
-        else:
-            final_contrastive_sampler = NegativeInstanceSampler(
-                k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)            
-            # final_contrastive_sampler = NegativeStatementSampler(
-            #     k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)
-            final_contrastive_sampler.prepare_global(struct_graph)
-    else: final_contrastive_sampler = None
+        if not args.no_contrastive:
+            if use_random_sampler:
+                final_contrastive_sampler = RandomInstanceSampler(
+                    k=contrastive_k, external_negs=external_edges)
+                final_contrastive_sampler.prepare_global(struct_graph)
+            elif use_partial_sampler:
+                edges_are_negative = nflag
+                final_contrastive_sampler = PartialInstanceSampler(k=contrastive_k,
+                    neg_edges=external_edges, edges_are_negative=edges_are_negative)
+                final_contrastive_sampler.prepare_global(struct_graph)
+            else:
+                final_contrastive_sampler = NegativeInstanceSampler(
+                    k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)            
+                # final_contrastive_sampler = NegativeStatementSampler(
+                #     k=contrastive_k,subclass_rel=subclass_rel, neg_prefix="NOT_",instance_rel=instance_rel)
+                final_contrastive_sampler.prepare_global(struct_graph)
+        else: final_contrastive_sampler = None
 
-    final_trainer = Train_BestModel(final_model, graph=encoder_graph,
-        heads=cls_heads, rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr=final_lr,
-        epochs=final_epochs, device=device, log=final_log, batch_size=args.batch_size,
-        contrastive_sampler=final_contrastive_sampler, contrastive_weight=contrastive_weight, loader=final_loader,
-        no_contrastive = args.no_contrastive)
-    final_loss = final_trainer.run()
-    print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}", flush=True)
+        final_trainer = Train_BestModel(final_model, graph=encoder_graph,
+            heads=cls_heads, rel_ids=cls_rels, tails=cls_tails, labels=cls_labels, lr=final_lr,
+            epochs=final_epochs, device=device, log=final_log, batch_size=args.batch_size,
+            contrastive_sampler=final_contrastive_sampler, contrastive_weight=contrastive_weight, loader=final_loader,
+            no_contrastive = args.no_contrastive)
+        final_loss = final_trainer.run()
+        print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}", flush=True)
 
 
     neg_samplers: Dict[str, NegativeSampler] = {}
@@ -446,7 +466,7 @@ def main():
     if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     model_path = os.path.join("output/"+ args.output_dir, f"final_model_{args.model}.pt")
-    torch.save(final_model.state_dict(), model_path)
+    if not args.test_only: torch.save(final_model.state_dict(), model_path)
 
     tester = Test_BestModel(model=final_model, graph=encoder_graph,
         test_heads=test_heads, test_rels=test_rels, test_tails=test_tails,

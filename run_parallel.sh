@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=wikidata_sgat_NEW
-#SBATCH --array=4-4
+#SBATCH --array=5-5
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=45:00:00

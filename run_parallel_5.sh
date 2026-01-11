@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=human_rahgcn_noNegs_RandomNegs_NEW
-#SBATCH --array=3-3
+#SBATCH --array=6-6
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
@@ -22,8 +22,6 @@ python -u main.py \
   --batch_size 3048 \
   --use_rstatement_sampler \
   --use_nstatementsampler \
-  --finaltrain_only \
-  --final_lr 0.005 \
-  --final_epochs 46 \
+  --test_only \
   --output_dir "wikidata_rahgcn_noNegs_RandomNegs_NEW/output_wikidata_rahgcn_noNegs_RandomNegs_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
