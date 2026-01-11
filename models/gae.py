@@ -7,7 +7,6 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.utils import dropout_edge, add_self_loops
 from typing import Dict, List, Optional, Tuple
 
-
 class MLP(nn.Module):
     def __init__(self, in_channels: int, hidden_channels: int,
         out_channels: int, num_layers: int = 2, dropout: float = 0.2,
@@ -76,7 +75,7 @@ class GCN_GAE(nn.Module):
         rel2id: Optional[Dict[str, int]] = None,
         drop_edge_p: float = 0.0,
         add_self_loops_flag: bool = True,
-        num_rel_total: int = 129
+        num_rel_total: Optional[int] = None
     ):
         super().__init__()
         self.n_type = n_type
@@ -113,26 +112,44 @@ class GCN_GAE(nn.Module):
         else:
             self.mlps = None
 
-        # --- Decoder relation space is independent of encoder edge types ---
-        self.num_rel = int(num_rel_total or 0)
+        if num_rel_total is None:
+            num_rel_total = len(rel2id) if rel2id is not None else 0
+        self.num_rel = int(num_rel_total)
         self.rel_emb = nn.Embedding(self.num_rel, self.hidden_dim) if self.num_rel > 0 else None
-
-        # Two decoders: (u,v) and (u,r,v)
         self.classify_uv = nn.Sequential(
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
+            nn.Linear(self.hidden_dim, 1),
         )
-
         self.classify_urv = None
         if self.rel_emb is not None:
             self.classify_urv = nn.Sequential(
                 nn.Linear(self.hidden_dim * 3, self.hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(self.dropout),
-                nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
-            )
+                nn.Linear(self.hidden_dim, 1))
+
+        # # --- Decoder relation space is independent of encoder edge types ---
+        # self.num_rel = int(num_rel_total or 0)
+        # self.rel_emb = nn.Embedding(self.num_rel, self.hidden_dim) if self.num_rel > 0 else None
+
+        # # Two decoders: (u,v) and (u,r,v)
+        # self.classify_uv = nn.Sequential(
+        #     nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+        #     nn.ReLU(),
+        #     nn.Dropout(self.dropout),
+        #     nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
+        # )
+
+        # self.classify_urv = None
+        # if self.rel_emb is not None:
+        #     self.classify_urv = nn.Sequential(
+        #         nn.Linear(self.hidden_dim * 3, self.hidden_dim),
+        #         nn.ReLU(),
+        #         nn.Dropout(self.dropout),
+        #         nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
+        #     )
 
         # Optional relation embeddings for decoding (only used if provided/inferred)
         # if rel2id is None and e_etypes is not None:
@@ -218,10 +235,18 @@ class GCN_GAE(nn.Module):
         if self.rel_emb is not None and rel_ids is not None:
             rel_ids = rel_ids.long()
             # (optional) explicit range check (keep yours if you like)
-            rmax = int(rel_ids.max().item()) if rel_ids.numel() else -1
-            if rmax > self.rel_emb.num_embeddings:
-                raise ValueError(f"rel_ids out of range: max={rmax} but rel_emb has {self.rel_emb.num_embeddings}")
-
+            # rmax = int(rel_ids.max().item()) if rel_ids.numel() else -1
+            # if rmax > self.rel_emb.num_embeddings:
+            #     raise ValueError(f"rel_ids out of range: max={rmax} but rel_emb has {self.rel_emb.num_embeddings}")
+            if rel_ids.numel():
+                rmin = int(rel_ids.min().item())
+                rmax = int(rel_ids.max().item())
+                if rmin < 0 or rmax >= self.rel_emb.num_embeddings:
+                    raise ValueError(
+                        f"rel_ids out of range: min={rmin}, max={rmax}, "
+                        f"but rel_emb has num_embeddings={self.rel_emb.num_embeddings}"
+                    )
+                    
             er = self.rel_emb(rel_ids)
             h_in = torch.cat([hs, er, hd], dim=-1)
             logits = self.classify_urv(h_in)
