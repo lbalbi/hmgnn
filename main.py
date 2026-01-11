@@ -64,8 +64,10 @@ def main():
     if args.use_pstatement_sampler or args.use_nstatement_sampler: state_list = dl.get_state_list()
     if args.use_pstatement_sampler and ["node","pos_statement","node"] in mcfg["edge_types"]:
         mcfg["edge_types"].remove(["node","pos_statement","node"])
+        print("Removed pos_statement from message-passing edge types.", flush=True)
     elif args.use_nstatement_sampler and ["node","neg_statement","node"] in mcfg["edge_types"]:
         mcfg["edge_types"].remove(["node","neg_statement","node"])
+        print("Removed neg_statement from message-passing edge types.", flush=True)
 
     full_graph = dl.make_data_graph(data_dict)
     ppi_rel = mcfg["ppi_etype"][1] if isinstance(mcfg["ppi_etype"], (list, tuple)) else mcfg["ppi_etype"]

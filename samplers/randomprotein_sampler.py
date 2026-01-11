@@ -69,6 +69,7 @@ class RandomProteinSampler:
         self.batch_pool_pos_to_u_neg: List[Tensor] = []
         self.batch_pool_neg_to_u_pos: List[Tensor] = []
         self.batch_pool_shared_pos: List[Tensor] = []
+        print("Initialized RandomProteinSampler")
 
     # -------------------------
     # Helpers

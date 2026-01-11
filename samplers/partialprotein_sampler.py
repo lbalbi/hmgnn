@@ -46,6 +46,7 @@ class PartialProteinSampler:
         self.batch_anchors_global: List[int] = []
         self.batch_anchors_local: List[int] = []
         self.Nb: int = 0
+        print("In PartialProteinSampler")
 
     def _expand_go_set(self, seeds: Set[int], hops: int) -> Set[int]:
         out = set(seeds)
