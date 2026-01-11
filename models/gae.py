@@ -76,6 +76,7 @@ class GCN_GAE(nn.Module):
         rel2id: Optional[Dict[str, int]] = None,
         drop_edge_p: float = 0.0,
         add_self_loops_flag: bool = True,
+        num_rel_total: int = 129
     ):
         super().__init__()
         self.n_type = n_type
@@ -112,24 +113,45 @@ class GCN_GAE(nn.Module):
         else:
             self.mlps = None
 
-        # Optional relation embeddings for decoding (only used if provided/inferred)
-        if rel2id is None and e_etypes is not None:
-            rel_names = sorted({rel for (_, rel, _) in e_etypes})
-            rel2id = {r: i for i, r in enumerate(rel_names)}
-        self.rel2id = rel2id
-        self.num_rel = len(rel2id) if rel2id is not None else 0
+        # --- Decoder relation space is independent of encoder edge types ---
+        self.num_rel = int(num_rel_total or 0)
         self.rel_emb = nn.Embedding(self.num_rel, self.hidden_dim) if self.num_rel > 0 else None
 
-        # Decoder
-        if self.rel_emb is None:
-            self.classify = nn.Sequential(
-                nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+        # Two decoders: (u,v) and (u,r,v)
+        self.classify_uv = nn.Sequential(
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
+        )
+
+        self.classify_urv = None
+        if self.rel_emb is not None:
+            self.classify_urv = nn.Sequential(
+                nn.Linear(self.hidden_dim * 3, self.hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(self.dropout),
                 nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
             )
+
+        # Optional relation embeddings for decoding (only used if provided/inferred)
+        # if rel2id is None and e_etypes is not None:
+        #     rel_names = sorted({rel for (_, rel, _) in e_etypes})
+        #     rel2id = {r: i for i, r in enumerate(rel_names)}
+        # self.rel2id = rel2id
+        # self.num_rel = len(rel2id) if rel2id is not None else 0
+        # self.rel_emb = nn.Embedding(self.num_rel, self.hidden_dim) if self.num_rel > 0 else None
+
+        # # Decoder
+        # if self.rel_emb is None:
+        #     self.classify = nn.Sequential(
+        #         nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+        #         nn.ReLU(),
+        #         nn.Dropout(self.dropout),
+        #         nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
+        #     )
         else:
-            self.classify = nn.Sequential(
+            self.classify_urv = nn.Sequential(
                 nn.Linear(self.hidden_dim * 3, self.hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(self.dropout),
@@ -188,29 +210,72 @@ class GCN_GAE(nn.Module):
 
         return {self.n_type: h}
 
-    def score_triples(self, z: Tensor, edge_index: Tensor, rel_ids: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        """
-        z: (num_nodes_in_batch, hidden_dim)
-        edge_index: (2, B) with local node indices
-        rel_ids: (B,) long
-        """
+
+    def score_triples(self, z: Tensor, edge_index: Tensor, rel_ids: Optional[Tensor] = None):
         src, dst = edge_index
-        hs = z[src]
-        hd = z[dst]
+        hs, hd = z[src], z[dst]
 
         if self.rel_emb is not None and rel_ids is not None:
+            rel_ids = rel_ids.long()
+            # (optional) explicit range check (keep yours if you like)
+            rmax = int(rel_ids.max().item()) if rel_ids.numel() else -1
+            if rmax > self.rel_emb.num_embeddings:
+                raise ValueError(f"rel_ids out of range: max={rmax} but rel_emb has {self.rel_emb.num_embeddings}")
+
             er = self.rel_emb(rel_ids)
             h_in = torch.cat([hs, er, hd], dim=-1)
+            logits = self.classify_urv(h_in)
         else:
             h_in = torch.cat([hs, hd], dim=-1)
+            logits = self.classify_uv(h_in)
 
-        logits = self.classify(h_in)
-        # match the trainer's BCEWithLogitsLoss expectation (typically labels are (B,))
         if logits.dim() == 2 and logits.size(1) == 1:
             logits = logits.squeeze(1)
 
         probs = torch.sigmoid(logits)
         return logits, probs
+
+
+    # def score_triples(self, z: Tensor, edge_index: Tensor, rel_ids: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    #     """
+    #     z: (num_nodes_in_batch, hidden_dim)
+    #     edge_index: (2, B) with local node indices
+    #     rel_ids: (B,) long
+    #     """
+    #     src, dst = edge_index
+
+    #     n = z.size(0)
+    #     # Catch bad node indices early (instead of CUDA assert later)
+    #     if src.numel() > 0:
+    #         smin, smax = int(src.min().item()), int(src.max().item())
+    #         dmin, dmax = int(dst.min().item()), int(dst.max().item())
+    #         if smin < 0 or dmin < 0 or smax >= n or dmax >= n:
+    #             raise ValueError(f"edge_index has out-of-range node ids: "
+    #                             f"src[{smin},{smax}] dst[{dmin},{dmax}] but z has {n} nodes")
+
+    #     hs = z[src]
+    #     hd = z[dst]
+
+    #     if self.rel_emb is not None and rel_ids is not None:
+    #         if rel_ids.dtype != torch.long:
+    #             rel_ids = rel_ids.long()
+    #         rmin, rmax = int(rel_ids.min().item()), int(rel_ids.max().item())
+    #         if rmin < 0 or rmax >= self.rel_emb.num_embeddings:
+    #             raise ValueError(f"rel_ids out of range: [{rmin},{rmax}] "
+    #                             f"but rel_emb has num_embeddings={self.rel_emb.num_embeddings}")
+
+    #         er = self.rel_emb(rel_ids)
+    #         h_in = torch.cat([hs, er, hd], dim=-1)
+    #     else:
+    #         h_in = torch.cat([hs, hd], dim=-1)
+
+    #     logits = self.classify(h_in)
+    #     # match the trainer's BCEWithLogitsLoss expectation (typically labels are (B,))
+    #     if logits.dim() == 2 and logits.size(1) == 1:
+    #         logits = logits.squeeze(1)
+
+    #     probs = torch.sigmoid(logits)
+    #     return logits, probs
 
     def forward(self, data: HeteroData, edge_index: Tensor, rel_ids: Optional[Tensor] = None):
         h_dict = self.encode(data)

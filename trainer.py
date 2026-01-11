@@ -9,7 +9,6 @@ from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveI
 
 import subprocess
 
-
 class Train:
     def __init__(self, model: nn.Module, graph: HeteroData, heads: torch.Tensor,
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr_candidates: List[float],
