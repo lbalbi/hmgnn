@@ -93,28 +93,64 @@ class RandomProteinSampler:
         s = self.pos_go_set_by_protein[u]
         return s if s is not None else set()
 
-    def _sample_k_tensor(self, pool: Tensor, k: int, fallback: int, device: torch.device) -> Tensor:
+
+    def _sample_k_tensor_cpu(self, pool: Tensor, k: int, fallback: int) -> Tensor:
         """
         pool: 1D CPU tensor
-        returns: (k,) tensor on `device`
+        returns: (k,) CPU tensor
 
-        Fallback rules:
-          - empty pool -> [fallback]*k
-          - 0 < L < k -> shuffle all L once, then pad with fallback
-          - L >= k -> sample k unique
+        - empty pool -> fallback
+        - 0 < L < k -> shuffled pool + pad fallback
+        - L >= k -> sample k unique WITHOUT randperm(L)
         """
         L = int(pool.numel())
         if L == 0:
-            return torch.full((k,), int(fallback), dtype=torch.long, device=device)
+            return torch.full((k,), int(fallback), dtype=torch.long)
 
-        if L >= k:
-            idx = torch.randperm(L, device=pool.device)[:k]
-            return pool[idx].to(device)
+        if L < k:
+            perm = torch.randperm(L)  # L is small here
+            out = pool[perm]
+            pad = torch.full((k - L,), int(fallback), dtype=torch.long)
+            return torch.cat([out, pad], dim=0)
 
-        perm = torch.randperm(L, device=pool.device)
-        out = pool[perm]  # (L,)
-        pad = torch.full((k - L,), int(fallback), dtype=torch.long, device=pool.device)
-        return torch.cat([out, pad], dim=0).to(device)
+        # L >= k: sample k unique indices without building randperm(L)
+        if k == 1:
+            idx = torch.randint(0, L, (1,), dtype=torch.long)
+            return pool[idx]
+
+        chosen = torch.empty((0,), dtype=torch.long)
+        # draw in small chunks until we have k unique indices
+        while chosen.numel() < k:
+            need = k - int(chosen.numel())
+            draw = torch.randint(0, L, (max(need * 3, 16),), dtype=torch.long)
+            draw = torch.unique(draw)
+            chosen = torch.unique(torch.cat([chosen, draw], dim=0))
+        chosen = chosen[:k]
+        return pool[chosen]
+
+
+    # def _sample_k_tensor(self, pool: Tensor, k: int, fallback: int, device: torch.device) -> Tensor:
+    #     """
+    #     pool: 1D CPU tensor
+    #     returns: (k,) tensor on `device`
+
+    #     Fallback rules:
+    #       - empty pool -> [fallback]*k
+    #       - 0 < L < k -> shuffle all L once, then pad with fallback
+    #       - L >= k -> sample k unique
+    #     """
+    #     L = int(pool.numel())
+    #     if L == 0:
+    #         return torch.full((k,), int(fallback), dtype=torch.long, device=device)
+
+    #     if L >= k:
+    #         idx = torch.randperm(L, device=pool.device)[:k]
+    #         return pool[idx].to(device)
+
+    #     perm = torch.randperm(L, device=pool.device)
+    #     out = pool[perm]  # (L,)
+    #     pad = torch.full((k - L,), int(fallback), dtype=torch.long, device=pool.device)
+    #     return torch.cat([out, pad], dim=0).to(device)
 
     def _corrupt_go_terms(self, pos_go: Set[int], n_draw: int) -> List[int]:
         """
@@ -413,17 +449,35 @@ class RandomProteinSampler:
         anchors_t = torch.tensor(anchors, dtype=torch.long, device=device)
         z_anchor = z[anchors_t]  # (Nb, D)
 
-        idx_shared_neg = torch.empty((self.Nb, k), dtype=torch.long, device=device)
-        idx_pos_to_u_neg = torch.empty((self.Nb, k), dtype=torch.long, device=device)
-        idx_neg_to_u_pos = torch.empty((self.Nb, k), dtype=torch.long, device=device)
-        idx_shared_pos = torch.empty((self.Nb, k), dtype=torch.long, device=device)
+        # CPU index buffers
+        idx_shared_neg_cpu = torch.empty((self.Nb, k), dtype=torch.long)
+        idx_pos_to_u_neg_cpu = torch.empty((self.Nb, k), dtype=torch.long)
+        idx_neg_to_u_pos_cpu = torch.empty((self.Nb, k), dtype=torch.long)
+        idx_shared_pos_cpu = torch.empty((self.Nb, k), dtype=torch.long)
 
         for i, u in enumerate(anchors):
             fallback = int(u)
-            idx_shared_neg[i] = self._sample_k_tensor(self.batch_pool_shared_neg[i], k, fallback, device)
-            idx_pos_to_u_neg[i] = self._sample_k_tensor(self.batch_pool_pos_to_u_neg[i], k, fallback, device)
-            idx_neg_to_u_pos[i] = self._sample_k_tensor(self.batch_pool_neg_to_u_pos[i], k, fallback, device)
-            idx_shared_pos[i] = self._sample_k_tensor(self.batch_pool_shared_pos[i], k, fallback, device)
+            idx_shared_neg_cpu[i] = self._sample_k_tensor_cpu(self.batch_pool_shared_neg[i], k, fallback)
+            idx_pos_to_u_neg_cpu[i] = self._sample_k_tensor_cpu(self.batch_pool_pos_to_u_neg[i], k, fallback)
+            idx_neg_to_u_pos_cpu[i] = self._sample_k_tensor_cpu(self.batch_pool_neg_to_u_pos[i], k, fallback)
+            idx_shared_pos_cpu[i] = self._sample_k_tensor_cpu(self.batch_pool_shared_pos[i], k, fallback)
+
+        idx_shared_neg = idx_shared_neg_cpu.to(device)
+        idx_pos_to_u_neg = idx_pos_to_u_neg_cpu.to(device)
+        idx_neg_to_u_pos = idx_neg_to_u_pos_cpu.to(device)
+        idx_shared_pos = idx_shared_pos_cpu.to(device)
+
+        # idx_shared_neg = torch.empty((self.Nb, k), dtype=torch.long, device=device)
+        # idx_pos_to_u_neg = torch.empty((self.Nb, k), dtype=torch.long, device=device)
+        # idx_neg_to_u_pos = torch.empty((self.Nb, k), dtype=torch.long, device=device)
+        # idx_shared_pos = torch.empty((self.Nb, k), dtype=torch.long, device=device)
+
+        # for i, u in enumerate(anchors):
+        #     fallback = int(u)
+        #     idx_shared_neg[i] = self._sample_k_tensor(self.batch_pool_shared_neg[i], k, fallback, device)
+        #     idx_pos_to_u_neg[i] = self._sample_k_tensor(self.batch_pool_pos_to_u_neg[i], k, fallback, device)
+        #     idx_neg_to_u_pos[i] = self._sample_k_tensor(self.batch_pool_neg_to_u_pos[i], k, fallback, device)
+        #     idx_shared_pos[i] = self._sample_k_tensor(self.batch_pool_shared_pos[i], k, fallback, device)
 
         z_shared_neg = z[idx_shared_neg]    
         z_pos_to_u_neg = z[idx_pos_to_u_neg]
