@@ -19,7 +19,7 @@ python -u main.py \
   --path "data/human_data_withLC" \
   --task "human" \
   --model "hgcn" \
-  --batch_size 3024 \
+  --batch_size 6048 \
   --protein_splits \
   --use_rstatement_sampler \
   --use_nstatement_sampler \
