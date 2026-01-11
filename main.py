@@ -193,6 +193,7 @@ def main():
         use_nstatement_sampler=args.use_nstatementsampler, use_rstatement_sampler=args.use_rstatement_sampler)
     data_dict = dl.get_data()
 
+
     full_graph_all = dl.make_data_graph(data_dict, orthogonal=False)
     num_nodes = full_graph_all["node"].num_nodes
     base_x = full_graph_all["node"].x
@@ -206,7 +207,7 @@ def main():
         for etype, (src, tgt) in data_dict.items():
             if isinstance(etype, str) and etype.startswith("NOT_"): neg_edges_all.extend(zip(src.tolist(), etype, tgt.tolist()))
         if neg_edges_all: external_edges = neg_edges_all
-
+        print(f" ##### Total external negative edges: {len(external_edges)}")
 
     triples = build_triples_from_wikidata(args.path)
     train_heads = triples["train_heads"]
