@@ -270,4 +270,4 @@ class SGAT(nn.Module):
         h_dict = self.encode(data)
         z = h_dict[self.n_type]
         logits, probs = self.score_triples(z, edge_index, rel_ids)
-        return z, torch.sigmoid(logits)
+        return z, logits

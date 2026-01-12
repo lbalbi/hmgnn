@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=wikidata_gcn_NEW
+#SBATCH --job-name=wikidata_gcn_protCL_NEW
 #SBATCH --array=3-3
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
@@ -10,9 +10,9 @@
 set -euo pipefail
 
 RUN_TAG="run_${SLURM_ARRAY_TASK_ID}"
-LOG_DIR="output/wikidata_gcn_NEW"
-OUTDIR="${LOG_DIR}/output_wikidata_gcn_NEW_${RUN_TAG}"
-LOGFILE="${LOG_DIR}/output_wikidata_gcn_NEW_${RUN_TAG}.txt"
+LOG_DIR="output/wikidata_gcn_protCL_NEW"
+OUTDIR="${LOG_DIR}/output_wikidata_gcn_protCL_NEW_${RUN_TAG}"
+LOGFILE="${LOG_DIR}/output_wikidata_gcn_protCL_NEW_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
 python -u main.py \
@@ -20,7 +20,8 @@ python -u main.py \
   --task "wikidata" \
   --model "gcn" \
   --batch_size 3024 \
-  --no_contrastive \
-  --test_only \
-  --output_dir "wikidata_gcn_NEW/output_wikidata_gcn_NEW_${RUN_TAG}/" \
+  --finaltrain_only \
+  --final_lr 0.005 \
+  --final_epochs 70 \
+  --output_dir "wikidata_gcn_protCL_NEW/output_wikidata_gcn_protCL_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
