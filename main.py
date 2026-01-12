@@ -32,6 +32,9 @@ def main():
             'HIGH-degree proteins tend to stay in training.')
     parser.add_argument('--degree_gamma', type=float,default=10.0,
          help='Strength of degree bias for --protein_degree_splits. Larger => more high-degree proteins in training.')
+    parser.add_argument('--finaltrain_only', action='store_true', help="Only run final training without cross-validation")
+    parser.add_argument('--final_lr', type=float, default=0.01, help="Learning rate for final training")
+    parser.add_argument('--final_epochs', type=int, default=20, help="Number of epochs for final training")
     args = parser.parse_args()
     
     if args.protein_degree_splits and args.protein_splits:
@@ -199,89 +202,101 @@ def main():
     test_loader = Pygloader(test_graph, ppi_rel=ppi_rel, batch_size=args.batch_size,
                             val_split=0.0, device=device, seed=42)
 
-
-    kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
     best_lrs, best_epochs, best_alphas = [], [], []
+    if args.finaltrain_only:
+        # Use user-provided hyperparams, skip CV completely
+        best_lr = float(args.final_lr)
+        best_epoch = int(args.final_epochs)
 
-    def run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold_num: int):
-        """Train one CV fold and store best hyperparams."""
-        train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
-            batch_size=args.batch_size, device=device)
-        val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
-            batch_size=args.batch_size, device=device)
+        cw = cfg.get("contrastive_weight", 0.1)
+        if isinstance(cw, (list, tuple)): best_alpha = float(cw[0])
+        else: best_alpha = float(cw)
 
-        model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"],
-            out_dim=mcfg["out_dim"], e_etypes=[tuple(e) for e in mcfg["edge_types"]],
-            ppi_etype=ppi_rel).to(device)
-        log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold_num}",
-            dir=args.output_dir)
-
-        gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
-                   (args.path == "gda_data" or args.path == "dp_data") else None
-
-        trainer = Train(model, args.CV_epochs, train_loader, val_loader,
-            e_type=ppi_rel, val_edges=ppi_vei, val_edge_batch_size=args.batch_size,
-            log=log, lrs=cfg["lr"], device=device, full_graph=full_graph, full_cvgraph=fold_train_graph,
-            contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
-            pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
-            rstatement_sampler=args.use_rstatement_sampler,
-            task=args.task, gda_negs=gda_negs, no_contrastive=args.no_contrastive, patience=args.patience,
-            neg_ppi_edge_index=neg_ppi_edge_index)
-
-        lr, loss, _, epoch_, alpha_ = trainer.run()
-        best_epochs.append(epoch_)
-        best_lrs.append(lr)
-        best_alphas.append(alpha_)
-
-    if args.protein_splits or args.protein_degree_splits:
-        src_all = ppi_ei[0].cpu()
-        dst_all = ppi_ei[1].cpu()
-        trainval_edge_mask = torch.zeros(ppi_ei.size(1), dtype=torch.bool)
-        trainval_edge_mask[trainval_eids.cpu()] = True
-        tv_nodes = torch.unique(src_all[trainval_edge_mask])
-
-        for fold, (train_idx, val_idx) in enumerate(kf.split(tv_nodes.numpy()), 1):
-            print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
-
-            fold_val_nodes = tv_nodes[val_idx]
-            fold_val_mask = trainval_edge_mask & (
-                torch.isin(src_all, fold_val_nodes) | torch.isin(dst_all, fold_val_nodes))
-            fold_val_eids = all_eids[fold_val_mask]
-            fold_train_eids = all_eids[trainval_edge_mask & (~fold_val_mask)]
-
-            if fold_train_eids.numel() == 0 or fold_val_eids.numel() == 0:
-                print(f"[WARN] Skipping fold {fold}: "
-                    f"fold_train_eids={fold_train_eids.numel()}, fold_val_eids={fold_val_eids.numel()}",
-                    flush=True)
-                continue
-
-            fold_train_graph = split_helper_train._create_split_graph(fold_train_eids, train=True)
-            fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids, train=False)
-            run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold)
+        print("\n=== FINALTRAIN_ONLY mode: skipping cross-validation ===", flush=True)
+        print(f"Using final_lr={best_lr} | final_epochs={best_epoch} | contrastive_weight={best_alpha}", flush=True)
 
     else:
-        for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
-            print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
-            fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
-            fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
-            if fold_train_eids.numel() == 0 or fold_val_eids.numel() == 0:
-                print(f"[WARN] Skipping fold {fold}: "
-                    f"fold_train_eids={fold_train_eids.numel()}, fold_val_eids={fold_val_eids.numel()}",
-                    flush=True)
-                continue
+        kf = KFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
 
-            fold_train_graph = split_helper_train._create_split_graph(fold_train_eids, train=True)
-            fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids, train=False)
-            run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold)
-    if len(best_lrs) == 0:
-        raise RuntimeError("Cross-validation produced no trained folds (best_lrs is empty). "
-            "This usually happens if every fold was skipped because the fold's "
-            "train/val PPI edge set became empty under the current splitting rule. "
-            "Try lowering k_folds.") # degree-aware protein split
+        def run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold_num: int):
+            """Train one CV fold and store best hyperparams."""
+            train_loader = Pygloader(fold_train_graph, ppi_rel=ppi_rel, val_split=0,
+                batch_size=args.batch_size, device=device)
+            val_loader = Pygloader(fold_val_graph, ppi_rel=ppi_rel, val_split=0,
+                batch_size=args.batch_size, device=device)
 
-    best_lr = mode(best_lrs)
-    best_epoch = mode(best_epochs)
-    best_alpha = mode(best_alphas)
+            model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"],
+                out_dim=mcfg["out_dim"], e_etypes=[tuple(e) for e in mcfg["edge_types"]],
+                ppi_etype=ppi_rel).to(device)
+            log = Logger(f"{ModelCls.__name__ if args.model != 'gae' else 'GAE'}_fold{fold_num}",
+                dir=args.output_dir)
+
+            gda_negs = dl.get_negative_edges() if hasattr(dl, "get_negative_edges") and \
+                    (args.path == "gda_data" or args.path == "dp_data") else None
+
+            trainer = Train(model, args.CV_epochs, train_loader, val_loader,
+                e_type=ppi_rel, val_edges=ppi_vei, val_edge_batch_size=args.batch_size,
+                log=log, lrs=cfg["lr"], device=device, full_graph=full_graph, full_cvgraph=fold_train_graph,
+                contrastive_weight=cfg["contrastive_weight"], state_list=state_list,
+                pstatement_sampler=args.use_pstatement_sampler, nstatement_sampler=args.use_nstatement_sampler,
+                rstatement_sampler=args.use_rstatement_sampler,
+                task=args.task, gda_negs=gda_negs, no_contrastive=args.no_contrastive, patience=args.patience,
+                neg_ppi_edge_index=neg_ppi_edge_index)
+
+            lr, loss, _, epoch_, alpha_ = trainer.run()
+            best_epochs.append(epoch_)
+            best_lrs.append(lr)
+            best_alphas.append(alpha_)
+
+        if args.protein_splits or args.protein_degree_splits:
+            src_all = ppi_ei[0].cpu()
+            dst_all = ppi_ei[1].cpu()
+            trainval_edge_mask = torch.zeros(ppi_ei.size(1), dtype=torch.bool)
+            trainval_edge_mask[trainval_eids.cpu()] = True
+            tv_nodes = torch.unique(src_all[trainval_edge_mask])
+
+            for fold, (train_idx, val_idx) in enumerate(kf.split(tv_nodes.numpy()), 1):
+                print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
+
+                fold_val_nodes = tv_nodes[val_idx]
+                fold_val_mask = trainval_edge_mask & (
+                    torch.isin(src_all, fold_val_nodes) | torch.isin(dst_all, fold_val_nodes))
+                fold_val_eids = all_eids[fold_val_mask]
+                fold_train_eids = all_eids[trainval_edge_mask & (~fold_val_mask)]
+
+                if fold_train_eids.numel() == 0 or fold_val_eids.numel() == 0:
+                    print(f"[WARN] Skipping fold {fold}: "
+                        f"fold_train_eids={fold_train_eids.numel()}, fold_val_eids={fold_val_eids.numel()}",
+                        flush=True)
+                    continue
+
+                fold_train_graph = split_helper_train._create_split_graph(fold_train_eids, train=True)
+                fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids, train=False)
+                run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold)
+
+        else:
+            for fold, (train_idx, val_idx) in enumerate(kf.split(trainval_eids), 1):
+                print(f"\n=== Fold {fold}/{cfg['k_folds']} ===", flush=True)
+                fold_train_eids = trainval_eids[torch.tensor(train_idx, dtype=torch.long)]
+                fold_val_eids = trainval_eids[torch.tensor(val_idx, dtype=torch.long)]
+                if fold_train_eids.numel() == 0 or fold_val_eids.numel() == 0:
+                    print(f"[WARN] Skipping fold {fold}: "
+                        f"fold_train_eids={fold_train_eids.numel()}, fold_val_eids={fold_val_eids.numel()}",
+                        flush=True)
+                    continue
+
+                fold_train_graph = split_helper_train._create_split_graph(fold_train_eids, train=True)
+                fold_val_graph, ppi_vei = split_helper_train._create_split_graph(fold_val_eids, train=False)
+                run_one_fold(fold_train_graph, fold_val_graph, ppi_vei, fold)
+        if len(best_lrs) == 0:
+            raise RuntimeError("Cross-validation produced no trained folds (best_lrs is empty). "
+                "This usually happens if every fold was skipped because the fold's "
+                "train/val PPI edge set became empty under the current splitting rule. "
+                "Try lowering k_folds.") # degree-aware protein split
+
+        best_lr = mode(best_lrs)
+        best_epoch = mode(best_epochs)
+        best_alpha = mode(best_alphas)
     final_model = ModelCls(in_dim=mcfg["in_feats"], hidden_dim=mcfg["hidden_dim"], out_dim=mcfg["out_dim"],
                 e_etypes=[tuple(e) for e in mcfg["edge_types"]],ppi_etype=ppi_rel).to(device)
     
