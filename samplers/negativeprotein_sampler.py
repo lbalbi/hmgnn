@@ -200,26 +200,48 @@ class NegativeProteinSampler:
     #     else: idx = torch.randint(0, L, (k,))
     #     return pool[idx].to(device)
 
+    # def _sample_k_tensor(self, pool: Tensor, k: int, fallback: int, device: torch.device) -> Tensor:
+    #     """Sample up to k unique indices from pool; pad with fallback to keep shape stable.
+    #     - If pool is empty: returns [fallback] * k
+    #     - If 0 < len(pool) < k: returns all pool entries once (shuffled) + [fallback] * (k-len(pool))
+    #     - If len(pool) >= k: returns k unique samples (no replacement)
+    #     """
+    #     L = int(pool.numel())
+    #     if L == 0:
+    #         return torch.full((k,), int(fallback), dtype=torch.long, device=device)
+
+    #     if L >= k:
+    #         idx = torch.randperm(L)[:k]
+    #         return pool[idx].to(device)
+
+    #     # 0 < L < k: use all candidates once, then pad with fallback
+    #     perm = torch.randperm(L)
+    #     out = pool[perm]  # all unique candidates, shuffled
+    #     pad = torch.full((k - L,), int(fallback), dtype=torch.long)  # CPU
+    #     out = torch.cat([out, pad], dim=0)
+    #     return out.to(device)
+
     def _sample_k_tensor(self, pool: Tensor, k: int, fallback: int, device: torch.device) -> Tensor:
-        """Sample up to k unique indices from pool; pad with fallback to keep shape stable.
-        - If pool is empty: returns [fallback] * k
-        - If 0 < len(pool) < k: returns all pool entries once (shuffled) + [fallback] * (k-len(pool))
-        - If len(pool) >= k: returns k unique samples (no replacement)
-        """
         L = int(pool.numel())
         if L == 0:
             return torch.full((k,), int(fallback), dtype=torch.long, device=device)
+        if k == 1:
+            j = torch.randint(0, L, (1,))
+            return pool[j].to(device)
+        if L < k:
+            perm = torch.randperm(L)
+            out = pool[perm]
+            pad = torch.full((k - L,), int(fallback), dtype=torch.long)
+            return torch.cat([out, pad], dim=0).to(device)
+        need = k
+        drawn = torch.empty(0, dtype=torch.long)
+        while drawn.numel() < k:
+            draw = torch.randint(0, L, (min(L, 4 * need),), dtype=torch.long)
+            drawn = torch.unique(torch.cat([drawn, draw]))
+            need = k - drawn.numel()
 
-        if L >= k:
-            idx = torch.randperm(L)[:k]
-            return pool[idx].to(device)
-
-        # 0 < L < k: use all candidates once, then pad with fallback
-        perm = torch.randperm(L)
-        out = pool[perm]  # all unique candidates, shuffled
-        pad = torch.full((k - L,), int(fallback), dtype=torch.long)  # CPU
-        out = torch.cat([out, pad], dim=0)
-        return out.to(device)
+        idx = drawn[:k]
+        return pool[idx].to(device)
 
 
     def get_contrastive_samples(self, z: Tensor, neg_statement_index: Optional[Tensor] = None

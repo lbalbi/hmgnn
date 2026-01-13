@@ -118,7 +118,7 @@ class Train_BestModel:
             if self.rstatement_sampler:
                 self.neg_statement_sampler.prepare_batch(batch, pos_edge_index)
                 neg_statement_index = self.neg_statement_sampler.sample()
-            elif self.nstatement__sampler or self.pstatement_sampler:
+            elif (self.nstatement__sampler or self.pstatement_sampler) and not self.no_contrastive:
                 self.neg_statement_sampler.prepare_batch(batch, pos_edge_index)
                 # self.neg_statement_sampler.prepare_batch(batch)
                 # neg_statement_index = self.neg_statement_sampler.sample()

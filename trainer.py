@@ -161,10 +161,10 @@ class Train:
             edge_index_pairs, labels, pos_index = self._prepare_pairs_and_labels(
                 batch, pos_index=None)
 
-            if self.rstatement_sampler:
+            if self.rstatement_sampler and not self.no_contrastive:
                 self.neg_statement_sampler.prepare_batch(batch, pos_index)
                 neg_stmt_idx = self.neg_statement_sampler.sample()
-            elif self.nstatement_sampler or self.pstatement_sampler:
+            elif (self.nstatement_sampler or self.pstatement_sampler) and not self.no_contrastive:
                 self.neg_statement_sampler.prepare_batch(batch, pos_index)
                 # self.neg_statement_sampler.prepare_batch(batch)
                 # neg_stmt_idx = self.neg_statement_sampler.sample()
