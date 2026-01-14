@@ -1,28 +1,25 @@
 #!/bin/bash
-#SBATCH --job-name=wikidata_sgat_NEW
-#SBATCH --array=7-7
+#SBATCH --job-name=wikidata_gat_NEW
+#SBATCH --array=1-5
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
-#SBATCH --nodelist=liseda-03
+#SBATCH --nodelist=liseda-01
 #SBATCH --partition=tier3
 
 set -euo pipefail
 
 RUN_TAG="run_${SLURM_ARRAY_TASK_ID}"
-LOG_DIR="output/wikidata_sgat_NEW"
-OUTDIR="${LOG_DIR}/output_wikidata_sgat_NEW_${RUN_TAG}"
-LOGFILE="${LOG_DIR}/output_wikidata_sgat_NEW_${RUN_TAG}.txt"
+LOG_DIR="output/wikidata_gat_NEW"
+OUTDIR="${LOG_DIR}/output_wikidata_gat_NEW_${RUN_TAG}"
+LOGFILE="${LOG_DIR}/output_wikidata_gat_NEW_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
 python -u main.py \
   --path "data/wikidata_data" \
   --task "wikidata" \
-  --model "sgat" \
+  --model "gat" \
   --no_contrastive \
   --batch_size 3024 \
-  --finaltrain_only \
-  --final_lr 0.005 \
-  --final_epochs 50 \
-  --output_dir "wikidata_sgat_NEW/output_wikidata_sgat_NEW_${RUN_TAG}/" \
+  --output_dir "wikidata_gat_NEW/output_wikidata_gat_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
