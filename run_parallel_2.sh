@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=human_hgat_protCL_NEW
-#SBATCH --array=1-5
+#SBATCH --array=3-3
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
