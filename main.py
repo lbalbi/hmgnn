@@ -325,7 +325,7 @@ def main():
             final_base_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
                 out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=encoder_e_etypes,
                 n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
-            if args.model in ("ra_hgcn", "sra_hgcn", "gcn","gae"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+            if args.model in ("ra_hgcn", "sra_hgcn", "ra_hgat", "gcn","gae", "gat"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
             else: final_model = ModelCls(**final_base_kwargs).to(device)
             
             state = torch.load(model_path, map_location=device)
@@ -360,7 +360,7 @@ def main():
             base_model_kwargs = dict(in_dim=in_dim, hidden_dim=mcfg["hidden_dim"],
                 out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]), e_etypes=list(fold_graph.edge_types),
                 n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
-            if args.model in ("ra_hgcn", "sra_hgcn", "gcn", "gae"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
+            if args.model in ("ra_hgcn", "sra_hgcn","ra_hgat", "gcn", "gae", "gat"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
             #if args.model in ("gcn","ra_hgcn"): model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
             else: model_fold = ModelCls(**base_model_kwargs).to(device)
             sampler_graph = struct_graph
@@ -417,7 +417,7 @@ def main():
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"))
 
         # if args.model in ("ra_hgcn", "gcn"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
-        if args.model in ("ra_hgcn", "sra_hgcn", "gcn","gae"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+        if args.model in ("ra_hgcn", "sra_hgcn","ra_hgat", "gcn","gat","gae"): final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
         else: final_model = ModelCls(**final_base_kwargs).to(device)
         final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
