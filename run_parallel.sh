@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=human_gcn_noNegs_perProt_NEW
-#SBATCH --array=4-4
+#SBATCH --array=5-5
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
