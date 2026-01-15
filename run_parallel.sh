@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=human_gat_noNegs_perProt_NEW
+#SBATCH --job-name=human_hgcn_noNegs_perProt_NEW
 #SBATCH --array=1-5
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
@@ -10,9 +10,9 @@
 set -euo pipefail
 
 RUN_TAG="run_${SLURM_ARRAY_TASK_ID}"
-LOG_DIR="output/human_gat_noNegs_perProt_NEW"
-OUTDIR="${LOG_DIR}/human_gat_noNegs_perProt_NEW_${RUN_TAG}"
-LOGFILE="${LOG_DIR}/human_gat_noNegs_perProt_NEW_${RUN_TAG}.txt"
+LOG_DIR="output/human_hgcn_noNegs_perProt_NEW"
+OUTDIR="${LOG_DIR}/human_hgcn_noNegs_perProt_NEW_${RUN_TAG}"
+LOGFILE="${LOG_DIR}/human_hgcn_noNegs_perProt_NEW_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
 python -u main.py \
@@ -20,9 +20,9 @@ python -u main.py \
   --task "human" \
   --no_contrastive \
   --use_nstatement_sampler \
-  --model "gat" \
+  --model "hgcn" \
   --patience 15 \
   --protein_splits \
   --batch_size 3024 \
-  --output_dir "human_gat_noNegs_perProt_NEW/human_gat_noNegs_perProt_NEW_${RUN_TAG}/" \
+  --output_dir "human_hgcn_noNegs_perProt_NEW/human_hgcn_noNegs_perProt_NEW_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
