@@ -16,7 +16,7 @@ class RA_HGAT(nn.Module):
       heads * head_dim == hidden_dim
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int,
+    def __init__(self, in_dim: Union[int, Dict[str, int]], hidden_dim: int, out_dim: int,
         e_etypes: List[Tuple[str, str, str]], n_type: str = "node",
         num_layers: int = 2, rel2id: Optional[Dict[str, int]] = None,
         heads: int = 4, attn_dropout: float = 0.0, aggr: str = "mean"):
@@ -42,14 +42,23 @@ class RA_HGAT(nn.Module):
         self.rel2id: Dict[str, int] = rel2id
         self.num_rel = len(self.rel2id)
 
+        # --- normalize in_dim to a per-node-type dict ---
+        if isinstance(in_dim, dict): node_in_dim = in_dim
+        else:
+            ntypes = {s for (s, _, _) in e_etypes} | {d for (_, _, d) in e_etypes}
+            node_in_dim = {nt: in_dim for nt in ntypes}
+
         # ----- Heterogeneous GAT encoder -----
-        # Use in_channels=(-1, -1) so PyG infers per node-type feature sizes automatically.
         convs: List[HeteroConv] = []
         for _layer in range(num_layers):
             conv_dict = {}
             for (src_nt, rel, dst_nt) in e_etypes:
+                if _layer == 0:
+                    src_in = node_in_dim[src_nt]
+                    dst_in = node_in_dim[dst_nt]
+                else: src_in = dst_in = hidden_dim
                 conv_dict[(src_nt, rel, dst_nt)] = GATConv(
-                    in_channels=(-1, -1), out_channels=head_dim,
+                    in_channels=(src_in, dst_in), out_channels=head_dim,
                     heads=heads, concat=True, dropout=attn_dropout,
                     add_self_loops=(src_nt == dst_nt),  # avoid invalid loops on bipartite edges
                     bias=True)
