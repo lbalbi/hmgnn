@@ -8,3 +8,4 @@ scripts/
 *.csv
 slurm_log.txt
 aggregate_results_updated.py
+*.tsv
