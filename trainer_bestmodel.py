@@ -467,6 +467,25 @@ class Test_BestModel:
                     else: z, out = self.model(hom_data.x, mapped_pairs)
                 else: _, out = self.model(g, edge_index)
 
+                import numpy as np
+                from sklearn.metrics import confusion_matrix, precision_recall_curve
+
+                probs = out.detach().cpu().numpy().reshape(-1)
+                y = labels.detach().cpu().numpy().astype(int)
+                print("Eval batch size:", len(y))
+                print("Pos rate (should be ~0.5 if you sampled 1:1 negs):", y.mean())
+                pred = (probs >= 0.5).astype(int)
+                tn, fp, fn, tp = confusion_matrix(y, pred).ravel()
+                print("Confusion @0.5: TP,FP,FN,TN =", tp, fp, fn, tn)
+                print("Precision(+):", tp / (tp + fp + 1e-12))
+                print("Recall(+):", tp / (tp + fn + 1e-12))
+                print("Score mean pos:", probs[y==1].mean(), "neg:", probs[y==0].mean())
+                print("Score median pos:", np.median(probs[y==1]), "neg:", np.median(probs[y==0]))
+                prec, rec, thr = precision_recall_curve(y, probs)
+                f1 = 2 * prec * rec / (prec + rec + 1e-12)
+                best = np.argmax(f1)
+                print("Best F1 threshold:", thr[max(best-1,0)])
+                print("Best Precision/Recall:", prec[best], rec[best])
                 all_labels.append(labels.cpu())
                 all_out.append(out.cpu())
 
