@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=wikidata_gcn_noNegs_RandomNegs_NEW
-#SBATCH --array=1-3
+#SBATCH --array=3-3
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
