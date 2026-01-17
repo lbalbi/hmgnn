@@ -344,7 +344,7 @@ class Train:
                             self.val_idx, z_val, train=False)
 
                 if val_probs is not None and val_labels is not None:
-                    val_metrics = self.metrics.update(val_probs, val_labels)
+                    val_metrics = self.metrics.update_all(val_probs, val_labels)
                 else:
                     val_metrics = None
 
@@ -355,7 +355,7 @@ class Train:
                         f"ValLoss(BCE)={val_bce:.4f}")
                     if val_metrics is not None:
                         msg += " | " + ", ".join(f"{name}={val_metrics[i]:.4f}"
-                            for i, name in enumerate(self.metrics.get_names()))
+                            for i, name in enumerate(self.metrics.get_allnames()))
                     self.log.log(msg)
 
                 if val_bce < best_val_loss_lr:

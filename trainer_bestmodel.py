@@ -7,6 +7,21 @@ from samplers import (NegativeSampler, NegativeStatementSampler, NegativeInstanc
     PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 
+import os
+def atomic_torch_save(obj, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+def maybe_load_neg_cache(path: str, map_location: str = "cpu"):
+    if path is None:
+        return None
+    if not os.path.exists(path):
+        return None
+    print(f"Loading negative sample cache", flush=True)
+    return torch.load(path, map_location=map_location)
+
 
 class Train_BestModel:
     """Final training on the full training set for a fixed number of epochs
@@ -328,8 +343,9 @@ class Test_BestModel:
 
     def __init__(self, model: nn.Module, graph: HeteroData, test_heads: torch.Tensor,
         test_rels: torch.Tensor, test_tails: torch.Tensor, id2rel: Dict[int, str],
-        neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int, device: torch.device,
-        log, batch_size: int = 1024):
+        neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int, 
+        device: torch.device, log, batch_size: int = 1024,
+        neg_cache_path: Optional[str] = None, force_regen_negs: bool = False):
         self.model = model.to(device)
         self.graph = graph
         self.test_heads = test_heads
@@ -338,6 +354,8 @@ class Test_BestModel:
         self.id2rel = id2rel
         self.neg_samplers = neg_samplers
         self.num_neg_per_pos = int(num_neg_per_pos)
+        self.neg_cache_path = neg_cache_path
+        self.force_regen_negs = force_regen_negs
         self.device = device
         self.log = log
         self.batch_size = int(batch_size)
@@ -414,62 +432,202 @@ class Test_BestModel:
         if neg_edge_index.size(1) > num_to_sample:neg_edge_index = neg_edge_index[:, :num_to_sample]
         return neg_edge_index
 
+    # def run(self):
+    #     self.graph = self.graph.to(self.device)
+    #     self.test_heads = self.test_heads.to(self.device)
+    #     self.test_rels = self.test_rels.to(self.device)
+    #     self.test_tails = self.test_tails.to(self.device)
+    #     # passed to cpu because of RA-HGCN
+    #     self.model = self.model.cpu()
+    #     graph_cpu = self.graph.cpu()
+        
+    #     cached = None
+    #     if (self.neg_cache_path is not None) and (not self.force_regen_negs):
+    #         cached = maybe_load_neg_cache(self.neg_cache_path, map_location="cpu")
+
+    #     self.model.eval()
+    #     # with torch.no_grad():
+    #     with torch.inference_mode():
+    #         h_dict = self.model.encode(graph_cpu)
+    #         z = h_dict[getattr(self.model, "n_type", "node")]
+    #         del h_dict
+    #         pos_probs = self._score_triples_in_batches(
+    #             z, self.test_heads, self.test_rels, self.test_tails)
+    #         pos_labels = torch.ones_like(pos_probs)
+
+    #         if cached is not None:
+    #             neg_heads = cached["neg_heads"].to(self.device)
+    #             neg_rels  = cached["neg_rels"].to(self.device)
+    #             neg_tails = cached["neg_tails"].to(self.device)
+    #         else:
+    #             neg_heads_list,neg_rels_list,neg_tails_list = [], [], []
+
+    #         unique_rels = torch.unique(self.test_rels)
+    #         for rel_id in unique_rels.tolist():
+    #             rel_name = self.id2rel[rel_id]
+    #             sampler = self.neg_samplers.get(rel_name, None)
+    #             if sampler is None: continue
+    #             # group by head within this relation
+    #             mask = (self.test_rels == rel_id)
+    #             h_rel = self.test_heads[mask]
+    #             if h_rel.numel() == 0:  continue
+
+    #             uniq_h, pos_counts_per_h = torch.unique(h_rel, return_counts=True)
+    #             neg_counts_per_h = pos_counts_per_h * self.num_neg_per_pos
+    #             extra_invalid = self.test_pos_ids_per_rel.get(rel_name, set())
+    #             neg_src, neg_dst = sampler.sample_for_heads(
+    #                 uniq_h.to(sampler.device),neg_counts_per_h.to(sampler.device),
+    #                 extra_invalid_ids=extra_invalid)
+
+    #             if neg_src.numel() == 0: continue
+    #             neg_src = neg_src.to(self.device)
+    #             neg_dst = neg_dst.to(self.device)
+    #             r_neg = torch.full((neg_src.size(0),), rel_id, dtype=torch.long, device=self.device)
+
+    #             neg_heads_list.append(neg_src)
+    #             neg_tails_list.append(neg_dst)
+    #             neg_rels_list.append(r_neg)
+
+
+    #         # unique_rels, counts = torch.unique(self.test_rels, return_counts=True)
+    #         # for rel_id, count in zip(unique_rels.tolist(), counts.tolist()):
+    #         #     rel_name = self.id2rel[rel_id]
+    #         #     sampler = self.neg_samplers.get(rel_name, None)
+    #         #     if sampler is None: continue
+
+    #         #     num_to_sample = count * self.num_neg_per_pos
+    #         #     neg_edge_index = self._sample_negatives_excluding_test(
+    #         #         sampler, rel_name, num_to_sample)
+
+    #         #     if neg_edge_index.numel() == 0: continue
+    #         #     neg_edge_index = neg_edge_index.to(self.device)
+    #         #     h_neg = neg_edge_index[0]
+    #         #     t_neg = neg_edge_index[1]
+    #         #     r_neg = torch.full((h_neg.size(0),), rel_id,
+    #         #         dtype=torch.long, device=self.device)
+    #         #     neg_heads_list.append(h_neg)
+    #         #     neg_tails_list.append(t_neg)
+    #         #     neg_rels_list.append(r_neg)
+
+    #         if neg_heads_list:
+    #             neg_heads = torch.cat(neg_heads_list, dim=0)
+    #             neg_tails = torch.cat(neg_tails_list, dim=0)
+    #             neg_rels = torch.cat(neg_rels_list, dim=0)
+    #             neg_probs = self._score_triples_in_batches(
+    #                 z, neg_heads, neg_rels, neg_tails)
+    #             neg_labels = torch.zeros_like(neg_probs)
+    #             all_probs = torch.cat([pos_probs, neg_probs], dim=0)
+    #             all_labels = torch.cat([pos_labels, neg_labels], dim=0)
+    #         else:
+    #             all_probs = pos_probs
+    #             all_labels = pos_labels
+
+
+    #         metrics = self.metrics.update_all(all_probs, all_labels)
+    #         names = self.metrics.get_allnames()
+    #         self.log.log("=== Test metrics (global) ===")
+    #         for name, val in zip(names, metrics):
+    #             self.log.log(f"{name}: {val:.4f}")
+    #     return metrics
+
+
     def run(self):
         self.graph = self.graph.to(self.device)
         self.test_heads = self.test_heads.to(self.device)
-        self.test_rels = self.test_rels.to(self.device)
+        self.test_rels  = self.test_rels.to(self.device)
         self.test_tails = self.test_tails.to(self.device)
-        # passed to cpu because of RA-HGCN
+        # RA-HGCN path: encode on CPU
         self.model = self.model.cpu()
         graph_cpu = self.graph.cpu()
-        
-        self.model.eval()
-        # with torch.no_grad():
+
+        cached = None
+        if (self.neg_cache_path is not None) and (not self.force_regen_negs):
+            cached = maybe_load_neg_cache(self.neg_cache_path, map_location="cpu")
+
         with torch.inference_mode():
             h_dict = self.model.encode(graph_cpu)
             z = h_dict[getattr(self.model, "n_type", "node")]
             del h_dict
+
             pos_probs = self._score_triples_in_batches(
-                z, self.test_heads, self.test_rels, self.test_tails)
+                z, self.test_heads, self.test_rels, self.test_tails
+            )
             pos_labels = torch.ones_like(pos_probs)
-            neg_heads_list,neg_rels_list,neg_tails_list = [], [], []
 
-            unique_rels, counts = torch.unique(self.test_rels, return_counts=True)
-            for rel_id, count in zip(unique_rels.tolist(), counts.tolist()):
-                rel_name = self.id2rel[rel_id]
-                sampler = self.neg_samplers.get(rel_name, None)
-                if sampler is None: continue
+            # --- if cache ok, use it ---
+            if cached is not None:
+                neg_heads = cached["neg_heads"].to(self.device)
+                neg_rels  = cached["neg_rels"].to(self.device)
+                neg_tails = cached["neg_tails"].to(self.device)
+            else:
+                # --- generate negatives per (rel, head) ---
+                neg_heads_list, neg_rels_list, neg_tails_list = [], [], []
 
-                num_to_sample = count * self.num_neg_per_pos
-                neg_edge_index = self._sample_negatives_excluding_test(
-                    sampler, rel_name, num_to_sample)
+                unique_rels = torch.unique(self.test_rels)
+                for rel_id in unique_rels.tolist():
+                    rel_name = self.id2rel[rel_id]
+                    sampler = self.neg_samplers.get(rel_name, None)
+                    if sampler is None:
+                        continue
 
-                if neg_edge_index.numel() == 0: continue
-                neg_edge_index = neg_edge_index.to(self.device)
-                h_neg = neg_edge_index[0]
-                t_neg = neg_edge_index[1]
-                r_neg = torch.full((h_neg.size(0),), rel_id,
-                    dtype=torch.long, device=self.device)
-                neg_heads_list.append(h_neg)
-                neg_tails_list.append(t_neg)
-                neg_rels_list.append(r_neg)
+                    mask = (self.test_rels == rel_id)
+                    h_rel = self.test_heads[mask]
+                    if h_rel.numel() == 0:
+                        continue
 
-            if neg_heads_list:
-                neg_heads = torch.cat(neg_heads_list, dim=0)
-                neg_tails = torch.cat(neg_tails_list, dim=0)
-                neg_rels = torch.cat(neg_rels_list, dim=0)
-                neg_probs = self._score_triples_in_batches(
-                    z, neg_heads, neg_rels, neg_tails)
+                    uniq_h, pos_counts_per_h = torch.unique(h_rel, return_counts=True)
+                    neg_counts_per_h = pos_counts_per_h * self.num_neg_per_pos
+
+                    extra_invalid = self.test_pos_ids_per_rel.get(rel_name, set())
+                    neg_src, neg_dst = sampler.sample_for_heads(
+                        uniq_h.to(sampler.device),
+                        neg_counts_per_h.to(sampler.device),
+                        extra_invalid_ids=extra_invalid
+                    )
+
+                    if neg_src.numel() == 0:
+                        continue
+
+                    neg_src = neg_src.to(self.device)
+                    neg_dst = neg_dst.to(self.device)
+                    r_neg = torch.full((neg_src.size(0),), rel_id,
+                                    dtype=torch.long, device=self.device)
+
+                    neg_heads_list.append(neg_src)
+                    neg_tails_list.append(neg_dst)
+                    neg_rels_list.append(r_neg)
+
+                if neg_heads_list:
+                    neg_heads = torch.cat(neg_heads_list, dim=0)
+                    neg_tails = torch.cat(neg_tails_list, dim=0)
+                    neg_rels  = torch.cat(neg_rels_list,  dim=0)
+                else:
+                    neg_heads = torch.empty(0, dtype=torch.long, device=self.device)
+                    neg_tails = torch.empty(0, dtype=torch.long, device=self.device)
+                    neg_rels  = torch.empty(0, dtype=torch.long, device=self.device)
+
+                # --- save cache (CPU tensors) ---
+                if self.neg_cache_path is not None:
+                    payload = {
+                        "neg_heads": neg_heads.detach().cpu(),
+                        "neg_rels":  neg_rels.detach().cpu(),
+                        "neg_tails": neg_tails.detach().cpu(),
+                        "meta": {
+                            "num_neg_per_pos": int(self.num_neg_per_pos),
+                            "num_nodes": int(self.num_nodes)}}
+                    atomic_torch_save(payload, self.neg_cache_path)
+
+            if neg_heads.numel() > 0:
+                neg_probs = self._score_triples_in_batches(z, neg_heads, neg_rels, neg_tails)
                 neg_labels = torch.zeros_like(neg_probs)
-                all_probs = torch.cat([pos_probs, neg_probs], dim=0)
+                all_probs  = torch.cat([pos_probs, neg_probs], dim=0)
                 all_labels = torch.cat([pos_labels, neg_labels], dim=0)
             else:
-                all_probs = pos_probs
-                all_labels = pos_labels
+                all_probs, all_labels = pos_probs, pos_labels
 
             metrics = self.metrics.update_all(all_probs, all_labels)
             names = self.metrics.get_allnames()
             self.log.log("=== Test metrics (global) ===")
             for name, val in zip(names, metrics):
                 self.log.log(f"{name}: {val:.4f}")
-        return metrics
+            return metrics

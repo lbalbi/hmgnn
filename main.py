@@ -1,7 +1,7 @@
 import torch.multiprocessing as mp
 # mp.set_sharing_strategy("file_system")
 import argparse, os, statistics, torch
-from typing import Dict, List
+from typing import Dict, Tuple, List
 import pandas as pd
 from sklearn.model_selection import KFold
 from torch_geometric.loader import NeighborLoader
@@ -17,6 +17,82 @@ from samplers import (PartialStatementSampler, NegativeStatementSampler, RandomS
 import os, resource
 print("RLIMIT_NOFILE:", resource.getrlimit(resource.RLIMIT_NOFILE))
 print("Open FDs now:", len(os.listdir("/proc/self/fd")))
+
+import random
+from collections import defaultdict
+
+
+def make_hr_paired_balanced_dataset(
+    heads: torch.Tensor,
+    rels: torch.Tensor,
+    tails: torch.Tensor,
+    labels: torch.Tensor,
+    seed: int = 42,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """
+    Re-orders/filters the classification triple tensors so they are arranged as:
+        [pos0, neg0, pos1, neg1, ...]
+    where each (pos,neg) pair shares the SAME (head h, relation r).
+
+    This guarantees that if you split by "pair index", both train and val splits
+    will have equal pos/neg counts per (h,r).
+
+    Returns:
+        heads2, rels2, tails2, labels2, num_pairs
+    """
+    assert heads.numel() == rels.numel() == tails.numel() == labels.numel()
+
+    pos = defaultdict(list)  # (h,r) -> [idx...]
+    neg = defaultdict(list)  # (h,r) -> [idx...]
+
+    # group indices by (h,r) and label
+    for i in range(labels.numel()):
+        key = (int(heads[i]), int(rels[i]))
+        if float(labels[i]) > 0.5:
+            pos[key].append(i)
+        else:
+            neg[key].append(i)
+
+    rng = random.Random(seed)
+
+    # build (pos_idx, neg_idx) pairs per (h,r)
+    pairs: List[Tuple[int, int]] = []
+    for key, p_list in pos.items():
+        n_list = neg.get(key, [])
+        if not n_list:
+            continue
+        rng.shuffle(p_list)
+        rng.shuffle(n_list)
+        m = min(len(p_list), len(n_list))
+        # pair up to m to enforce equal counts within each (h,r)
+        for j in range(m):
+            pairs.append((p_list[j], n_list[j]))
+
+    if not pairs:
+        raise RuntimeError("No (head,rel) groups had both positives and negatives.")
+
+    rng.shuffle(pairs)  # shuffle pair order globally, but keep (pos,neg) adjacency
+
+    flat_idx = [i for (pi, ni) in pairs for i in (pi, ni)]
+    sel = torch.tensor(flat_idx, dtype=torch.long)
+
+    heads2 = heads[sel]
+    rels2  = rels[sel]
+    tails2 = tails[sel]
+    labels2 = labels[sel]
+
+    # sanity: every consecutive pair shares (h,r) and is (1,0) labels
+    # (can comment out after verifying once)
+    for k in range(0, labels2.numel(), 2):
+        assert int(heads2[k]) == int(heads2[k+1])
+        assert int(rels2[k]) == int(rels2[k+1])
+        assert float(labels2[k]) > 0.5
+        assert float(labels2[k+1]) < 0.5
+
+    num_pairs = len(pairs)
+    return heads2, rels2, tails2, labels2, num_pairs
+
+
 
 def build_hgcn_encoder_graph(struct_graph: HeteroData, subclass_rel: str = "subclass_of",
     neg_prefix: str = "NOT_") -> HeteroData:
@@ -247,8 +323,15 @@ def main():
     cls_idx = torch.nonzero(inst_inst_mask, as_tuple=False).view(-1)
     cls_heads = train_heads[cls_idx]
     cls_tails = train_tails[cls_idx]
-    cls_rels = train_rels[cls_idx]
+    cls_rels  = train_rels[cls_idx]
     cls_labels = train_labels[cls_idx]
+    # NEW: enforce paired (h,r) pos/neg structure for correct splitting
+    cls_heads, cls_rels, cls_tails, cls_labels, num_pairs = make_hr_paired_balanced_dataset(
+        cls_heads, cls_rels, cls_tails, cls_labels, seed=42
+    )
+    num_cls_triples = cls_heads.size(0)
+    print(f"[Balanced] Classification triples now: {num_cls_triples} (pairs: {num_pairs})", flush=True)
+
     cls_raw_rels = [train_raw_rels[i] for i in cls_idx.tolist()]
 
     relation_has_inst_class = set()
@@ -338,10 +421,13 @@ def main():
 
     else:    
         kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
-        for fold, (train_idx_np, val_idx_np) in enumerate(
-            kf.split(range(num_cls_triples)), start=1):
-            train_idx = torch.tensor(train_idx_np, dtype=torch.long)
-            val_idx = torch.tensor(val_idx_np, dtype=torch.long)
+        # for fold, (train_idx_np, val_idx_np) in enumerate(
+        #     kf.split(range(num_cls_triples)), start=1):
+        for fold, (train_pairs_np, val_pairs_np) in enumerate(kf.split(range(num_pairs)), start=1):
+            train_pairs  = torch.tensor(train_pairs_np, dtype=torch.long)
+            val_pairs = torch.tensor(val_pairs_np, dtype=torch.long)
+            train_idx = torch.stack([2 * train_pairs, 2 * train_pairs + 1], dim=1).view(-1)
+            val_idx = torch.stack([2 * val_pairs,   2 * val_pairs + 1], dim=1).view(-1)
 
             train_nodes = torch.unique(torch.cat([cls_heads[train_idx], cls_tails[train_idx]], dim=0))
             val_nodes = torch.unique(torch.cat([cls_heads[val_idx], cls_tails[val_idx]], dim=0))
@@ -467,11 +553,12 @@ def main():
 
     model_path = os.path.join("output/"+ args.output_dir, f"final_model_{args.model}.pt")
     if not args.test_only: torch.save(final_model.state_dict(), model_path)
-
+    cache_path = os.path.join("data/neg_cache",f"test_negs_{args.task}_numneg{args.num_neg_test}.pt")
+    print("neg cache abs path:", os.path.abspath(cache_path))
     tester = Test_BestModel(model=final_model, graph=encoder_graph,
         test_heads=test_heads, test_rels=test_rels, test_tails=test_tails,
         id2rel=id2rel, neg_samplers=neg_samplers, num_neg_per_pos=args.num_neg_test,
-        device=device, log=test_log, batch_size=args.batch_size)
+        device=device, log=test_log, batch_size=args.batch_size, neg_cache_path=cache_path)
     tester.run()
 
 

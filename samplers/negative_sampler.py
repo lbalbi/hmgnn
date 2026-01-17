@@ -1,7 +1,8 @@
 import torch
 from torch import Tensor
-from typing import Tuple, Optional
+from typing import Iterable, Set, Optional, Tuple
 from torch_geometric.data import HeteroData
+
 
 class NegativeSampler:
     """ Negative sampler for an edge type, draws negatives by stratifying over training positive sources.
@@ -55,6 +56,66 @@ class NegativeSampler:
             invalid_ids = set(pos_ids) | set(inv_ids)
         else: invalid_ids = set(pos_ids)
         self.invalid_ids = invalid_ids
+
+
+    def sample_for_heads(
+        self,
+        heads: Tensor,
+        num_negs_per_head: Tensor,
+        extra_invalid_ids: Optional[Set[int]] = None,
+        max_attempts: int = 20,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Sample negatives by preserving head (h) and corrupting tail (t).
+        For each heads[i], samples exactly num_negs_per_head[i] tails such that:
+            (h, t) is NOT in self.invalid_ids and NOT in extra_invalid_ids.
+
+        Returns:
+            neg_src [M], neg_dst [M] where M = sum(num_negs_per_head)
+        """
+        heads = heads.to(self.device).long()
+        num_negs_per_head = num_negs_per_head.to(self.device).long()
+        if extra_invalid_ids is None:
+            extra_invalid_ids = set()
+
+        neg_src_list = []
+        neg_dst_list = []
+
+        for h, k in zip(heads.tolist(), num_negs_per_head.tolist()):
+            k = int(k)
+            if k <= 0:
+                continue
+
+            collected: Set[int] = set()
+            attempts = 0
+
+            while len(collected) < k and attempts < max_attempts:
+                attempts += 1
+                remaining = k - len(collected)
+                M = max(int(remaining * self.oversample), remaining)
+
+                d_cand = torch.randint(0, self.num_dst, (M,), device=self.device)
+                cand_ids = (torch.full_like(d_cand, h).long() * self.num_dst + d_cand.long()).tolist()
+
+                for cid in cand_ids:
+                    if cid in self.invalid_ids or cid in extra_invalid_ids or cid in collected:
+                        continue
+                    collected.add(cid)
+                    if len(collected) >= k:
+                        break
+
+            # best-effort: may return fewer if graph is tiny / constrained
+            for cid in collected:
+                neg_src_list.append(cid // self.num_dst)
+                neg_dst_list.append(cid % self.num_dst)
+
+        if not neg_src_list:
+            return (torch.empty(0, dtype=torch.long, device=self.device),
+                    torch.empty(0, dtype=torch.long, device=self.device))
+
+        neg_src = torch.tensor(neg_src_list, dtype=torch.long, device=self.device)
+        neg_dst = torch.tensor(neg_dst_list, dtype=torch.long, device=self.device)
+        return neg_src, neg_dst
 
 
     def sample(self, num_samples: int) -> Tuple[Tensor, Tensor]:
