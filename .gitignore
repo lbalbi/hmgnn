@@ -6,6 +6,6 @@ scripts/
 *.log
 *.json
 *.csv
-slurm_log.txt
-aggregate_results_updated.py
+*.txt
 *.tsv
+*_old*.py
