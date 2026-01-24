@@ -9,6 +9,8 @@ from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveI
 
 import subprocess
 
+CLS_EDGE_TYPE = ("node", "cls_link", "node")
+
 class Train:
     def __init__(self, model: nn.Module, graph: HeteroData, heads: torch.Tensor,
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr_candidates: List[float],
@@ -57,6 +59,13 @@ class Train:
         self.train_idx_set = set(self.train_idx.tolist())
         self.val_idx_set = set(self.val_idx.tolist())
 
+        ## LinkNeighborLoader
+        self.train_rels_sub = self.rels[self.train_idx].clone().long()
+        self.train_labels_sub = self.labels[self.train_idx].clone().float()
+        self.val_rels_sub = self.rels[self.val_idx].clone().long()
+        self.val_labels_sub = self.labels[self.val_idx].clone().float()
+
+
         self._init_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
         if "node" not in self.graph.node_types:
             raise ValueError("Train currently assumes a single node type 'node' in the graph.")
@@ -67,6 +76,41 @@ class Train:
         for idx in range(num_triples):
             h = int(self.heads[idx])
             if 0 <= h < num_nodes: self.node_to_triples[h].append(idx)
+
+        self.cls_edge_type = CLS_EDGE_TYPE
+
+
+    # def _get_link_supervision(self, batch: HeteroData):
+    #     """
+    #     Returns (edge_label_index, edge_label, input_id) from a LinkNeighborLoader batch.
+    #     For HeteroData, these live on the edge store corresponding to the edge_type you
+    #     passed into LinkNeighborLoader(edge_label_index=(edge_type, ...)).
+    #     """
+    #     # Hetero: supervision attrs live in an edge store:
+    #     if isinstance(batch, HeteroData):
+    #         for et in batch.edge_types:
+    #             store = batch[et]
+    #             eli = getattr(store, "edge_label_index", None)
+    #             if eli is not None:
+    #                 el = getattr(store, "edge_label", None)
+    #                 iid = getattr(store, "input_id", None)
+    #                 return eli, el, iid
+    #     # Homo fallback (in case you ever switch to Data):
+    #     eli = getattr(batch, "edge_label_index", None)
+    #     if eli is not None:
+    #         return eli, getattr(batch, "edge_label", None), getattr(batch, "input_id", None)
+    #     raise RuntimeError("No edge_label_index found in batch. Are you using LinkNeighborLoader?")
+
+    def _get_link_supervision(self, batch: HeteroData):
+        if isinstance(batch, HeteroData):
+            if self.cls_edge_type not in batch.edge_types:
+                raise RuntimeError(f"Batch missing cls edge store {self.cls_edge_type}.")
+            store = batch[self.cls_edge_type]
+            return store.edge_label_index, getattr(store, "edge_label", None), getattr(store, "input_id", None)
+        eli = getattr(batch, "edge_label_index", None)
+        if eli is None: raise RuntimeError("No edge_label_index found in batch.")
+        return eli, getattr(batch, "edge_label", None), getattr(batch, "input_id", None)
+
 
     def _maybe_switch_to_dual(self, h_dict: Dict[str, torch.Tensor], n_type: str) -> None:
         """If the encoder exposes two per-node views (e.g. SRA-HGCN), switch the
@@ -181,8 +225,54 @@ class Train:
         labels = self.labels[triple_idx].to(device)
         return edge_index_local, rel_ids, labels
 
+    # def _train_one_epoch_with_neighbors(self, optimizer, n_type: str) -> Tuple[float, float]:
+    #     assert self.train_loader is not None, "NeighborLoader not provided."
+    #     self.model.train()
+    #     total_bce = 0.0
+    #     total_contr = 0.0
+    #     total_examples = 0
+
+    #     for batch in self.train_loader:
+    #         batch = batch.to(self.device)
+    #         triple_idx = self._get_batch_triple_indices(batch, subset="train")
+    #         if triple_idx.numel() == 0: continue
+
+    #         if (not self.no_contrastive and self.contrastive_sampler is not None
+    #             and hasattr(self.contrastive_sampler, "prepare_batch")):
+    #             self.contrastive_sampler.prepare_batch(batch)
+    #         optimizer.zero_grad()
+    #         h_dict = self.model.encode(batch)
+    #         self._maybe_switch_to_dual(h_dict, n_type)
+    #         z = h_dict[n_type]
+    #         del h_dict
+    #         edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
+    #             triple_idx, batch["node"].n_id, self.device)
+
+    #         logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
+    #         bce_loss = self.criterion(logits, labels)
+
+    #         loss = bce_loss
+    #         contr_loss_val = 0.0
+
+    #         if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+    #             batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
+    #             samples = self.contrastive_sampler.get_contrastive_samples(
+    #                 z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
+    #             contr_loss = self.contrastive_loss_fn(*samples)
+    #             loss = loss + self.contrastive_weight * contr_loss
+    #             contr_loss_val = float(contr_loss.detach().cpu().item())
+    #         loss.backward()
+    #         optimizer.step()
+
+    #         batch_size_eff = labels.size(0)
+    #         total_bce += bce_loss.detach().cpu().item() * batch_size_eff
+    #         total_contr += contr_loss_val * batch_size_eff
+    #         total_examples += batch_size_eff
+    #     avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
+    #     avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
+    #     return avg_bce, avg_contr
     def _train_one_epoch_with_neighbors(self, optimizer, n_type: str) -> Tuple[float, float]:
-        assert self.train_loader is not None, "NeighborLoader not provided."
+        assert self.train_loader is not None, "LinkNeighborLoader not provided."
         self.model.train()
         total_bce = 0.0
         total_contr = 0.0
@@ -190,50 +280,129 @@ class Train:
 
         for batch in self.train_loader:
             batch = batch.to(self.device)
-            triple_idx = self._get_batch_triple_indices(batch, subset="train")
-            if triple_idx.numel() == 0: continue
+
+            edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
+            if input_id is None:
+                raise RuntimeError("Batch is missing input_id; ensure you're using LinkNeighborLoader. "
+                                "input_id is required to recover rel_ids.")  # :contentReference[oaicite:2]{index=2}
+
+            # input_id may be on GPU; index CPU tensors safely:
+            input_id_cpu = input_id.detach().to("cpu").long()
+
+            # Labels: prefer what loader provides; fallback to cached subset:
+            labels = (edge_label if edge_label is not None else self.train_labels_sub[input_id_cpu])
+            labels = labels.to(self.device).float()
+
+            # Relation ids come from your original triple dataset:
+            rel_ids = self.train_rels_sub[input_id_cpu].to(self.device).long()
+
+            if labels.numel() == 0:
+                continue
 
             if (not self.no_contrastive and self.contrastive_sampler is not None
                 and hasattr(self.contrastive_sampler, "prepare_batch")):
                 self.contrastive_sampler.prepare_batch(batch)
+
             optimizer.zero_grad()
+
             h_dict = self.model.encode(batch)
             self._maybe_switch_to_dual(h_dict, n_type)
             z = h_dict[n_type]
             del h_dict
-            edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
-                triple_idx, batch["node"].n_id, self.device)
 
-            logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
+            if edge_label_index.numel() > 0:
+                if int(edge_label_index.max()) >= int(z.size(0)):
+                    raise RuntimeError("edge_label_index seems to use GLOBAL node ids, but z is LOCAL embeddings. "
+                        "You need to map endpoints via batch['node'].n_id -> local.")
+            assert rel_ids.numel() == labels.numel() == edge_label_index.size(1)
+
+            logits, probs = self.model.score_triples(z, edge_label_index, rel_ids)
             bce_loss = self.criterion(logits, labels)
 
             loss = bce_loss
             contr_loss_val = 0.0
 
-            if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-                batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
+            if (not self.no_contrastive and self.contrastive_sampler is not None
+                and self.contrastive_weight > 0.0):
+                batch_nodes = torch.unique(edge_label_index.view(-1))
                 samples = self.contrastive_sampler.get_contrastive_samples(
-                    z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
+                    z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id
+                )
                 contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
+
             loss.backward()
             optimizer.step()
 
-            batch_size_eff = labels.size(0)
-            total_bce += bce_loss.detach().cpu().item() * batch_size_eff
-            total_contr += contr_loss_val * batch_size_eff
-            total_examples += batch_size_eff
-        avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
-        avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
+            bs = labels.size(0)
+            total_bce += float(bce_loss.detach().cpu().item()) * bs
+            total_contr += float(contr_loss_val) * bs
+            total_examples += bs
+
+        avg_bce = total_bce / total_examples if total_examples else 0.0
+        avg_contr = total_contr / total_examples if total_examples else 0.0
         return avg_bce, avg_contr
 
 
-    def _eval_with_neighbors(self, n_type:str) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        assert self.val_loader is not None, "NeighborLoader not provided."
+    # def _eval_with_neighbors(self, n_type:str) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    #     assert self.val_loader is not None, "NeighborLoader not provided."
+    #     self.model.eval()
+    #     total_bce = 0.0
+    #     total_contr = 0.0
+    #     total_examples = 0
+    #     all_probs = []
+    #     all_labels = []
+
+    #     with torch.no_grad():
+    #         for batch in self.val_loader:
+    #             batch = batch.to(self.device)
+    #             triple_idx = self._get_batch_triple_indices(batch, subset="val")
+    #             if triple_idx.numel() == 0: continue
+
+    #             # if (not self.no_contrastive and self.contrastive_sampler is not None
+    #             #     and hasattr(self.contrastive_sampler, "prepare_batch")):
+    #             #     self.contrastive_sampler.prepare_batch(batch)
+
+    #             h_dict = self.model.encode(batch)
+    #             z = h_dict[n_type]
+
+    #             edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
+    #                 triple_idx, batch["node"].n_id, self.device)
+    #             logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
+    #             bce_loss = self.criterion(logits, labels)
+    #             loss = bce_loss
+    #             contr_loss_val = 0.0
+
+    #             # if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+    #             #     batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
+    #             #     z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
+    #             #         z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
+    #             #     contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
+    #             #     loss = loss + self.contrastive_weight * contr_loss
+    #             #     contr_loss_val = float(contr_loss.detach().cpu().item())
+
+    #             batch_size_eff = labels.size(0)
+    #             total_bce += bce_loss.detach().cpu().item() * batch_size_eff
+    #             total_contr += contr_loss_val * batch_size_eff
+    #             total_examples += batch_size_eff
+    #             all_probs.append(probs.detach().cpu())
+    #             all_labels.append(labels.detach().cpu())
+
+    #     avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
+    #     avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
+
+    #     if all_probs:
+    #         all_probs = torch.cat(all_probs, dim=0)
+    #         all_labels = torch.cat(all_labels, dim=0)
+    #     else:
+    #         all_probs = None
+    #         all_labels = None
+    #     return avg_bce, avg_contr, all_probs, all_labels
+    def _eval_with_neighbors(self, n_type: str):
+        assert self.val_loader is not None, "LinkNeighborLoader not provided."
         self.model.eval()
         total_bce = 0.0
-        total_contr = 0.0
         total_examples = 0
         all_probs = []
         all_labels = []
@@ -241,48 +410,45 @@ class Train:
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = batch.to(self.device)
-                triple_idx = self._get_batch_triple_indices(batch, subset="val")
-                if triple_idx.numel() == 0: continue
 
-                # if (not self.no_contrastive and self.contrastive_sampler is not None
-                #     and hasattr(self.contrastive_sampler, "prepare_batch")):
-                #     self.contrastive_sampler.prepare_batch(batch)
+                edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
+                if input_id is None:
+                    raise RuntimeError("Batch is missing input_id; ensure you're using LinkNeighborLoader.")
+
+                input_id_cpu = input_id.detach().to("cpu").long()
+
+                labels = (edge_label if edge_label is not None else self.val_labels_sub[input_id_cpu])
+                labels = labels.to(self.device).float()
+                rel_ids = self.val_rels_sub[input_id_cpu].to(self.device).long()
+
+                if labels.numel() == 0:
+                    continue
 
                 h_dict = self.model.encode(batch)
                 z = h_dict[n_type]
 
-                edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
-                    triple_idx, batch["node"].n_id, self.device)
-                logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
+                if edge_label_index.numel() > 0:
+                    if int(edge_label_index.max()) >= int(z.size(0)):
+                        raise RuntimeError("edge_label_index seems to use GLOBAL node ids, but z is LOCAL embeddings. "
+                            "You need to map endpoints via batch['node'].n_id -> local.")
+                assert rel_ids.numel() == labels.numel() == edge_label_index.size(1)
+
+                logits, probs = self.model.score_triples(z, edge_label_index, rel_ids)
                 bce_loss = self.criterion(logits, labels)
-                loss = bce_loss
-                contr_loss_val = 0.0
 
-                # if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-                #     batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
-                #     z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
-                #         z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
-                #     contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
-                #     loss = loss + self.contrastive_weight * contr_loss
-                #     contr_loss_val = float(contr_loss.detach().cpu().item())
-
-                batch_size_eff = labels.size(0)
-                total_bce += bce_loss.detach().cpu().item() * batch_size_eff
-                total_contr += contr_loss_val * batch_size_eff
-                total_examples += batch_size_eff
+                bs = labels.size(0)
+                total_bce += float(bce_loss.detach().cpu().item()) * bs
+                total_examples += bs
                 all_probs.append(probs.detach().cpu())
                 all_labels.append(labels.detach().cpu())
 
-        avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
-        avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
-
+        avg_bce = total_bce / total_examples if total_examples else 0.0
         if all_probs:
             all_probs = torch.cat(all_probs, dim=0)
             all_labels = torch.cat(all_labels, dim=0)
         else:
-            all_probs = None
-            all_labels = None
-        return avg_bce, avg_contr, all_probs, all_labels
+            all_probs, all_labels = None, None
+        return avg_bce, 0.0, all_probs, all_labels
 
 
     def run(self):
@@ -342,6 +508,13 @@ class Train:
                         z_val = h_dict_val[n_type]
                         val_bce, _, val_probs, val_labels, _ = self._iterate_batches(
                             self.val_idx, z_val, train=False)
+
+                # print("val labels mean:", val_labels.float().mean().item())   # in Train_BestModel
+                # print("val unique labels:", torch.unique(val_labels).tolist())
+                # p = val_probs.detach().cpu().view(-1)
+                # y = val_labels.detach().cpu().view(-1)
+                # print("mean prob on val positives:", p[y==1].mean().item())
+                # print("mean prob on val negatives:", p[y==0].mean().item())
 
                 if val_probs is not None and val_labels is not None:
                     val_metrics = self.metrics.update_all(val_probs, val_labels)

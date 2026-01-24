@@ -7,4 +7,5 @@ from .sgnn import *
 from .sgat import *
 from .gat import GAT
 from .ra_hgat import RA_HGAT
+from .ra_rgcn import RA_RGCN
 # from .hpgcn import HPGCN

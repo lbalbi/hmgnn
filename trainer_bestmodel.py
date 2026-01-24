@@ -6,8 +6,10 @@ from utils import Metrics, EarlyStopping
 from samplers import (NegativeSampler, NegativeStatementSampler, NegativeInstanceSampler, 
     PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
-
 import os
+
+CLS_EDGE_TYPE = ("node", "cls_link", "node")
+
 def atomic_torch_save(obj, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -89,6 +91,18 @@ class Train_BestModel:
         #     h = int(self.heads[idx])
         #     if 0 <= h < num_nodes: self.node_to_triples[h].append(idx)
 
+    def _get_link_supervision(self, batch: HeteroData):
+        if isinstance(batch, HeteroData):
+            for et in batch.edge_types:
+                store = batch[et]
+                eli = getattr(store, "edge_label_index", None)
+                if eli is not None:
+                    return eli, getattr(store, "edge_label", None), getattr(store, "input_id", None)
+        eli = getattr(batch, "edge_label_index", None)
+        if eli is not None:
+            return eli, getattr(batch, "edge_label", None), getattr(batch, "input_id", None)
+        raise RuntimeError("No edge_label_index found in batch. Are you using LinkNeighborLoader?")
+
 
     def _maybe_switch_to_dual(self, h_dict: Dict[str, torch.Tensor], n_type: str) -> None:
         if self.contrastive_sampler is None or self.no_contrastive or self.contrastive_weight <= 0.0:
@@ -126,6 +140,11 @@ class Train_BestModel:
             logits, probs = self.model.score_triples(z, edge_index, r)
             bce_loss = self.criterion(logits, y)
 
+            if edge_index.numel() > 0:
+                if int(edge_index.max()) >= int(z.size(0)):
+                    raise RuntimeError("edge_index seems to use GLOBAL node ids, but z is LOCAL embeddings. "
+                        "You need to map endpoints via batch['node'].n_id -> local.")
+
             loss = bce_loss
             contr_loss_val = 0.0
 
@@ -148,10 +167,10 @@ class Train_BestModel:
         avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
         return avg_bce, avg_contr, total_loss_tensor
 
-    @staticmethod
-    def _build_global_to_local(n_id: torch.Tensor) -> Dict[int, int]:
-        n_id_list = n_id.cpu().tolist()
-        return {int(g): i for i, g in enumerate(n_id_list)}
+    # @staticmethod
+    # def _build_global_to_local(n_id: torch.Tensor) -> Dict[int, int]:
+    #     n_id_list = n_id.cpu().tolist()
+    #     return {int(g): i for i, g in enumerate(n_id_list)}
 
 
     # def _get_batch_triple_indices(self, batch: HeteroData, subset: str) -> torch.Tensor:
@@ -174,43 +193,87 @@ class Train_BestModel:
     #     node_mask[n_id] = False
     #     return subset_idx[in_batch]
 
-    def _get_batch_triple_indices(self, batch: HeteroData) -> torch.Tensor:
-        """
-        Returns the indices of *all* triples (over self.heads/self.tails/self.rels/self.labels)
-        whose head and tail are both inside the current NeighborLoader subgraph.
-        This is simpler than in the CV trainer: there is no 'train'/'val' split here,
-        we are training on the full classification triple set.
-        """
-        n_id = batch["node"].n_id
-        if n_id.is_cuda: n_id = n_id.cpu()
-        node_mask = self.node_mask
-        node_mask[n_id] = True
-        heads_sub = self.heads
-        tails_sub = self.tails
-        in_batch = node_mask[heads_sub] & node_mask[tails_sub]
-        node_mask[n_id] = False
-        return torch.nonzero(in_batch, as_tuple=False).view(-1)
+    # def _get_batch_triple_indices(self, batch: HeteroData) -> torch.Tensor:
+    #     """
+    #     Returns the indices of *all* triples (over self.heads/self.tails/self.rels/self.labels)
+    #     whose head and tail are both inside the current NeighborLoader subgraph.
+    #     This is simpler than in the CV trainer: there is no 'train'/'val' split here,
+    #     we are training on the full classification triple set.
+    #     """
+    #     n_id = batch["node"].n_id
+    #     if n_id.is_cuda: n_id = n_id.cpu()
+    #     node_mask = self.node_mask
+    #     node_mask[n_id] = True
+    #     heads_sub = self.heads
+    #     tails_sub = self.tails
+    #     in_batch = node_mask[heads_sub] & node_mask[tails_sub]
+    #     node_mask[n_id] = False
+    #     return torch.nonzero(in_batch, as_tuple=False).view(-1)
 
+    # def _build_local_triple_tensors(self, triple_idx: torch.Tensor, n_id: torch.Tensor,
+    #     device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    #     g2l = self._build_global_to_local(n_id)
+    #     heads_global = self.heads[triple_idx].tolist()
+    #     tails_global = self.tails[triple_idx].tolist()
 
-    def _build_local_triple_tensors(self, triple_idx: torch.Tensor, n_id: torch.Tensor,
-        device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        g2l = self._build_global_to_local(n_id)
-        heads_global = self.heads[triple_idx].tolist()
-        tails_global = self.tails[triple_idx].tolist()
+    #     h_local = [g2l[int(h)] for h in heads_global]
+    #     t_local = [g2l[int(t)] for t in tails_global]
+    #     h_local_t = torch.tensor(h_local, dtype=torch.long, device=device)
+    #     t_local_t = torch.tensor(t_local, dtype=torch.long, device=device)
+    #     edge_index_local = torch.stack([h_local_t, t_local_t], dim=0)
 
-        h_local = [g2l[int(h)] for h in heads_global]
-        t_local = [g2l[int(t)] for t in tails_global]
-        h_local_t = torch.tensor(h_local, dtype=torch.long, device=device)
-        t_local_t = torch.tensor(t_local, dtype=torch.long, device=device)
-        edge_index_local = torch.stack([h_local_t, t_local_t], dim=0)
+    #     rel_ids = self.rels[triple_idx].to(device)
+    #     labels = self.labels[triple_idx].to(device)
+    #     return edge_index_local, rel_ids, labels
 
-        rel_ids = self.rels[triple_idx].to(device)
-        labels = self.labels[triple_idx].to(device)
-        return edge_index_local, rel_ids, labels
+    # def _epoch_step_neighbors(self, n_type: str) -> Tuple[float, float]:
+    #     """One epoch using NeighborLoader subgraphs."""
+    #     assert self.loader is not None, "NeighborLoader not provided for Train_BestModel."
+    #     self.model.train()
+    #     total_bce = 0.0
+    #     total_contr = 0.0
+    #     total_examples = 0
 
-    def _epoch_step_neighbors(self, n_type: str) -> Tuple[float, float]:
-        """One epoch using NeighborLoader subgraphs."""
-        assert self.loader is not None, "NeighborLoader not provided for Train_BestModel."
+    #     for batch in self.loader:
+    #         batch = batch.to(self.device)
+    #         triple_idx = self._get_batch_triple_indices(batch)
+    #         if triple_idx.numel() == 0: continue
+
+    #         if (not self.no_contrastive and self.contrastive_sampler is not None
+    #             and hasattr(self.contrastive_sampler, "prepare_batch")):
+    #             self.contrastive_sampler.prepare_batch(batch)
+    #         self.optimizer.zero_grad()
+    #         h_dict = self.model.encode(batch)
+    #         self._maybe_switch_to_dual(h_dict, n_type)
+    #         z = h_dict[n_type]
+
+    #         edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
+    #             triple_idx, batch["node"].n_id, self.device)
+
+    #         logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
+    #         bce_loss = self.criterion(logits, labels)
+    #         loss = bce_loss
+    #         contr_loss_val = 0.0
+
+    #         if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
+    #             batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
+    #             samples = self.contrastive_sampler.get_contrastive_samples(
+    #                 z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
+    #             contr_loss = self.contrastive_loss_fn(*samples)
+    #             loss = loss + self.contrastive_weight * contr_loss
+    #             contr_loss_val = float(contr_loss.detach().cpu().item())
+
+    #         loss.backward()
+    #         self.optimizer.step()
+    #         batch_size_eff = labels.size(0)
+    #         total_bce += bce_loss.detach().cpu().item() * batch_size_eff
+    #         total_contr += contr_loss_val * batch_size_eff
+    #         total_examples += batch_size_eff
+    #     avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
+    #     avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
+    #     return avg_bce, avg_contr
+    def _epoch_step_neighbors(self, n_type: str):
+        assert self.loader is not None, "LinkNeighborLoader not provided for Train_BestModel."
         self.model.train()
         total_bce = 0.0
         total_contr = 0.0
@@ -218,41 +281,61 @@ class Train_BestModel:
 
         for batch in self.loader:
             batch = batch.to(self.device)
-            triple_idx = self._get_batch_triple_indices(batch)
-            if triple_idx.numel() == 0: continue
+
+            edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
+            if input_id is None:
+                raise RuntimeError("Batch is missing input_id; ensure you're using LinkNeighborLoader.")
+
+            input_id_cpu = input_id.detach().to("cpu").long()
+
+            labels = (edge_label if edge_label is not None else self.labels[input_id_cpu])
+            labels = labels.to(self.device).float()
+            rel_ids = self.rels[input_id_cpu].to(self.device).long()
+
+            if labels.numel() == 0:
+                continue
 
             if (not self.no_contrastive and self.contrastive_sampler is not None
                 and hasattr(self.contrastive_sampler, "prepare_batch")):
                 self.contrastive_sampler.prepare_batch(batch)
+
             self.optimizer.zero_grad()
             h_dict = self.model.encode(batch)
             self._maybe_switch_to_dual(h_dict, n_type)
             z = h_dict[n_type]
 
-            edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
-                triple_idx, batch["node"].n_id, self.device)
+            if edge_label_index.numel() > 0:
+                if int(edge_label_index.max()) >= int(z.size(0)):
+                    raise RuntimeError(
+                            "edge_index seems to use GLOBAL node ids, but z is LOCAL embeddings. "
+                            "You need to map endpoints via batch['node'].n_id -> local.")
+            assert rel_ids.numel() == labels.numel() == edge_label_index.size(1)
 
-            logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
+            logits, probs = self.model.score_triples(z, edge_label_index, rel_ids)
             bce_loss = self.criterion(logits, labels)
+
             loss = bce_loss
             contr_loss_val = 0.0
-
-            if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-                batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
+            if (not self.no_contrastive and self.contrastive_sampler is not None
+                and self.contrastive_weight > 0.0):
+                batch_nodes = torch.unique(edge_label_index.view(-1))
                 samples = self.contrastive_sampler.get_contrastive_samples(
-                    z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
+                    z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id
+                )
                 contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
 
             loss.backward()
             self.optimizer.step()
-            batch_size_eff = labels.size(0)
-            total_bce += bce_loss.detach().cpu().item() * batch_size_eff
-            total_contr += contr_loss_val * batch_size_eff
-            total_examples += batch_size_eff
-        avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
-        avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
+
+            bs = labels.size(0)
+            total_bce += float(bce_loss.detach().cpu().item()) * bs
+            total_contr += float(contr_loss_val) * bs
+            total_examples += bs
+
+        avg_bce = total_bce / total_examples if total_examples else 0.0
+        avg_contr = total_contr / total_examples if total_examples else 0.0
         return avg_bce, avg_contr
 
 
@@ -345,7 +428,7 @@ class Test_BestModel:
         test_rels: torch.Tensor, test_tails: torch.Tensor, id2rel: Dict[int, str],
         neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int, 
         device: torch.device, log, batch_size: int = 1024,
-        neg_cache_path: Optional[str] = None, force_regen_negs: bool = False):
+        neg_cache_path: Optional[str] = None, force_regen_negs: bool = True):
         self.model = model.to(device)
         self.graph = graph
         self.test_heads = test_heads
@@ -370,6 +453,28 @@ class Test_BestModel:
             ids = (h.long() * self.num_nodes + t.long()).tolist()
             self.test_pos_ids_per_rel[rel_name] = set(ids)
 
+
+    def confusion_matrix_binary(self, probs: torch.Tensor,
+                                labels: torch.Tensor,
+                                threshold: float = 0.5) -> torch.Tensor:
+        """
+        Returns confusion matrix:
+            [[TN, FP],
+            [FN, TP]]
+        """
+        probs = probs.detach().view(-1).cpu()
+        labels = labels.detach().view(-1).cpu().to(torch.long)
+
+        preds = (probs >= threshold).to(torch.long)
+
+        tn = ((preds == 0) & (labels == 0)).sum()
+        fp = ((preds == 1) & (labels == 0)).sum()
+        fn = ((preds == 0) & (labels == 1)).sum()
+        tp = ((preds == 1) & (labels == 1)).sum()
+
+        return torch.stack([torch.stack([tn, fp]), torch.stack([fn, tp])])
+
+
     def _score_triples_in_batches(self, z: torch.Tensor, heads: torch.Tensor,
         rels: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
         """
@@ -391,6 +496,7 @@ class Test_BestModel:
                 edge_index = edge_index.to(device)
                 r = r.to(device)
                 _, probs = self.model.score_triples(z, edge_index, r)
+
                 all_probs.append(probs.detach().cpu())
         return torch.cat(all_probs, dim=0) if all_probs else torch.empty(0)
 
@@ -585,9 +691,13 @@ class Test_BestModel:
                         extra_invalid_ids=extra_invalid
                     )
 
-                    if neg_src.numel() == 0:
-                        continue
+                    requested = int(neg_counts_per_h.sum().item())
+                    got = int(neg_src.numel())
+                    if got < requested:
+                        print(f"[WARN] rel={rel_name} requested_negs={requested} got={got} "
+                            f"({got/requested:.2%} of target)")
 
+                    if neg_src.numel() == 0: continue
                     neg_src = neg_src.to(self.device)
                     neg_dst = neg_dst.to(self.device)
                     r_neg = torch.full((neg_src.size(0),), rel_id,
@@ -617,6 +727,7 @@ class Test_BestModel:
                             "num_nodes": int(self.num_nodes)}}
                     atomic_torch_save(payload, self.neg_cache_path)
 
+
             if neg_heads.numel() > 0:
                 neg_probs = self._score_triples_in_batches(z, neg_heads, neg_rels, neg_tails)
                 neg_labels = torch.zeros_like(neg_probs)
@@ -624,6 +735,25 @@ class Test_BestModel:
                 all_labels = torch.cat([pos_labels, neg_labels], dim=0)
             else:
                 all_probs, all_labels = pos_probs, pos_labels
+                print("  -----   HERE   -------- ")
+
+            print("labels mean:", all_labels.float().mean().item())   # in Train_BestModel
+            print("unique labels:", torch.unique(all_labels).tolist())
+
+            p = all_probs.detach().cpu().view(-1)
+            y = all_labels.detach().cpu().view(-1)
+
+            print("mean prob on positives:", p[y==1].mean().item())
+            print("mean prob on negatives:", p[y==0].mean().item())
+
+            # --- Confusion matrix (global) ---
+            cm = self.confusion_matrix_binary(all_probs, all_labels, threshold=0.5)
+            tn, fp = cm[0].tolist()
+            fn, tp = cm[1].tolist()
+            self.log.log("=== Confusion Matrix @thr=0.5 ===")
+            self.log.log(f"TN={tn}  FP={fp}")
+            self.log.log(f"FN={fn}  TP={tp}")
+            self.log.log(f"Matrix:\n{cm}")
 
             metrics = self.metrics.update_all(all_probs, all_labels)
             names = self.metrics.get_allnames()

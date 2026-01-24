@@ -12,7 +12,6 @@ class ContrastiveInstanceLoss(torch.nn.Module):
       z_neg_to_u_pos : (B, k, D)   negatives
       z_shared_pos   : (B, k, D)   positives
     """
-
     def __init__(self, temperature: float = 0.5):
         super().__init__()
         self.temperature = float(temperature)

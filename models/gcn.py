@@ -45,18 +45,18 @@ class GCN(nn.Module):
             convs.append(GCNConv(in_ch, hidden_dim))
         self.convs = nn.ModuleList(convs)
 
-        # ----- Relation embeddings for the decoder -----
+        ## ----- Relation embeddings for the decoder -----
         if rel2id is None:
-            # fall back to 1 relation (won't crash if forgot to pass)
+        #     # fall back to 1 relation (won't crash if forgot to pass)
             self.num_rel = 1
         else:
             self.num_rel = len(rel2id)
 
         self.rel_emb = nn.Embedding(self.num_rel, hidden_dim)
 
-        # ----- Triple classifier: [h_u, e_r, h_v] -> logit -----
+        ## ----- Triple classifier: [h_u, e_r, h_v] -> logit -----
         self.classify = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.Linear(hidden_dim * 3, hidden_dim), # nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -119,11 +119,14 @@ class GCN(nn.Module):
 
         if rel_ids.dim() == 0:
             rel_ids = rel_ids.view(-1)
-        rel_ids = rel_ids.clamp(min=0, max=self.num_rel - 1)
+        # rel_ids = rel_ids.clamp(min=0, max=self.num_rel - 1)
+        if (rel_ids < 0).any() or (rel_ids >= self.num_rel).any():
+            bad = rel_ids[(rel_ids < 0) | (rel_ids >= self.num_rel)][:10].tolist()
+            raise ValueError(f"rel_ids out of range (num_rel={self.num_rel}). Examples: {bad}")
 
         e_r = self.rel_emb(rel_ids)
         h_pair = torch.cat([h_u, e_r, h_v], dim=-1)
-
+        #h_pair = torch.cat([h_u, h_v], dim=-1)
         logits = self.classify(h_pair).view(-1)
         probs = torch.sigmoid(logits)
         return logits, probs
