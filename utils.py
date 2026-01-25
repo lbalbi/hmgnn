@@ -56,7 +56,7 @@ class EarlyStopping:
             self.best_state = copy.deepcopy(model.state_dict())
             self.num_bad = 0
         else: self.num_bad += 1
-        return self.num_bad > self.patience
+        return self.num_bad >= self.patience
 
     def best_state_dict(self):
         return self.best_state

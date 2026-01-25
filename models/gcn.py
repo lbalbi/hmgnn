@@ -24,6 +24,7 @@ class GCN(nn.Module):
         n_type: str = "node",
         num_layers: int = 2,
         rel2id: Optional[Dict[str, int]] = None,
+        dropout: float = 0.2,
     ):
         super().__init__()
 
@@ -37,7 +38,8 @@ class GCN(nn.Module):
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
         self.num_layers = num_layers
-
+        self.dropout = dropout
+        self.drop = nn.Dropout(p=dropout)
         # ----- GCN encoder over a single homogeneous graph -----
         convs: List[GCNConv] = []
         for layer in range(num_layers):
@@ -58,6 +60,7 @@ class GCN(nn.Module):
         self.classify = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim), # nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -102,6 +105,7 @@ class GCN(nn.Module):
         for conv in self.convs:
             h = conv(h, edge_index)
             h = F.relu(h)
+            h = self.drop(h)
 
         return {self.n_type: h}
 

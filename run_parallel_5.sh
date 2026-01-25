@@ -22,6 +22,6 @@ python -u main.py \
   --batch_size 12460 \
   --finaltrain_only \
   --final_lr 0.005 \
-  --final_epochs 45 \
+  --final_epochs 55 \
   --output_dir "wikidata_gcn_protCL_wn_linkloader/output_wikidata_gcn_protCL_wn_linkloader_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1

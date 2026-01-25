@@ -5,3 +5,4 @@ from .randomstatement_sampler import RandomStatementSampler
 from .negativeinstance_sampler import NegativeInstanceSampler
 from .randominstance_sampler import RandomInstanceSampler
 from .partialinstance_sampler import PartialInstanceSampler
+from .negativeinstance_sampler_NEW import NegativeInstanceSampler_NEW

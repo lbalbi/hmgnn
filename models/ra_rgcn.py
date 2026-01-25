@@ -22,7 +22,7 @@ class RA_RGCN(nn.Module):
         rel2id: Optional[Dict[str, int]] = None,   # decoder relations (triple labels)
         num_bases: Optional[int] = None,           # optional parameter sharing for RGCN
         use_fast: bool = False,                    # toggle FastRGCNConv if you want
-    ):
+        dropout: float = 0.2):
         super().__init__()
 
         self.n_type = n_type
@@ -30,6 +30,9 @@ class RA_RGCN(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.out_dim = int(out_dim)
         self.num_layers = int(num_layers)
+        self.dropout = float(dropout)
+        self.drop = nn.Dropout(p=self.dropout)
+
         if rel2id is None:
             dec_rel_names = sorted({rel for (_, rel, _) in e_etypes})
             rel2id = {r: i for i, r in enumerate(dec_rel_names)}
@@ -56,7 +59,7 @@ class RA_RGCN(nn.Module):
         # ----- decoder: relation embeddings + MLP over [h_u, e_r, h_v] -----
         self.rel_emb = nn.Embedding(self.num_dec_rel, self.hidden_dim)
         self.classify = nn.Sequential(nn.Linear(self.hidden_dim * 3, self.hidden_dim),
-            nn.ReLU(), nn.Linear(self.hidden_dim, 1))
+            nn.ReLU(), nn.Dropout(p=self.dropout),nn.Linear(self.hidden_dim, 1))
 
     def _hetero_to_relational(self, data: HeteroData) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """  Convert HeteroData (single node type) into:
@@ -100,6 +103,7 @@ class RA_RGCN(nn.Module):
         for conv in self.convs:
             h = conv(h, edge_index, edge_type)
             h = F.relu(h)
+            h = self.drop(h)
         return {self.n_type: h}
 
     def score_triples(self, z: torch.Tensor, edge_index: torch.Tensor, rel_ids: torch.Tensor):

@@ -15,6 +15,7 @@ OUTDIR="${LOG_DIR}/output_wikidata_rargcn_noCL_NS_wn_linkloader_${RUN_TAG}"
 LOGFILE="${LOG_DIR}/output_wikidata_rargcn_noCL_NS_wn_linkloader_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
+ulimit -n 4096
 python -u main_NEW.py \
   --path "data/wikidata_data" \
   --task "wikidata" \
