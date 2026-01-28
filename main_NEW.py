@@ -26,6 +26,73 @@ from samplers import (
 NEG_PREFIX = "NOT_"
 CLS_EDGE_TYPE = ("node", "cls_link", "node")
 
+def print_encoder_and_cls_totals(
+    *,
+    encoder_graph: HeteroData,
+    subclass_rel: str,
+    neg_prefix: str,
+    train_heads: torch.Tensor,
+    train_rels: torch.Tensor,
+    train_tails: torch.Tensor,
+    train_labels: torch.Tensor,
+    test_heads: torch.Tensor,
+    test_rels: torch.Tensor,
+    test_tails: torch.Tensor,
+    test_labels: torch.Tensor,
+) -> None:
+    # 1) positives in encoder graph: instance_of + any non-subclass, non-NOT_* (and pos_statement if present)
+    # 2) negatives in encoder graph: all NOT_* (and neg_statement if present)
+    # 3) subclass_of (subsumption) in encoder graph
+    pos_cnt = 0
+    neg_cnt = 0
+    sub_cnt = 0
+
+    for et in encoder_graph.edge_types:
+        if et == CLS_EDGE_TYPE:
+            continue
+
+        s, rel, d = et
+        if s != "node" or d != "node":
+            continue
+
+        ei = encoder_graph[et].edge_index
+        n = int(ei.size(1)) if (ei is not None and ei.numel() > 0) else 0
+        rel_s = str(rel)
+
+        if rel_s == str(subclass_rel):
+            sub_cnt += n
+        elif rel_s.startswith(str(neg_prefix)) or rel_s == "neg_statement":
+            neg_cnt += n
+        elif rel_s == "pos_statement":
+            pos_cnt += n
+        else:
+            pos_cnt += n
+
+    # 4) unique classification examples used in total (train + test)
+    def _unique_examples(h, r, t, y) -> torch.Tensor:
+        if h is None or h.numel() == 0:
+            return torch.empty((0, 4), dtype=torch.long)
+        yb = (y.detach().cpu() > 0.5).long()
+        return torch.stack(
+            [h.detach().cpu().long(), r.detach().cpu().long(), t.detach().cpu().long(), yb],
+            dim=1,
+        )
+
+    all_ex = torch.cat(
+        [
+            _unique_examples(train_heads, train_rels, train_tails, train_labels),
+            _unique_examples(test_heads, test_rels, test_tails, test_labels),
+        ],
+        dim=0,
+    )
+    uniq_cls_total = int(torch.unique(all_ex, dim=0).size(0)) if all_ex.numel() else 0
+
+    print(f"1) how many positive statements/triples are in the encoder graph: {pos_cnt}")
+    print(f"2) how many negative statements/triples are in the encoder graph: {neg_cnt}")
+    print(f"3) how many ontology subsumption relations (subclass_of) are in the encoder graph: {sub_cnt}")
+    print(f"4) how many unique classification examples are used in total (training + testing): {uniq_cls_total}")
+
+
 def report_unseen_test_nodes(
     *,
     test_heads: torch.Tensor,
@@ -1035,17 +1102,11 @@ def main():
 
     # Compute leftovers + encoder-only subclass/instance negatives from file
     leftover_pos_df, leftover_neg_df, enc_only_neg_df = compute_leftover_examples_for_encoder(
-        args.path,
-        rel_list=rel_list,
-        balance_stats=balance_stats,
-        seed=int(args.balanced_seed),
-        subclass_rel=subclass_rel,
-        instance_rel=instance_rel,
-        min_pos_per_rel=int(args.min_pos_per_rel),
-    )
+        args.path, rel_list=rel_list, balance_stats=balance_stats, seed=int(args.balanced_seed),
+        subclass_rel=subclass_rel, instance_rel=instance_rel, min_pos_per_rel=int(args.min_pos_per_rel))
 
     # (a) Add ONLY subclass/instance negatives from file
-    if len(enc_only_neg_df) > 0:
+    if (not nflag) and len(enc_only_neg_df) > 0:
         enc_only_neg_df = enc_only_neg_df.copy()
         enc_only_neg_df["edge_type"] = enc_only_neg_df["rel_base"].astype(str).map(_ensure_not_prefixed)
         for et, g in enc_only_neg_df.groupby("edge_type"):
@@ -1053,29 +1114,60 @@ def main():
             tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
             _append_edges(struct_graph, str(et), src, tgt)
         print(f"\n[INFO] Encoder got ONLY subclass/instance negatives from train2id_neg: {len(enc_only_neg_df)}")
-
+    elif nflag: print("\n[INFO] --use_nstatementsampler: skipping subclass/instance NOT_* edges for encoder")
     # (b) Add leftover classification examples (unused after balancing)
     n_left_pos = int(len(leftover_pos_df))
     n_left_neg = int(len(leftover_neg_df))
-    if n_left_pos or n_left_neg:
-        if n_left_pos:
-            for r, g in leftover_pos_df.groupby("rel_base"):
-                src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
-                tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
-                _append_edges(struct_graph, str(r), src, tgt)
+    if n_left_pos:
+        for r, g in leftover_pos_df.groupby("rel_base"):
+            src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+            tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+            _append_edges(struct_graph, str(r), src, tgt)
+    if (not nflag) and n_left_neg:
+        for r, g in leftover_neg_df.groupby("rel_base"):
+            et = _ensure_not_prefixed(str(r))  # -> NOT_*
+            src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+            tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+            _append_edges(struct_graph, et, src, tgt)
+    elif nflag and n_left_neg:
+        print(f"\n[INFO] --use_nstatementsampler: skipping leftover NOT_* edges for encoder (count={n_left_neg})")
+    print(f"\n[INFO] Encoder augmented with leftover (unused) classification examples:")
+    print(f"       leftover positives added: {n_left_pos}")
+    print(f"       leftover negatives added: {0 if nflag else n_left_neg}")
 
-        if n_left_neg:
-            for r, g in leftover_neg_df.groupby("rel_base"):
-                et = _ensure_not_prefixed(str(r))
-                src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
-                tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
-                _append_edges(struct_graph, et, src, tgt)
 
-        print(f"\n[INFO] Encoder augmented with leftover (unused) classification examples:")
-        print(f"       leftover positives added: {n_left_pos}")
-        print(f"       leftover negatives added: {n_left_neg}")
-    else:
-        print("\n[INFO] No leftover classification examples to add to encoder.")
+    # # (a) Add ONLY subclass/instance negatives from file
+    # if len(enc_only_neg_df) > 0:
+    #     enc_only_neg_df = enc_only_neg_df.copy()
+    #     enc_only_neg_df["edge_type"] = enc_only_neg_df["rel_base"].astype(str).map(_ensure_not_prefixed)
+    #     for et, g in enc_only_neg_df.groupby("edge_type"):
+    #         src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+    #         tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+    #         _append_edges(struct_graph, str(et), src, tgt)
+    #     print(f"\n[INFO] Encoder got ONLY subclass/instance negatives from train2id_neg: {len(enc_only_neg_df)}")
+
+    # (b) Add leftover classification examples (unused after balancing)
+    # n_left_pos = int(len(leftover_pos_df))
+    # n_left_neg = int(len(leftover_neg_df))
+    # if n_left_pos or n_left_neg:
+    #     if n_left_pos:
+    #         for r, g in leftover_pos_df.groupby("rel_base"):
+    #             src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+    #             tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+    #             _append_edges(struct_graph, str(r), src, tgt)
+
+    #     if n_left_neg:
+    #         for r, g in leftover_neg_df.groupby("rel_base"):
+    #             et = _ensure_not_prefixed(str(r))
+    #             src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+    #             tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+    #             _append_edges(struct_graph, et, src, tgt)
+
+    #     print(f"\n[INFO] Encoder augmented with leftover (unused) classification examples:")
+    #     print(f"       leftover positives added: {n_left_pos}")
+    #     print(f"       leftover negatives added: {n_left_neg}")
+    # else:
+    #     print("\n[INFO] No leftover classification examples to add to encoder.")
 
     # e_etypes_struct = list(struct_graph.edge_types)
     # if args.model == "hgcn":
@@ -1098,6 +1190,18 @@ def main():
     MP_EDGE_TYPES = [et for et in encoder_graph.edge_types if et != CLS_EDGE_TYPE]
     encoder_e_etypes = MP_EDGE_TYPES
 
+    print_encoder_and_cls_totals(
+        encoder_graph=encoder_graph,
+        subclass_rel=subclass_rel,
+        neg_prefix=NEG_PREFIX,
+        train_heads=cls_heads,
+        train_rels=cls_rels,
+        train_tails=cls_tails,
+        train_labels=cls_labels,
+        test_heads=test_heads_all,
+        test_rels=test_rels_all,
+        test_tails=test_tails_all,
+        test_labels=test_labels_all)
 
     print("\n=== Encoder graph summary ===")
     print(f"#Structural edge types: {len(e_etypes_struct)}")
