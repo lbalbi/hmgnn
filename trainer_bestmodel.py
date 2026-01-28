@@ -62,8 +62,6 @@ class Train_BestModel:
         self.no_contrastive = no_contrastive
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
-        # self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
-        # self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
         self.dual_view = bool(getattr(self.model, "dual_view", False))
         if contrastive_sampler is not None:
             self.contrastive_loss_fn = DualContrastiveInstanceLoss() if self.dual_view else ContrastiveInstanceLoss()
@@ -78,18 +76,6 @@ class Train_BestModel:
         self.num_nodes = num_nodes
         self.node_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
         num_triples = self.heads.size(0)
-
-        # if "node" not in self.graph.node_types:
-        #     raise ValueError("Train_BestModel assumes a single node type 'node'.")
-        # num_nodes = int(self.graph["node"].num_nodes)
-        # self.num_nodes = num_nodes
-        # self.node_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
-        # num_triples = self.heads.size(0)
-
-        # self.node_to_triples: List[List[int]] = [[] for _ in range(num_nodes)]
-        # for idx in range(num_triples):
-        #     h = int(self.heads[idx])
-        #     if 0 <= h < num_nodes: self.node_to_triples[h].append(idx)
 
     def _get_link_supervision(self, batch: HeteroData):
         if isinstance(batch, HeteroData):
@@ -167,111 +153,6 @@ class Train_BestModel:
         avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
         return avg_bce, avg_contr, total_loss_tensor
 
-    # @staticmethod
-    # def _build_global_to_local(n_id: torch.Tensor) -> Dict[int, int]:
-    #     n_id_list = n_id.cpu().tolist()
-    #     return {int(g): i for i, g in enumerate(n_id_list)}
-
-
-    # def _get_batch_triple_indices(self, batch: HeteroData, subset: str) -> torch.Tensor:
-    #     """
-    #     Returns the indices of triples in the given subset ('train' or 'val')
-    #     whose head and tail are both inside the current NeighborLoader subgraph.
-    #     This implementation avoids Python loops by using a boolean node mask.
-    #     """
-    #     n_id = batch["node"].n_id
-    #     if n_id.is_cuda: n_id = n_id.cpu()
-
-    #     if subset == "train": subset_idx = self.train_idx
-    #     elif subset == "val": subset_idx = self.val_idx  
-    #     else: raise ValueError(f"Unknown subset: {subset}")
-    #     node_mask = self.node_mask
-    #     node_mask[n_id] = True
-    #     heads_sub = self.heads[subset_idx]
-    #     tails_sub = self.tails[subset_idx]
-    #     in_batch = node_mask[heads_sub] & node_mask[tails_sub]
-    #     node_mask[n_id] = False
-    #     return subset_idx[in_batch]
-
-    # def _get_batch_triple_indices(self, batch: HeteroData) -> torch.Tensor:
-    #     """
-    #     Returns the indices of *all* triples (over self.heads/self.tails/self.rels/self.labels)
-    #     whose head and tail are both inside the current NeighborLoader subgraph.
-    #     This is simpler than in the CV trainer: there is no 'train'/'val' split here,
-    #     we are training on the full classification triple set.
-    #     """
-    #     n_id = batch["node"].n_id
-    #     if n_id.is_cuda: n_id = n_id.cpu()
-    #     node_mask = self.node_mask
-    #     node_mask[n_id] = True
-    #     heads_sub = self.heads
-    #     tails_sub = self.tails
-    #     in_batch = node_mask[heads_sub] & node_mask[tails_sub]
-    #     node_mask[n_id] = False
-    #     return torch.nonzero(in_batch, as_tuple=False).view(-1)
-
-    # def _build_local_triple_tensors(self, triple_idx: torch.Tensor, n_id: torch.Tensor,
-    #     device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    #     g2l = self._build_global_to_local(n_id)
-    #     heads_global = self.heads[triple_idx].tolist()
-    #     tails_global = self.tails[triple_idx].tolist()
-
-    #     h_local = [g2l[int(h)] for h in heads_global]
-    #     t_local = [g2l[int(t)] for t in tails_global]
-    #     h_local_t = torch.tensor(h_local, dtype=torch.long, device=device)
-    #     t_local_t = torch.tensor(t_local, dtype=torch.long, device=device)
-    #     edge_index_local = torch.stack([h_local_t, t_local_t], dim=0)
-
-    #     rel_ids = self.rels[triple_idx].to(device)
-    #     labels = self.labels[triple_idx].to(device)
-    #     return edge_index_local, rel_ids, labels
-
-    # def _epoch_step_neighbors(self, n_type: str) -> Tuple[float, float]:
-    #     """One epoch using NeighborLoader subgraphs."""
-    #     assert self.loader is not None, "NeighborLoader not provided for Train_BestModel."
-    #     self.model.train()
-    #     total_bce = 0.0
-    #     total_contr = 0.0
-    #     total_examples = 0
-
-    #     for batch in self.loader:
-    #         batch = batch.to(self.device)
-    #         triple_idx = self._get_batch_triple_indices(batch)
-    #         if triple_idx.numel() == 0: continue
-
-    #         if (not self.no_contrastive and self.contrastive_sampler is not None
-    #             and hasattr(self.contrastive_sampler, "prepare_batch")):
-    #             self.contrastive_sampler.prepare_batch(batch)
-    #         self.optimizer.zero_grad()
-    #         h_dict = self.model.encode(batch)
-    #         self._maybe_switch_to_dual(h_dict, n_type)
-    #         z = h_dict[n_type]
-
-    #         edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
-    #             triple_idx, batch["node"].n_id, self.device)
-
-    #         logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
-    #         bce_loss = self.criterion(logits, labels)
-    #         loss = bce_loss
-    #         contr_loss_val = 0.0
-
-    #         if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-    #             batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
-    #             samples = self.contrastive_sampler.get_contrastive_samples(
-    #                 z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
-    #             contr_loss = self.contrastive_loss_fn(*samples)
-    #             loss = loss + self.contrastive_weight * contr_loss
-    #             contr_loss_val = float(contr_loss.detach().cpu().item())
-
-    #         loss.backward()
-    #         self.optimizer.step()
-    #         batch_size_eff = labels.size(0)
-    #         total_bce += bce_loss.detach().cpu().item() * batch_size_eff
-    #         total_contr += contr_loss_val * batch_size_eff
-    #         total_examples += batch_size_eff
-    #     avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
-    #     avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
-    #     return avg_bce, avg_contr
     def _epoch_step_neighbors(self, n_type: str):
         assert self.loader is not None, "LinkNeighborLoader not provided for Train_BestModel."
         self.model.train()
@@ -538,111 +419,12 @@ class Test_BestModel:
         if neg_edge_index.size(1) > num_to_sample:neg_edge_index = neg_edge_index[:, :num_to_sample]
         return neg_edge_index
 
-    # def run(self):
-    #     self.graph = self.graph.to(self.device)
-    #     self.test_heads = self.test_heads.to(self.device)
-    #     self.test_rels = self.test_rels.to(self.device)
-    #     self.test_tails = self.test_tails.to(self.device)
-    #     # passed to cpu because of RA-HGCN
-    #     self.model = self.model.cpu()
-    #     graph_cpu = self.graph.cpu()
-        
-    #     cached = None
-    #     if (self.neg_cache_path is not None) and (not self.force_regen_negs):
-    #         cached = maybe_load_neg_cache(self.neg_cache_path, map_location="cpu")
-
-    #     self.model.eval()
-    #     # with torch.no_grad():
-    #     with torch.inference_mode():
-    #         h_dict = self.model.encode(graph_cpu)
-    #         z = h_dict[getattr(self.model, "n_type", "node")]
-    #         del h_dict
-    #         pos_probs = self._score_triples_in_batches(
-    #             z, self.test_heads, self.test_rels, self.test_tails)
-    #         pos_labels = torch.ones_like(pos_probs)
-
-    #         if cached is not None:
-    #             neg_heads = cached["neg_heads"].to(self.device)
-    #             neg_rels  = cached["neg_rels"].to(self.device)
-    #             neg_tails = cached["neg_tails"].to(self.device)
-    #         else:
-    #             neg_heads_list,neg_rels_list,neg_tails_list = [], [], []
-
-    #         unique_rels = torch.unique(self.test_rels)
-    #         for rel_id in unique_rels.tolist():
-    #             rel_name = self.id2rel[rel_id]
-    #             sampler = self.neg_samplers.get(rel_name, None)
-    #             if sampler is None: continue
-    #             # group by head within this relation
-    #             mask = (self.test_rels == rel_id)
-    #             h_rel = self.test_heads[mask]
-    #             if h_rel.numel() == 0:  continue
-
-    #             uniq_h, pos_counts_per_h = torch.unique(h_rel, return_counts=True)
-    #             neg_counts_per_h = pos_counts_per_h * self.num_neg_per_pos
-    #             extra_invalid = self.test_pos_ids_per_rel.get(rel_name, set())
-    #             neg_src, neg_dst = sampler.sample_for_heads(
-    #                 uniq_h.to(sampler.device),neg_counts_per_h.to(sampler.device),
-    #                 extra_invalid_ids=extra_invalid)
-
-    #             if neg_src.numel() == 0: continue
-    #             neg_src = neg_src.to(self.device)
-    #             neg_dst = neg_dst.to(self.device)
-    #             r_neg = torch.full((neg_src.size(0),), rel_id, dtype=torch.long, device=self.device)
-
-    #             neg_heads_list.append(neg_src)
-    #             neg_tails_list.append(neg_dst)
-    #             neg_rels_list.append(r_neg)
-
-
-    #         # unique_rels, counts = torch.unique(self.test_rels, return_counts=True)
-    #         # for rel_id, count in zip(unique_rels.tolist(), counts.tolist()):
-    #         #     rel_name = self.id2rel[rel_id]
-    #         #     sampler = self.neg_samplers.get(rel_name, None)
-    #         #     if sampler is None: continue
-
-    #         #     num_to_sample = count * self.num_neg_per_pos
-    #         #     neg_edge_index = self._sample_negatives_excluding_test(
-    #         #         sampler, rel_name, num_to_sample)
-
-    #         #     if neg_edge_index.numel() == 0: continue
-    #         #     neg_edge_index = neg_edge_index.to(self.device)
-    #         #     h_neg = neg_edge_index[0]
-    #         #     t_neg = neg_edge_index[1]
-    #         #     r_neg = torch.full((h_neg.size(0),), rel_id,
-    #         #         dtype=torch.long, device=self.device)
-    #         #     neg_heads_list.append(h_neg)
-    #         #     neg_tails_list.append(t_neg)
-    #         #     neg_rels_list.append(r_neg)
-
-    #         if neg_heads_list:
-    #             neg_heads = torch.cat(neg_heads_list, dim=0)
-    #             neg_tails = torch.cat(neg_tails_list, dim=0)
-    #             neg_rels = torch.cat(neg_rels_list, dim=0)
-    #             neg_probs = self._score_triples_in_batches(
-    #                 z, neg_heads, neg_rels, neg_tails)
-    #             neg_labels = torch.zeros_like(neg_probs)
-    #             all_probs = torch.cat([pos_probs, neg_probs], dim=0)
-    #             all_labels = torch.cat([pos_labels, neg_labels], dim=0)
-    #         else:
-    #             all_probs = pos_probs
-    #             all_labels = pos_labels
-
-
-    #         metrics = self.metrics.update_all(all_probs, all_labels)
-    #         names = self.metrics.get_allnames()
-    #         self.log.log("=== Test metrics (global) ===")
-    #         for name, val in zip(names, metrics):
-    #             self.log.log(f"{name}: {val:.4f}")
-    #     return metrics
-
 
     def run(self):
         self.graph = self.graph.to(self.device)
         self.test_heads = self.test_heads.to(self.device)
         self.test_rels  = self.test_rels.to(self.device)
         self.test_tails = self.test_tails.to(self.device)
-        # RA-HGCN path: encode on CPU
         self.model = self.model.cpu()
         graph_cpu = self.graph.cpu()
 
@@ -735,10 +517,9 @@ class Test_BestModel:
                 all_labels = torch.cat([pos_labels, neg_labels], dim=0)
             else:
                 all_probs, all_labels = pos_probs, pos_labels
-                print("  -----   HERE   -------- ")
 
-            print("labels mean:", all_labels.float().mean().item())   # in Train_BestModel
-            print("unique labels:", torch.unique(all_labels).tolist())
+            # print("labels mean:", all_labels.float().mean().item())   # in Train_BestModel
+            # print("unique labels:", torch.unique(all_labels).tolist())
 
             p = all_probs.detach().cpu().view(-1)
             y = all_labels.detach().cpu().view(-1)

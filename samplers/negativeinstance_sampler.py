@@ -268,12 +268,6 @@ class NegativeInstanceSampler:
             preds.remove(self.primary_pred)
             return [self.primary_pred] + preds
         return preds
-    # def _pred_priority(self, u_g: int) -> list[str]:
-    #     preds = list(self.preds_seen[u_g]) if self.preds_seen is not None else []
-    #     if self.primary_pred in preds:
-    #         preds.remove(self.primary_pred)
-    #         return [self.primary_pred] + preds
-    #     return preds
 
 
     def _sample_k_priority_cpu(self, pools_by_pred: dict, pred_order: list[str], *, stamp: int,
