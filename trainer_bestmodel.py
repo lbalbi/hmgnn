@@ -45,7 +45,8 @@ class Train_BestModel:
         epochs: int, device: torch.device, log, batch_size: int = 1024,
         contrastive_sampler: Optional[NegativeInstanceSampler] = None,
         contrastive_weight: Optional[float] = 0.1, loader=None, no_contrastive: bool = False,
-        early_stopping_patience: int = 15):
+        early_stopping_patience: int = 15, contrastive_temperature: float = 0.5,
+        learnable_contrastive_temperature: bool = True):
         self.model = model.to(device)
         self.graph = graph
         self.heads = heads.clone().long()
@@ -58,14 +59,19 @@ class Train_BestModel:
         self.log = log
         self.batch_size = int(batch_size)
         self.criterion = nn.BCEWithLogitsLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.no_contrastive = no_contrastive
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
+        self.learnable_contrastive_temperature = bool(learnable_contrastive_temperature)
+        self.contrastive_temperature_init = float(contrastive_temperature)
         self.dual_view = bool(getattr(self.model, "dual_view", False))
         if contrastive_sampler is not None:
-            self.contrastive_loss_fn = DualContrastiveInstanceLoss() if self.dual_view else ContrastiveInstanceLoss()
+            self.contrastive_loss_fn = self._make_contrastive_loss_fn(self.dual_view, self.contrastive_temperature_init)
         else: self.contrastive_loss_fn = None
+        params = list(self.model.parameters())
+        if self.contrastive_loss_fn is not None:
+            params.extend([p for p in self.contrastive_loss_fn.parameters() if p.requires_grad])
+        self.optimizer = torch.optim.Adam(params, lr=self.lr)
         self.es_patience = int(early_stopping_patience)
         lr_early_stopping = EarlyStopping(patience=self.es_patience, mode="min")
         self.loader = loader
@@ -76,6 +82,26 @@ class Train_BestModel:
         self.num_nodes = num_nodes
         self.node_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
         num_triples = self.heads.size(0)
+
+    def _make_contrastive_loss_fn(self, dual_view: bool, temperature: float):
+        if dual_view:
+            loss_fn = DualContrastiveInstanceLoss(
+                temperature=temperature, learnable_temperature=self.learnable_contrastive_temperature
+            )
+        else:
+            loss_fn = ContrastiveInstanceLoss(
+                temperature=temperature, learnable_temperature=self.learnable_contrastive_temperature
+            )
+        return loss_fn.to(self.device)
+
+    def _get_contrastive_temperature_value(self) -> Optional[float]:
+        if self.contrastive_loss_fn is None:
+            return None
+        if hasattr(self.contrastive_loss_fn, "get_temperature_value"):
+            return float(self.contrastive_loss_fn.get_temperature_value())
+        if hasattr(self.contrastive_loss_fn, "temperature"):
+            return float(self.contrastive_loss_fn.temperature)
+        return None
 
     def _get_link_supervision(self, batch: HeteroData):
         if isinstance(batch, HeteroData):
@@ -102,7 +128,13 @@ class Train_BestModel:
             zp = h_dict[pos_k]
             if z.dim() == 2 and zp.dim() == 2 and z.size(1) == 2 * zp.size(1):
                 self.dual_view = True
-                self.contrastive_loss_fn = DualContrastiveInstanceLoss()
+                current_temp = self._get_contrastive_temperature_value()
+                if current_temp is None:
+                    current_temp = self.contrastive_temperature_init
+                self.contrastive_loss_fn = self._make_contrastive_loss_fn(True, current_temp)
+                new_params = [p for p in self.contrastive_loss_fn.parameters() if p.requires_grad]
+                if new_params:
+                    self.optimizer.add_param_group({"params": new_params})
 
     def _epoch_step_fullgraph(self, z: torch.Tensor) -> Tuple[float, float, torch.Tensor]:
         num_triples = self.heads.size(0)

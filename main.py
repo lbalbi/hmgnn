@@ -1,5 +1,6 @@
 # main.py
-import os, hashlib, re, statistics
+import os, hashlib, re, statistics, inspect
+from itertools import product
 from collections import defaultdict
 from typing import Dict, Tuple, List, Optional, Set
 
@@ -7,7 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedKFold
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import LinkNeighborLoader
 
@@ -776,10 +777,33 @@ def main():
 
     lr_cfg = cfg.get("lr", 1e-3)
     lr_candidates = [float(lr) for lr in lr_cfg] if isinstance(lr_cfg, (list, tuple)) else [float(lr_cfg)]
+
+    dropout_cfg = cfg.get("dropout", mcfg.get("dropout", None))
+    if isinstance(dropout_cfg, (list, tuple)):
+        dropout_candidates = [float(d) for d in dropout_cfg]
+    elif dropout_cfg is None:
+        dropout_candidates = [None]
+    else:
+        dropout_candidates = [float(dropout_cfg)]
+
+    contrastive_weight_cfg = cfg.get("contrastive_weight", 0.1)
+    contrastive_weight_candidates = (
+        [float(w) for w in contrastive_weight_cfg]
+        if isinstance(contrastive_weight_cfg, (list, tuple))
+        else [float(contrastive_weight_cfg)]
+    )
+
+    contrastive_temp_cfg = cfg.get("contrastive_temperature", 0.5)
+    contrastive_temp_candidates = (
+        [float(t) for t in contrastive_temp_cfg]
+        if isinstance(contrastive_temp_cfg, (list, tuple))
+        else [float(contrastive_temp_cfg)]
+    )
+
     print(f"Learning rate candidates (per-fold sweep): {lr_candidates}")
 
     k_folds = int(cfg.get("k_folds", 10))
-    contrastive_weight = float(cfg.get("contrastive_weight", 0.1))
+    contrastive_weight = float(contrastive_weight_candidates[0])
     subclass_rel = str(cfg.get("subclass_rel", "subclass_of"))
     instance_rel = str(cfg.get("instance_rel", "instance_of"))
     contrastive_k = int(cfg.get("contrastive_k", 1))
@@ -985,10 +1009,41 @@ def main():
         topk=25)
 
 
+    model_sig = inspect.signature(ModelCls.__init__)
+    model_params = set(model_sig.parameters.keys())
+    model_params.discard("self")
+    supports_dropout = ("dropout" in model_params) or ("attn_dropout" in model_params)
+    if not supports_dropout:
+        if any(d is not None for d in dropout_candidates):
+            print(f"[WARN] Model {ModelCls.__name__} does not accept dropout/attn_dropout; "
+                  "ignoring dropout grid.")
+        dropout_candidates = [None]
+    print(f"Dropout candidates: {dropout_candidates}")
+
+    use_contrastive = (not args.no_contrastive)
+    if not use_contrastive:
+        contrastive_weight_candidates = [0.0]
+        contrastive_temp_candidates = [contrastive_temp_candidates[0]]
+    print(f"Contrastive weight candidates: {contrastive_weight_candidates}")
+    print(f"Contrastive temperature inits:  {contrastive_temp_candidates}")
+
+    def _filter_model_kwargs(kwargs: Dict[str, object]) -> Dict[str, object]:
+        return {k: v for k, v in kwargs.items() if k in model_params}
+
+    def _build_model_kwargs(base_kwargs: Dict[str, object], dropout_value: Optional[float]) -> Dict[str, object]:
+        kwargs = dict(base_kwargs)
+        if dropout_value is not None:
+            if "dropout" in model_params:
+                kwargs["dropout"] = float(dropout_value)
+            elif "attn_dropout" in model_params:
+                kwargs["attn_dropout"] = float(dropout_value)
+        return _filter_model_kwargs(kwargs)
+
     neighbor_sizes = [15, 10]
-    lr_to_fold_losses = defaultdict(list)
-    lr_to_fold_epochs = defaultdict(list)
-    lr_to_fold_metrics = defaultdict(list)
+    hp_to_fold_losses = defaultdict(list)
+    hp_to_fold_epochs = defaultdict(list)
+    hp_to_fold_metrics = defaultdict(list)
+    hp_to_fold_temperatures = defaultdict(list)
     cv_metrics: List[torch.Tensor] = []
 
 
@@ -997,6 +1052,10 @@ def main():
             raise ValueError("When using --finaltrain_only you must provide BOTH --final_lr and --final_epochs")
         final_lr = float(args.final_lr)
         final_epochs = int(args.final_epochs)
+        final_dropout = dropout_candidates[0]
+        final_contrastive_weight = float(contrastive_weight_candidates[0])
+        final_contrastive_temp_init = float(contrastive_temp_candidates[0])
+        final_contrastive_temperature = float(contrastive_temp_candidates[0])
         print("\n=== Final-only mode (CV skipped) ===")
         print(f"final_epochs: {final_epochs}")
         print(f"final_lr:     {final_lr}")
@@ -1005,6 +1064,10 @@ def main():
         model_path = os.path.join("output/" + args.output_dir, f"final_model_{args.model}.pt")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file for testing not found: {model_path}")
+        final_dropout = dropout_candidates[0]
+        final_contrastive_weight = float(contrastive_weight_candidates[0])
+        final_contrastive_temp_init = float(contrastive_temp_candidates[0])
+        final_contrastive_temperature = float(contrastive_temp_candidates[0])
 
         final_base_kwargs = dict(
             in_dim=in_dim,
@@ -1013,10 +1076,11 @@ def main():
             e_etypes=encoder_e_etypes,
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
         )
+        final_model_kwargs = _build_model_kwargs(final_base_kwargs, final_dropout)
         if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
-            final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+            final_model = ModelCls(**final_model_kwargs, rel2id=rel2id).to(device)
         else:
-            final_model = ModelCls(**final_base_kwargs).to(device)
+            final_model = ModelCls(**final_model_kwargs).to(device)
 
         state = torch.load(model_path, map_location=device)
         missing, unexpected = final_model.load_state_dict(state, strict=False)
@@ -1025,9 +1089,6 @@ def main():
         print("  unexpected keys:", unexpected)
 
     else:
-        val_ratio = float(args.cv_val_ratio)
-        val_ratio = max(0.01, min(0.49, val_ratio))
-
         y = make_rel_label_strat_y(cls_rels, cls_labels)
 
         class_counts = np.bincount(y) if y.size else np.array([], dtype=np.int64)
@@ -1042,8 +1103,11 @@ def main():
             rare_idx = np.array([], dtype=np.int64)
             main_idx = np.arange(len(y), dtype=np.int64)
 
-        splitter = StratifiedShuffleSplit(n_splits=int(k_folds), test_size=val_ratio, random_state=42)
+        splitter = StratifiedKFold(n_splits=int(k_folds), shuffle=True, random_state=42)
+        print(f"[CV] StratifiedKFold with k={k_folds} (val size ≈ {1.0 / max(k_folds,1):.2f})")
         split_iter = splitter.split(np.zeros(len(main_idx), dtype=np.int64), y[main_idx]) if len(main_idx) else []
+
+        hyperparam_grid = list(product(dropout_candidates, contrastive_weight_candidates, contrastive_temp_candidates))
 
         for fold, (tr_sub, va_sub) in enumerate(split_iter, start=1):
             train_idx_np = main_idx[tr_sub]
@@ -1076,103 +1140,130 @@ def main():
             print(f"\n=== CV Split {fold}/{k_folds} ===")
             print(f"  Train cls examples: {train_idx.numel()} | Val cls examples: {val_idx.numel()}")
 
-            base_model_kwargs = dict(
-                in_dim=in_dim,
-                hidden_dim=mcfg["hidden_dim"],
-                out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
-                # e_etypes=list(encoder_graph.edge_types),
-                e_etypes=encoder_e_etypes,
-                n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
-            )
-            if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
-                model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
-            else:
-                model_fold = ModelCls(**base_model_kwargs).to(device)
-
-            sampler_graph = struct_graph
-            if not args.no_contrastive:
-                if use_random_sampler:
-                    neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                    neg_stmt_sampler.prepare_global(sampler_graph)
-                elif use_partial_sampler:
-                    edges_are_negative = nflag
-                    neg_stmt_sampler = PartialInstanceSampler(
-                        k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
-                    )
-                    neg_stmt_sampler.prepare_global(sampler_graph)
+            for hp_i, (dropout_val, contr_w, contr_temp_init) in enumerate(hyperparam_grid, start=1):
+                base_model_kwargs = dict(
+                    in_dim=in_dim,
+                    hidden_dim=mcfg["hidden_dim"],
+                    out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
+                    e_etypes=encoder_e_etypes,
+                    n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
+                )
+                model_kwargs = _build_model_kwargs(base_model_kwargs, dropout_val)
+                if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
+                    model_fold = ModelCls(**model_kwargs, rel2id=rel2id).to(device)
                 else:
-                    neg_stmt_sampler = NegativeInstanceSampler_NEW(
-                        k=contrastive_k,
-                        subclass_rel=subclass_rel,
-                        neg_prefix=NEG_PREFIX,
-                        instance_rel=instance_rel,
-                    )
-                    neg_stmt_sampler.prepare_global(sampler_graph)
-            else:
-                neg_stmt_sampler = None
+                    model_fold = ModelCls(**model_kwargs).to(device)
 
-            log_fold = Logger(f"train_cv_split{fold}", dir=args.output_dir)
-            trainer_fold = Train(
-                model=model_fold,
-                graph=encoder_graph,
-                heads=cls_heads,
-                rel_ids=cls_rels,
-                tails=cls_tails,
-                labels=cls_labels,
-                lr_candidates=lr_candidates,
-                epochs=args.epochs,
-                device=device,
-                log=log_fold,
-                batch_size=args.batch_size,
-                val_ratio=0.0,
-                early_stopping_patience=cfg.get("patience", 15),
-                train_idx=train_idx,
-                val_idx=val_idx,
-                contrastive_sampler=neg_stmt_sampler,
-                contrastive_weight=contrastive_weight,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                no_contrastive=args.no_contrastive,
-            )
+                sampler_graph = struct_graph
+                if not args.no_contrastive:
+                    if use_random_sampler:
+                        neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    elif use_partial_sampler:
+                        edges_are_negative = nflag
+                        neg_stmt_sampler = PartialInstanceSampler(
+                            k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                        )
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    else:
+                        neg_stmt_sampler = NegativeInstanceSampler_NEW(
+                            k=contrastive_k,
+                            subclass_rel=subclass_rel,
+                            neg_prefix=NEG_PREFIX,
+                            instance_rel=instance_rel,
+                        )
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                else:
+                    neg_stmt_sampler = None
 
-            best_val_loss, best_epoch, best_metrics, best_lr, per_lr = trainer_fold.run()
-            for lr in lr_candidates:
-                lr = float(lr)
-                rec = per_lr.get(lr, None)
-                if rec is None: continue
-                loss = float(rec["best_val_loss"])
-                ep = int(rec["best_epoch"])
+                dtag = "default" if dropout_val is None else f"{dropout_val:.3g}"
+                log_fold = Logger(f"train_cv_split{fold}_d{dtag}_cw{contr_w:.3g}_t{contr_temp_init:.3g}",
+                                  dir=args.output_dir)
+                trainer_fold = Train(
+                    model=model_fold,
+                    graph=encoder_graph,
+                    heads=cls_heads,
+                    rel_ids=cls_rels,
+                    tails=cls_tails,
+                    labels=cls_labels,
+                    lr_candidates=lr_candidates,
+                    epochs=args.epochs,
+                    device=device,
+                    log=log_fold,
+                    batch_size=args.batch_size,
+                    val_ratio=0.0,
+                    early_stopping_patience=cfg.get("patience", 15),
+                    train_idx=train_idx,
+                    val_idx=val_idx,
+                    contrastive_sampler=neg_stmt_sampler,
+                    contrastive_weight=contr_w,
+                    contrastive_temperature=contr_temp_init,
+                    learnable_contrastive_temperature=True,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    no_contrastive=args.no_contrastive,
+                )
 
-                if loss != float("inf"): lr_to_fold_losses[lr].append(loss)
-                if ep > 0: lr_to_fold_epochs[lr].append(ep)
-                if rec.get("best_metrics", None) is not None: lr_to_fold_metrics[lr].append(rec["best_metrics"])
-            if best_metrics is not None:
-                cv_metrics.append(best_metrics)
+                best_val_loss, best_epoch, best_metrics, best_lr, per_lr = trainer_fold.run()
+                for lr in lr_candidates:
+                    lr = float(lr)
+                    rec = per_lr.get(lr, None)
+                    if rec is None: continue
+                    loss = float(rec["best_val_loss"])
+                    ep = int(rec["best_epoch"])
+                    temp = rec.get("best_temperature", None)
 
-        lr_summary = []
-        for lr in lr_candidates:
-            lr = float(lr)
-            losses = lr_to_fold_losses.get(lr, [])
-            if not losses: continue
+                    key = (lr, dropout_val, float(contr_w), float(contr_temp_init))
+                    if loss != float("inf"): hp_to_fold_losses[key].append(loss)
+                    if ep > 0: hp_to_fold_epochs[key].append(ep)
+                    if temp is not None: hp_to_fold_temperatures[key].append(float(temp))
+                    if rec.get("best_metrics", None) is not None: hp_to_fold_metrics[key].append(rec["best_metrics"])
+                if best_metrics is not None:
+                    cv_metrics.append(best_metrics)
+
+        hp_summary = []
+        for key, losses in hp_to_fold_losses.items():
+            if not losses:
+                continue
             mean_loss = statistics.mean(losses)
             std_loss = statistics.pstdev(losses) if len(losses) > 1 else 0.0
             n = len(losses)
-            lr_summary.append((mean_loss, std_loss, n, lr))
-        if not lr_summary:
+            hp_summary.append((mean_loss, std_loss, n, key))
+        if not hp_summary:
             final_lr = float(lr_candidates[0])
+            final_dropout = dropout_candidates[0]
+            final_contrastive_weight = float(contrastive_weight_candidates[0])
+            final_contrastive_temp_init = float(contrastive_temp_candidates[0])
+            final_contrastive_temperature = float(contrastive_temp_candidates[0])
             final_epochs = int(args.epochs)
         else:
-            lr_summary.sort(key=lambda x: (x[0], x[1], x[3]))
-            best_mean, best_std, best_n, final_lr = lr_summary[0]
-            epochs_for_lr = lr_to_fold_epochs.get(final_lr, [])
-            final_epochs = int(statistics.median(epochs_for_lr)) if epochs_for_lr else int(args.epochs)
+            hp_summary.sort(key=lambda x: (
+                x[0], x[1], x[3][0], x[3][1] if x[3][1] is not None else -1.0, x[3][2], x[3][3]
+            ))
+            best_mean, best_std, best_n, best_key = hp_summary[0]
+            final_lr, final_dropout, final_contrastive_weight, final_contrastive_temp_init = best_key
+            epochs_for_key = hp_to_fold_epochs.get(best_key, [])
+            final_epochs = int(statistics.median(epochs_for_key)) if epochs_for_key else int(args.epochs)
+            temps_for_key = hp_to_fold_temperatures.get(best_key, [])
+            if temps_for_key:
+                final_contrastive_temperature = float(statistics.median(temps_for_key))
+            else:
+                final_contrastive_temperature = float(final_contrastive_temp_init)
         print("\n=== Cross-validation summary (TRAIN split only) ===")
-        print("LR aggregates (mean_val_loss ± std over folds):")
-        for mean_loss, std_loss, n, lr in sorted(lr_summary, key=lambda x: (x[0], x[1], x[3])):
-            print(f"  lr={lr:.3g} | mean={mean_loss:.6f} | std={std_loss:.6f} | folds={n}")
+        print("Grid aggregates (mean_val_loss ± std over folds):")
+        for mean_loss, std_loss, n, key in sorted(hp_summary, key=lambda x: (x[0], x[1], x[3][0])):
+            lr, d, cw, ct = key
+            dtag = "default" if d is None else f"{d:.3g}"
+            print(f"  lr={lr:.3g} | dropout={dtag} | c_w={cw:.3g} | c_t0={ct:.3g} | "
+                  f"mean={mean_loss:.6f} | std={std_loss:.6f} | folds={n}")
+        dtag = "default" if final_dropout is None else f"{final_dropout:.3g}"
         print(f"\nChosen final_lr (best mean over folds): {final_lr:.6g}")
-        print(f"Epochs for chosen LR across folds:      {lr_to_fold_epochs.get(final_lr, [])}")
-        print(f"Chosen final_epochs (median for LR):    {final_epochs}")
+        print(f"Chosen final_dropout:                    {dtag}")
+        print(f"Chosen final_contrastive_weight:         {final_contrastive_weight:.6g}")
+        print(f"Chosen final_contrastive_temperature:    {final_contrastive_temperature:.6g}")
+        final_key = (final_lr, final_dropout, float(final_contrastive_weight), float(final_contrastive_temp_init))
+        print(f"Epochs for chosen grid key across folds: {hp_to_fold_epochs.get(final_key, [])}")
+        print(f"Chosen final_epochs (median for key):    {final_epochs}")
 
 
     # -----------------------------------------------------------------
@@ -1196,10 +1287,11 @@ def main():
             e_etypes=encoder_e_etypes,
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
         )
+        final_model_kwargs = _build_model_kwargs(final_base_kwargs, final_dropout)
         if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gat", "gae"):
-            final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
+            final_model = ModelCls(**final_model_kwargs, rel2id=rel2id).to(device)
         else:
-            final_model = ModelCls(**final_base_kwargs).to(device)
+            final_model = ModelCls(**final_model_kwargs).to(device)
 
         final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
@@ -1238,9 +1330,11 @@ def main():
             log=final_log,
             batch_size=args.batch_size,
             contrastive_sampler=final_contrastive_sampler,
-            contrastive_weight=contrastive_weight,
+            contrastive_weight=final_contrastive_weight,
             loader=final_loader,
             no_contrastive=args.no_contrastive,
+            contrastive_temperature=final_contrastive_temperature,
+            learnable_contrastive_temperature=True,
         )
         final_loss = final_trainer.run()
         print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}")

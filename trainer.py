@@ -16,7 +16,8 @@ class Train:
         epochs: int, device: torch.device, log, batch_size: int = 1024, val_ratio: float = 0.1,
         early_stopping_patience: int = 15, train_idx: Optional[torch.Tensor] = None,
         val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeInstanceSampler] = None,
-        contrastive_weight: float = 0.1, train_loader=None, val_loader=None, no_contrastive: bool = False):
+        contrastive_weight: float = 0.1, train_loader=None, val_loader=None, no_contrastive: bool = False,
+        contrastive_temperature: float = 0.5, learnable_contrastive_temperature: bool = True):
 
         self.model = model.to(device)
         print(model.__class__.__name__)
@@ -37,11 +38,12 @@ class Train:
         self.no_contrastive = no_contrastive
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
-        # self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
-        # self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
+        self.learnable_contrastive_temperature = bool(learnable_contrastive_temperature)
+        self.contrastive_temperature_init = float(contrastive_temperature)
+
         self.dual_view = bool(getattr(self.model, "dual_view", False))
         if contrastive_sampler is not None:
-            self.contrastive_loss_fn = DualContrastiveInstanceLoss() if self.dual_view else ContrastiveInstanceLoss()
+            self.contrastive_loss_fn = self._make_contrastive_loss_fn(self.dual_view, self.contrastive_temperature_init)
         else: self.contrastive_loss_fn = None
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -66,6 +68,8 @@ class Train:
 
 
         self._init_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+        self._init_dual_view = self.dual_view
+        self._init_contrastive_temperature = self._get_contrastive_temperature_value()
         if "node" not in self.graph.node_types:
             raise ValueError("Train currently assumes a single node type 'node' in the graph.")
         num_nodes = int(self.graph["node"].num_nodes)
@@ -78,27 +82,34 @@ class Train:
 
         self.cls_edge_type = CLS_EDGE_TYPE
 
+    def _make_contrastive_loss_fn(self, dual_view: bool, temperature: float):
+        if dual_view:
+            loss_fn = DualContrastiveInstanceLoss(
+                temperature=temperature, learnable_temperature=self.learnable_contrastive_temperature
+            )
+        else:
+            loss_fn = ContrastiveInstanceLoss(
+                temperature=temperature, learnable_temperature=self.learnable_contrastive_temperature
+            )
+        return loss_fn.to(self.device)
 
-    # def _get_link_supervision(self, batch: HeteroData):
-    #     """
-    #     Returns (edge_label_index, edge_label, input_id) from a LinkNeighborLoader batch.
-    #     For HeteroData, these live on the edge store corresponding to the edge_type you
-    #     passed into LinkNeighborLoader(edge_label_index=(edge_type, ...)).
-    #     """
-    #     # Hetero: supervision attrs live in an edge store:
-    #     if isinstance(batch, HeteroData):
-    #         for et in batch.edge_types:
-    #             store = batch[et]
-    #             eli = getattr(store, "edge_label_index", None)
-    #             if eli is not None:
-    #                 el = getattr(store, "edge_label", None)
-    #                 iid = getattr(store, "input_id", None)
-    #                 return eli, el, iid
-    #     # Homo fallback (in case you ever switch to Data):
-    #     eli = getattr(batch, "edge_label_index", None)
-    #     if eli is not None:
-    #         return eli, getattr(batch, "edge_label", None), getattr(batch, "input_id", None)
-    #     raise RuntimeError("No edge_label_index found in batch. Are you using LinkNeighborLoader?")
+    def _get_contrastive_temperature_value(self) -> Optional[float]:
+        if self.contrastive_loss_fn is None:
+            return None
+        if hasattr(self.contrastive_loss_fn, "get_temperature_value"):
+            return float(self.contrastive_loss_fn.get_temperature_value())
+        if hasattr(self.contrastive_loss_fn, "temperature"):
+            return float(self.contrastive_loss_fn.temperature)
+        return None
+
+    def _reset_contrastive_state(self) -> None:
+        if self.contrastive_loss_fn is None:
+            return
+        self.dual_view = self._init_dual_view
+        init_temp = self._init_contrastive_temperature
+        if init_temp is None:
+            init_temp = self.contrastive_temperature_init
+        self.contrastive_loss_fn = self._make_contrastive_loss_fn(self.dual_view, init_temp)
 
     def _get_link_supervision(self, batch: HeteroData):
         if isinstance(batch, HeteroData):
@@ -111,7 +122,8 @@ class Train:
         return eli, getattr(batch, "edge_label", None), getattr(batch, "input_id", None)
 
 
-    def _maybe_switch_to_dual(self, h_dict: Dict[str, torch.Tensor], n_type: str) -> None:
+    def _maybe_switch_to_dual(self, h_dict: Dict[str, torch.Tensor], n_type: str,
+        optimizer: Optional[torch.optim.Optimizer] = None) -> None:
         """If the encoder exposes two per-node views (e.g. SRA-HGCN), switch the
         contrastive loss to the dual-view objective. Safe to call every batch."""
         if self.contrastive_sampler is None or self.no_contrastive or self.contrastive_weight <= 0.0:
@@ -125,7 +137,14 @@ class Train:
             zp = h_dict[pos_k]
             if z.dim() == 2 and zp.dim() == 2 and z.size(1) == 2 * zp.size(1):
                 self.dual_view = True
-                self.contrastive_loss_fn = DualContrastiveInstanceLoss()
+                current_temp = self._get_contrastive_temperature_value()
+                if current_temp is None:
+                    current_temp = self.contrastive_temperature_init
+                self.contrastive_loss_fn = self._make_contrastive_loss_fn(True, current_temp)
+                if optimizer is not None:
+                    new_params = [p for p in self.contrastive_loss_fn.parameters() if p.requires_grad]
+                    if new_params:
+                        optimizer.add_param_group({"params": new_params})
 
     def _iterate_batches(self, idx: torch.Tensor, z: torch.Tensor,
         train: bool = True) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -224,52 +243,6 @@ class Train:
         labels = self.labels[triple_idx].to(device)
         return edge_index_local, rel_ids, labels
 
-    # def _train_one_epoch_with_neighbors(self, optimizer, n_type: str) -> Tuple[float, float]:
-    #     assert self.train_loader is not None, "NeighborLoader not provided."
-    #     self.model.train()
-    #     total_bce = 0.0
-    #     total_contr = 0.0
-    #     total_examples = 0
-
-    #     for batch in self.train_loader:
-    #         batch = batch.to(self.device)
-    #         triple_idx = self._get_batch_triple_indices(batch, subset="train")
-    #         if triple_idx.numel() == 0: continue
-
-    #         if (not self.no_contrastive and self.contrastive_sampler is not None
-    #             and hasattr(self.contrastive_sampler, "prepare_batch")):
-    #             self.contrastive_sampler.prepare_batch(batch)
-    #         optimizer.zero_grad()
-    #         h_dict = self.model.encode(batch)
-    #         self._maybe_switch_to_dual(h_dict, n_type)
-    #         z = h_dict[n_type]
-    #         del h_dict
-    #         edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
-    #             triple_idx, batch["node"].n_id, self.device)
-
-    #         logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
-    #         bce_loss = self.criterion(logits, labels)
-
-    #         loss = bce_loss
-    #         contr_loss_val = 0.0
-
-    #         if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-    #             batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
-    #             samples = self.contrastive_sampler.get_contrastive_samples(
-    #                 z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
-    #             contr_loss = self.contrastive_loss_fn(*samples)
-    #             loss = loss + self.contrastive_weight * contr_loss
-    #             contr_loss_val = float(contr_loss.detach().cpu().item())
-    #         loss.backward()
-    #         optimizer.step()
-
-    #         batch_size_eff = labels.size(0)
-    #         total_bce += bce_loss.detach().cpu().item() * batch_size_eff
-    #         total_contr += contr_loss_val * batch_size_eff
-    #         total_examples += batch_size_eff
-    #     avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
-    #     avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
-    #     return avg_bce, avg_contr
     def _train_one_epoch_with_neighbors(self, optimizer, n_type: str) -> Tuple[float, float]:
         assert self.train_loader is not None, "LinkNeighborLoader not provided."
         self.model.train()
@@ -305,7 +278,7 @@ class Train:
             optimizer.zero_grad()
 
             h_dict = self.model.encode(batch)
-            self._maybe_switch_to_dual(h_dict, n_type)
+            self._maybe_switch_to_dual(h_dict, n_type, optimizer=optimizer)
             z = h_dict[n_type]
             del h_dict
 
@@ -344,60 +317,6 @@ class Train:
         return avg_bce, avg_contr
 
 
-    # def _eval_with_neighbors(self, n_type:str) -> Tuple[float, float, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    #     assert self.val_loader is not None, "NeighborLoader not provided."
-    #     self.model.eval()
-    #     total_bce = 0.0
-    #     total_contr = 0.0
-    #     total_examples = 0
-    #     all_probs = []
-    #     all_labels = []
-
-    #     with torch.no_grad():
-    #         for batch in self.val_loader:
-    #             batch = batch.to(self.device)
-    #             triple_idx = self._get_batch_triple_indices(batch, subset="val")
-    #             if triple_idx.numel() == 0: continue
-
-    #             # if (not self.no_contrastive and self.contrastive_sampler is not None
-    #             #     and hasattr(self.contrastive_sampler, "prepare_batch")):
-    #             #     self.contrastive_sampler.prepare_batch(batch)
-
-    #             h_dict = self.model.encode(batch)
-    #             z = h_dict[n_type]
-
-    #             edge_index_local, rel_ids, labels = self._build_local_triple_tensors(
-    #                 triple_idx, batch["node"].n_id, self.device)
-    #             logits, probs = self.model.score_triples(z, edge_index_local, rel_ids)
-    #             bce_loss = self.criterion(logits, labels)
-    #             loss = bce_loss
-    #             contr_loss_val = 0.0
-
-    #             # if not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
-    #             #     batch_nodes = torch.unique(torch.cat([edge_index_local[0], edge_index_local[1]], dim=0))
-    #             #     z_pos, z_pos_pos, z_pos_neg = self.contrastive_sampler.get_contrastive_samples(
-    #             #         z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id)
-    #             #     contr_loss = self.contrastive_loss_fn(z_pos, z_pos_pos, z_pos_neg)
-    #             #     loss = loss + self.contrastive_weight * contr_loss
-    #             #     contr_loss_val = float(contr_loss.detach().cpu().item())
-
-    #             batch_size_eff = labels.size(0)
-    #             total_bce += bce_loss.detach().cpu().item() * batch_size_eff
-    #             total_contr += contr_loss_val * batch_size_eff
-    #             total_examples += batch_size_eff
-    #             all_probs.append(probs.detach().cpu())
-    #             all_labels.append(labels.detach().cpu())
-
-    #     avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
-    #     avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
-
-    #     if all_probs:
-    #         all_probs = torch.cat(all_probs, dim=0)
-    #         all_labels = torch.cat(all_labels, dim=0)
-    #     else:
-    #         all_probs = None
-    #         all_labels = None
-    #     return avg_bce, avg_contr, all_probs, all_labels
     def _eval_with_neighbors(self, n_type: str):
         assert self.val_loader is not None, "LinkNeighborLoader not provided."
         self.model.eval()
@@ -463,13 +382,18 @@ class Train:
 
         for lr in self.lr_candidates:
             self.model.load_state_dict(self._init_state)
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+            self._reset_contrastive_state()
+            params = list(self.model.parameters())
+            if self.contrastive_loss_fn is not None:
+                params.extend([p for p in self.contrastive_loss_fn.parameters() if p.requires_grad])
+            optimizer = torch.optim.Adam(params, lr=lr)
             lr_early_stopping = EarlyStopping(patience=self.es_patience, mode="min")
 
             best_val_loss_lr = float("inf")
             best_epoch_lr = -1
             best_metrics_lr = None
             best_state_lr = None
+            best_temperature_lr = None
             if not getattr(self.log, "non_verbose", False):
                 self.log.log(f"=== Starting LR sweep for lr={lr:.3g} ===")
             
@@ -490,7 +414,7 @@ class Train:
                         self.contrastive_sampler.prepare_batch(self.graph)
                     optimizer.zero_grad()
                     h_dict = self.model.encode(self.graph)
-                    self._maybe_switch_to_dual(h_dict, n_type)
+                    self._maybe_switch_to_dual(h_dict, n_type, optimizer=optimizer)
                     z_train = h_dict[n_type]
 
                     train_bce, train_contr, _, _, train_total_loss = self._iterate_batches(
@@ -536,6 +460,7 @@ class Train:
                     best_epoch_lr = epoch
                     best_metrics_lr = val_metrics
                     best_state_lr = {k:v.detach().clone() for k,v in self.model.state_dict().items()}
+                    best_temperature_lr = self._get_contrastive_temperature_value()
 
                 if lr_early_stopping.step(val_bce, self.model):
                     if not getattr(self.log, "non_verbose", False):
@@ -548,6 +473,8 @@ class Train:
                 "best_epoch": int(best_epoch_lr),
                 "best_metrics": best_metrics_lr,
                 "best_state": best_state_lr,
+                "best_temperature": (float(best_temperature_lr)
+                    if best_temperature_lr is not None else None),
             }
 
             if best_val_loss_lr < overall_best_val_loss:

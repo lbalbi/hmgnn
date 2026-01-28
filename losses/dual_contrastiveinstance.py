@@ -21,11 +21,27 @@ class DualContrastiveInstanceLoss(nn.Module):
       If you later update the sampler to PAD with -1 and return validity masks, you can pass
       neg_mask / pos_mask as extra positional args (6th and 7th), shape (B, k) bool.
     """
-    def __init__(self, temperature: float = 0.5, w_neg: float = 1.0, w_pos: float = 1.0):
+    def __init__(self, temperature: float = 0.5, w_neg: float = 1.0, w_pos: float = 1.0,
+        learnable_temperature: bool = False, min_temperature: float = 1e-4):
         super().__init__()
+        self.learnable_temperature = bool(learnable_temperature)
+        self.min_temperature = float(min_temperature)
+        if self.learnable_temperature:
+            init_temp = max(float(temperature), self.min_temperature)
+            self.log_temperature = nn.Parameter(torch.log(torch.tensor(init_temp)))
+        else:
+            self.register_buffer("fixed_temperature", torch.tensor(float(temperature)))
         self.temperature = float(temperature)
         self.w_neg = float(w_neg)
         self.w_pos = float(w_pos)
+
+    def _get_temperature(self) -> Tensor:
+        if self.learnable_temperature:
+            return torch.exp(self.log_temperature).clamp(min=self.min_temperature)
+        return self.fixed_temperature
+
+    def get_temperature_value(self) -> float:
+        return float(self._get_temperature().detach().cpu().item())
 
     def _info_nce_masked(self, anchor: Tensor, pos: Tensor, neg: Tensor, neg_mask: Optional[Tensor]) -> Tensor:
         """ Masked InfoNCE (single-positive per anchor).
@@ -45,11 +61,12 @@ class DualContrastiveInstanceLoss(nn.Module):
         pos = pos[row_ok]
         neg = neg[row_ok]
         neg_mask = neg_mask[row_ok]
-        pos_logits = _cosine_sim(anchor, pos).unsqueeze(1) / self.temperature
+        temperature = self._get_temperature()
+        pos_logits = _cosine_sim(anchor, pos).unsqueeze(1) / temperature
 
         a = F.normalize(anchor, dim=-1).unsqueeze(1)
         n = F.normalize(neg, dim=-1)
-        neg_logits = (a * n).sum(dim=-1) / self.temperature
+        neg_logits = (a * n).sum(dim=-1) / temperature
         neg_logits = neg_logits.masked_fill(~neg_mask, -1e9)
 
         logits = torch.cat([pos_logits, neg_logits], dim=1)
