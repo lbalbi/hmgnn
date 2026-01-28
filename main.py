@@ -1180,7 +1180,7 @@ def main():
                     )
                     neg_stmt_sampler.prepare_global(sampler_graph)
                 else:
-                    neg_stmt_sampler = NegativeInstanceSampler_NEW(
+                    neg_stmt_sampler = NegativeInstanceSampler(
                         k=contrastive_k,
                         subclass_rel=subclass_rel,
                         neg_prefix=NEG_PREFIX,
@@ -1341,7 +1341,7 @@ def main():
                 )
                 final_contrastive_sampler.prepare_global(struct_graph)
             else:
-                final_contrastive_sampler = NegativeInstanceSampler_NEW(
+                final_contrastive_sampler = NegativeInstanceSampler(
                     k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel
                 )
                 final_contrastive_sampler.prepare_global(struct_graph)
