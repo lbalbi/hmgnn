@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor
 from torch_geometric.data import HeteroData
+from collections import defaultdict
 
 class NegativeInstanceSampler:
     """  Wiki-framework sampler that returns instance-example groups per anchor.
@@ -33,6 +34,13 @@ class NegativeInstanceSampler:
         self._g2l_cpu: Optional[Tensor] = None
         self._stamp_cpu: Optional[Tensor] = None        
         self._cur_stamp: int = 0
+
+        self.pool_shared_pos_by_pred = None
+        self.pool_shared_neg_by_pred = None
+        self.pool_pos_to_u_neg_by_pred = None
+        self.pool_neg_to_u_pos_by_pred = None
+        self.preds_seen = None
+        self.primary_pred = instance_rel  # "instance_of"
 
 
     @staticmethod
@@ -147,6 +155,12 @@ class NegativeInstanceSampler:
             chosen_l[bad] = fallback_local
         return chosen_l.long()
 
+
+    def _base_pred(self, rel: str) -> str:
+        rel = str(rel)
+        return rel[len(self.neg_prefix):] if rel.startswith(self.neg_prefix) else rel
+
+
     def prepare_global(self, full_g: HeteroData) -> None:
         if len(full_g.node_types) != 1:
             raise ValueError("NegativeInstanceSampler assumes a single node type.")
@@ -167,9 +181,9 @@ class NegativeInstanceSampler:
             self._is_instance = is_instance
         else: self._is_instance = None
 
-        self.pos_classes = [[] for _ in range(N)]
-        self.neg_classes_direct = [[] for _ in range(N)]
-        # Build subclass predecessors (parent -> children)
+        # self.pos_classes = [[] for _ in range(N)]
+        # self.neg_classes_direct = [[] for _ in range(N)]
+
         subclass_predecessors: Dict[int, Tensor] = {}
         sub_key = self._find_edge_key(full_g, self.subclass_rel)
         if sub_key is not None and "edge_index" in full_g[sub_key]:
@@ -180,115 +194,217 @@ class NegativeInstanceSampler:
                     tmp.setdefault(int(parent), []).append(int(child))
             subclass_predecessors = {p: self._unique_cpu(ch) for p, ch in tmp.items()}
 
-        class2pos_tmp: Dict[int, List[int]] = {}
-        class2neg_tmp: Dict[int, List[int]] = {}
+        pos_by_pred = [defaultdict(list) for _ in range(N)]
+        neg_by_pred_direct = [defaultdict(list) for _ in range(N)]
+        class2pos_by_pred_tmp = defaultdict(lambda: defaultdict(list))
+        class2neg_by_pred_tmp = defaultdict(lambda: defaultdict(list))
         anchor_sources: set[int] = set(instance_nodes)
-        # Scan all edges, collect (inst -> class) and inverse maps (class -> inst)
+
         for (_, rel, _), eidx in full_g.edge_index_dict.items():
-            if eidx.numel() == 0 or rel == self.subclass_rel:
-                continue
+            if eidx.numel() == 0 or rel == self.subclass_rel: continue
+            rel = str(rel)
             is_neg_rel = rel.startswith(self.neg_prefix)
+            pred = self._base_pred(rel)
             src_list = eidx[0].tolist()
             dst_list = eidx[1].tolist()
 
             for a, b in zip(src_list, dst_list):
                 if not (0 <= a < N and 0 <= b < N): continue
                 inst, cls = self._as_inst_class(int(a), int(b))
-                if inst is None or cls is None: continue
+                if inst is None: continue
                 anchor_sources.add(inst)
                 if is_neg_rel:
-                    self.neg_classes_direct[inst].append(cls)
-                    class2neg_tmp.setdefault(cls, []).append(inst)
+                    neg_by_pred_direct[inst][pred].append(cls)
+                    class2neg_by_pred_tmp[pred][cls].append(inst)
                 else:
-                    self.pos_classes[inst].append(cls)
-                    class2pos_tmp.setdefault(cls, []).append(inst)
+                    pos_by_pred[inst][pred].append(cls)
+                    class2pos_by_pred_tmp[pred][cls].append(inst)
         self.anchors = sorted(anchor_sources) if anchor_sources else list(range(N))
 
-        # Expand negative classes via subclass graph
-        self.neg_classes_expanded = [[] for _ in range(N)]
+        neg_by_pred_expanded = [defaultdict(list) for _ in range(N)]
         for u in self.anchors:
-            self.neg_classes_expanded[u] = self._expand_negs(self.neg_classes_direct[u], subclass_predecessors)
+            for pred, cls_list in neg_by_pred_direct[u].items():
+                neg_by_pred_expanded[u][pred] = self._expand_negs(cls_list, subclass_predecessors)
 
-        class2pos = {c: self._unique_cpu(vs) for c, vs in class2pos_tmp.items()}
-        class2neg = {c: self._unique_cpu(vs) for c, vs in class2neg_tmp.items()}
+        class2pos_by_pred = {pred: {c: self._unique_cpu(vs) for c, vs in cls_map.items()}
+            for pred, cls_map in class2pos_by_pred_tmp.items()}
+        class2neg_by_pred = {pred: {c: self._unique_cpu(vs) for c, vs in cls_map.items()}
+            for pred, cls_map in class2neg_by_pred_tmp.items()}
 
         empty = torch.empty(0, dtype=torch.long)
-        self.pool_shared_pos = [empty for _ in range(N)]
-        self.pool_shared_neg = [empty for _ in range(N)]
-        self.pool_pos_to_u_neg = [empty for _ in range(N)]
-        self.pool_neg_to_u_pos = [empty for _ in range(N)]
+        self.pool_shared_pos_by_pred = [defaultdict(lambda: empty) for _ in range(N)]
+        self.pool_shared_neg_by_pred = [defaultdict(lambda: empty) for _ in range(N)]
+        self.pool_pos_to_u_neg_by_pred = [defaultdict(lambda: empty) for _ in range(N)]
+        self.pool_neg_to_u_pos_by_pred = [defaultdict(lambda: empty) for _ in range(N)]
+        self.preds_seen = [set() for _ in range(N)]
 
-        # Build pools per anchor u (global ids)
         for u in self.anchors:
-            pos_cls = self.pos_classes[u]
-            neg_cls = self.neg_classes_expanded[u]
-            self.pool_shared_pos[u] = self._collect_instances(pos_cls, class2pos, exclude=u)
-            self.pool_shared_neg[u] = self._collect_instances(neg_cls, class2neg, exclude=u)
-            self.pool_pos_to_u_neg[u] = self._collect_instances(neg_cls, class2pos, exclude=u)
-            self.pool_neg_to_u_pos[u] = self._collect_instances(pos_cls, class2neg, exclude=u)
+            preds_u = set(pos_by_pred[u].keys()) | set(neg_by_pred_expanded[u].keys())
+            self.preds_seen[u] = preds_u
+            for pred in preds_u:
+                pos_cls = pos_by_pred[u].get(pred, [])
+                neg_cls = neg_by_pred_expanded[u].get(pred, [])
 
-        # Initialize stamp buffers (CPU)
+                self.pool_shared_pos_by_pred[u][pred] = self._collect_instances(
+                    pos_cls, class2pos_by_pred.get(pred, {}), exclude=u)
+                self.pool_shared_neg_by_pred[u][pred] = self._collect_instances(
+                    neg_cls, class2neg_by_pred.get(pred, {}), exclude=u)
+                self.pool_pos_to_u_neg_by_pred[u][pred] = self._collect_instances(
+                    neg_cls, class2pos_by_pred.get(pred, {}), exclude=u)
+                self.pool_neg_to_u_pos_by_pred[u][pred] = self._collect_instances(
+                    pos_cls, class2neg_by_pred.get(pred, {}), exclude=u)
         self._g2l_cpu = torch.empty(self.num_nodes, dtype=torch.long)
         self._stamp_cpu = torch.zeros(self.num_nodes, dtype=torch.int32)
         self._cur_stamp = 0
 
+
     def prepare_batch(self, batch: HeteroData, pos_index: Optional[Tensor] = None) -> None:
-        # Keep as no-op to preserve your current external behavior.
         return
 
-    def get_contrastive_samples(
-        self,
-        z: Tensor,
-        anchor_nodes: Optional[Tensor] = None,
-        n_id: Optional[Tensor] = None,
-    ):
-        """
-        Returns:
-            (z_anchor, z_shared_neg, z_pos_to_u_neg, z_neg_to_u_pos, z_shared_pos)
+    def _pred_priority(self, u_g: int) -> list[str]:
+        # Deterministic ordering (set -> sorted list)
+        preds = sorted(self.preds_seen[u_g]) if self.preds_seen is not None else []
+        if self.primary_pred in preds:
+            preds.remove(self.primary_pred)
+            return [self.primary_pred] + preds
+        return preds
+    # def _pred_priority(self, u_g: int) -> list[str]:
+    #     preds = list(self.preds_seen[u_g]) if self.preds_seen is not None else []
+    #     if self.primary_pred in preds:
+    #         preds.remove(self.primary_pred)
+    #         return [self.primary_pred] + preds
+    #     return preds
+
+
+    def _sample_k_priority_cpu(self, pools_by_pred: dict, pred_order: list[str], *, stamp: int,
+        fallback_global: int, fallback_local: int, k: int, full_graph_mode: bool) -> torch.Tensor:
+        chosen_globals: list[int] = []
+        chosen_set: set[int] = set()
+
+        def _filter_in_batch(globals_: torch.Tensor) -> torch.Tensor:
+            if globals_.numel() == 0:
+                return globals_
+            if full_graph_mode:
+                return globals_
+            # neighbor-mode filter (globals only)
+            mask = (self._stamp_cpu[globals_] == stamp)
+            return globals_[mask]
+
+        # take from predicates in priority order
+        for pred in pred_order:
+            pool_g = pools_by_pred.get(pred, None)
+            if pool_g is None or pool_g.numel() == 0:
+                continue
+            pool_g = _filter_in_batch(pool_g)
+            if pool_g.numel() == 0:
+                continue
+
+            if chosen_set:
+                chosen_t = torch.tensor(list(chosen_set), dtype=pool_g.dtype)
+                pool_g = pool_g[~torch.isin(pool_g, chosen_t)]
+                # mask = torch.tensor([int(x) not in chosen_set for x in pool_g.tolist()], dtype=torch.bool)
+                # pool_g = pool_g[mask]
+                if pool_g.numel() == 0: continue
+
+            need = k - len(chosen_globals)
+            if need <= 0:
+                break
+
+            idx = self._choose_indices(int(pool_g.numel()), need)
+            for x in pool_g[idx].tolist():
+                x = int(x)
+                if x not in chosen_set:
+                    chosen_set.add(x)
+                    chosen_globals.append(x)
+                    if len(chosen_globals) >= k:
+                        break
+
+        # fallback: union across predicates (still global ids)
+        if len(chosen_globals) < k:
+            all_parts = []
+            for pred in pred_order:
+                p = pools_by_pred.get(pred, None)
+                if p is None or p.numel() == 0:
+                    continue
+                all_parts.append(_filter_in_batch(p))
+            if all_parts:
+                union = torch.unique(torch.cat(all_parts, dim=0))
+                if union.numel() > 0:
+                    if chosen_set:
+                        chosen_t = torch.tensor(list(chosen_set), dtype=union.dtype)
+                        union = union[~torch.isin(union, chosen_t)]
+                        # mask = torch.tensor([int(x) not in chosen_set for x in union.tolist()], dtype=torch.bool)
+                        # union = union[mask]
+                    if union.numel() > 0:
+                        need = k - len(chosen_globals)
+                        idx = self._choose_indices(int(union.numel()), need)
+                        chosen_globals.extend([int(x) for x in union[idx].tolist()])
+
+        # pad with GLOBAL fallback
+        if len(chosen_globals) < k:
+            chosen_globals.extend([int(fallback_global)] * (k - len(chosen_globals)))
+
+        chosen_globals_t = torch.tensor(chosen_globals[:k], dtype=torch.long)
+
+        if full_graph_mode:
+            return chosen_globals_t  # local == global
+
+        # neighbor-mode: map global -> local
+        chosen_local = self._g2l_cpu[chosen_globals_t]
+        bad = (self._stamp_cpu[chosen_globals_t] != stamp) | (chosen_local < 0)
+        if bad.any():
+            chosen_local = chosen_local.clone()
+            chosen_local[bad] = int(fallback_local)
+        return chosen_local.long()
+
+
+    def _has_any_pool(self, u: int) -> bool:
+        for d in (
+            self.pool_shared_pos_by_pred[u],
+            self.pool_shared_neg_by_pred[u],
+            self.pool_pos_to_u_neg_by_pred[u],
+            self.pool_neg_to_u_pos_by_pred[u],
+        ):
+            for t in d.values():
+                if t is not None and t.numel() > 0:
+                    return True
+        return False
+
+    def get_contrastive_samples(self, z: Tensor, anchor_nodes: Optional[Tensor] = None,
+        n_id: Optional[Tensor] = None):
+        """   Returns: (z_anchor, z_shared_neg, z_pos_to_u_neg, z_neg_to_u_pos, z_shared_pos)
         with shapes:
-            z_anchor:     (B,D)
-            each other:   (B,k,D)
+            z_anchor: (B,D)
+            each other: (B,k,D)
         where B = number of anchors that had non-empty pools and were valid.
         """
         device = z.device
         B_rows, D = z.shape
         k = self.k
 
-        # --------------------------
-        # FULL GRAPH MODE (n_id is None)
-        # local == global, no in-batch filtering needed
-        # --------------------------
         if n_id is None:
             if anchor_nodes is None or anchor_nodes.numel() == 0:
                 anchor_globals_cpu = torch.tensor(self.anchors, dtype=torch.long)
-            else:
-                anchor_globals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
-
-            # keep valid range
+            else: anchor_globals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
             anchor_globals_cpu = anchor_globals_cpu[(anchor_globals_cpu >= 0) & (anchor_globals_cpu < self.num_nodes)]
 
             anchors_cpu: List[int] = []
             shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
 
             for u in anchor_globals_cpu.tolist():
-                # skip anchors with no pools at all
-                if (
-                    self.pool_shared_pos[u].numel() == 0
-                    and self.pool_shared_neg[u].numel() == 0
-                    and self.pool_pos_to_u_neg[u].numel() == 0
-                    and self.pool_neg_to_u_pos[u].numel() == 0
-                ):
-                    continue
+                
+                if not self._has_any_pool(u): continue
+                pred_order = self._pred_priority(u)
 
                 anchors_cpu.append(u)
-                shneg_cpu.append(self._sample_k_locals_cpu(self.pool_shared_neg[u], stamp=0,
-                                                          fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                pos2neg_cpu.append(self._sample_k_locals_cpu(self.pool_pos_to_u_neg[u], stamp=0,
-                                                             fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                neg2pos_cpu.append(self._sample_k_locals_cpu(self.pool_neg_to_u_pos[u], stamp=0,
-                                                             fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                shpos_cpu.append(self._sample_k_locals_cpu(self.pool_shared_pos[u], stamp=0,
-                                                          fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
+                shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u], pred_order, stamp=0,
+                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
+                pos2neg_cpu.append(self._sample_k_priority_cpu(self.pool_pos_to_u_neg_by_pred[u], pred_order, stamp=0,
+                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
+                neg2pos_cpu.append(self._sample_k_priority_cpu(self.pool_neg_to_u_pos_by_pred[u], pred_order, stamp=0,
+                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
+                shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u], pred_order, stamp=0,
+                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
 
             if not anchors_cpu:
                 empty = torch.empty(0, D, device=device)
@@ -300,13 +416,8 @@ class NegativeInstanceSampler:
             pos2neg = torch.cat(pos2neg_cpu, dim=0).to(device)
             neg2pos = torch.cat(neg2pos_cpu, dim=0).to(device)
             shpos = torch.cat(shpos_cpu, dim=0).to(device)
-
             return z[anchors], z[shneg], z[pos2neg], z[neg2pos], z[shpos]
 
-        # --------------------------
-        # NEIGHBOR MODE (n_id provided)
-        # Use stamp trick to avoid O(num_nodes) clears
-        # --------------------------
         assert self._stamp_cpu is not None and self._g2l_cpu is not None
 
         n_id_cpu = n_id.detach().long().cpu()
@@ -334,25 +445,19 @@ class NegativeInstanceSampler:
         shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
 
         for u_g, u_l in zip(anchor_globals_cpu.tolist(), anchor_locals_cpu.tolist()):
-            if u_l < 0:
-                continue
-            if (
-                self.pool_shared_pos[u_g].numel() == 0
-                and self.pool_shared_neg[u_g].numel() == 0
-                and self.pool_pos_to_u_neg[u_g].numel() == 0
-                and self.pool_neg_to_u_pos[u_g].numel() == 0
-            ):
-                continue
+            if u_l < 0: continue
+            if not self._has_any_pool(u_g):  continue
 
             anchors_local_cpu.append(u_l)
-            shneg_cpu.append(self._sample_k_locals_cpu(self.pool_shared_neg[u_g], stamp=stamp,
-                                                      fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            pos2neg_cpu.append(self._sample_k_locals_cpu(self.pool_pos_to_u_neg[u_g], stamp=stamp,
-                                                         fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            neg2pos_cpu.append(self._sample_k_locals_cpu(self.pool_neg_to_u_pos[u_g], stamp=stamp,
-                                                         fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            shpos_cpu.append(self._sample_k_locals_cpu(self.pool_shared_pos[u_g], stamp=stamp,
-                                                      fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+            pred_order = self._pred_priority(u_g)
+            shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u_g], pred_order, stamp=stamp,
+                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+            pos2neg_cpu.append(self._sample_k_priority_cpu(self.pool_pos_to_u_neg_by_pred[u_g], pred_order, stamp=stamp,
+                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+            neg2pos_cpu.append(self._sample_k_priority_cpu(self.pool_neg_to_u_pos_by_pred[u_g], pred_order, stamp=stamp,
+                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+            shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u_g], pred_order, stamp=stamp,
+                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
 
         if not anchors_local_cpu:
             empty = torch.empty(0, D, device=device)
@@ -365,317 +470,3 @@ class NegativeInstanceSampler:
         neg2pos = torch.cat(neg2pos_cpu, dim=0).to(device)
         shpos = torch.cat(shpos_cpu, dim=0).to(device)
         return z[anchors_local], z[shneg], z[pos2neg], z[neg2pos], z[shpos]
-
-
-# import random
-# from typing import Dict, List, Optional, Tuple
-# import torch
-# from torch import Tensor
-# from torch_geometric.data import HeteroData
-
-
-# class NegativeInstanceSampler:
-#     """
-#     Wiki-framework sampler that returns instance-example groups per anchor.
-#     Positive statements: relation does NOT start with 'NOT_' and != subclass_of
-#     Negative statements: relation DOES start with 'NOT_'
-#     Ontological expansion: subclass_of children expansion for negative classes
-#     Returns:
-#         z_anchor: (B,D)
-#         z_shared_neg: (B,k,D)
-#         z_pos_to_u_neg: (B,k,D)
-#         z_neg_to_u_pos: (B,k,D)
-#         z_shared_pos: (B,k,D)
-#     """
-
-#     def __init__(
-#         self,
-#         k: int = 2,
-#         subclass_rel: str = "subclass_of",
-#         neg_prefix: str = "NOT_",
-#         instance_rel: str = "2",
-#         neg_expansion_hops: int = 1,
-#     ):
-#         self.k = int(k)
-#         self.subclass_rel = subclass_rel
-#         self.neg_prefix = neg_prefix
-#         self.instance_rel = instance_rel
-#         self.neg_expansion_hops = int(neg_expansion_hops)
-
-#         self.node_type: str = "node"
-#         self.num_nodes: int = 0
-#         self._is_instance: Optional[Tensor] = None
-
-#         self.anchors: List[int] = []
-#         self.pos_classes: List[List[int]] = []
-#         self.neg_classes_direct: List[List[int]] = []
-#         self.neg_classes_expanded: List[List[int]] = []
-
-#         self.pool_shared_pos: List[Tensor] = []
-#         self.pool_shared_neg: List[Tensor] = []
-#         self.pool_pos_to_u_neg: List[Tensor] = []
-#         self.pool_neg_to_u_pos: List[Tensor] = []
-
-#         self._global2local_cpu: Optional[Tensor] = None
-#         self._in_batch_mask_cpu: Optional[Tensor] = None
-
-#     @staticmethod
-#     def _find_edge_key(g: HeteroData, rel: str) -> Optional[Tuple[str, str, str]]:
-#         for et in g.edge_types:
-#             if et[1] == rel:
-#                 return et
-#         return None
-
-#     @staticmethod
-#     def _infer_num_nodes(g: HeteroData, node_type: str) -> int:
-#         nt = g[node_type]
-#         if hasattr(nt, "num_nodes") and nt.num_nodes is not None:
-#             return int(nt.num_nodes)
-#         max_id = -1
-#         for eidx in g.edge_index_dict.values():
-#             if eidx.numel() > 0:
-#                 max_id = max(max_id, int(eidx.max().item()))
-#         return max_id + 1 if max_id >= 0 else 0
-
-#     def _as_inst_class(self, a: int, b: int) -> Tuple[Optional[int], Optional[int]]:
-#         if self._is_instance is None:
-#             return a, b
-#         ia = bool(self._is_instance[a])
-#         ib = bool(self._is_instance[b])
-#         if ia and not ib:
-#             return a, b
-#         if ib and not ia:
-#             return b, a
-#         return None, None
-
-#     @staticmethod
-#     def _unique_cpu(x: List[int]) -> Tensor:
-#         if not x:
-#             return torch.empty(0, dtype=torch.long)
-#         return torch.unique(torch.tensor(x, dtype=torch.long))
-
-#     @staticmethod
-#     def _collect_instances(
-#         classes: List[int],
-#         class2inst: Dict[int, Tensor],
-#         exclude: Optional[int] = None,
-#     ) -> Tensor:
-#         if not classes:
-#             return torch.empty(0, dtype=torch.long)
-#         parts = [class2inst[c] for c in classes if c in class2inst and class2inst[c].numel() > 0]
-#         if not parts:
-#             return torch.empty(0, dtype=torch.long)
-#         out = torch.unique(torch.cat(parts, dim=0))
-#         if exclude is not None and out.numel() > 0:
-#             out = out[out != int(exclude)]
-#         return out
-
-#     def _expand_negs(self, direct: List[int], subclass_predecessors: Dict[int, Tensor]) -> List[int]:
-#         if not direct:
-#             return []
-#         expanded = set(int(x) for x in direct)
-#         frontier = set(expanded)
-#         for _ in range(max(self.neg_expansion_hops, 0)):
-#             nxt: set[int] = set()
-#             for c in list(frontier):
-#                 children = subclass_predecessors.get(c)
-#                 if children is None or children.numel() == 0:
-#                     continue
-#                 for ch in children.tolist():
-#                     if ch not in expanded:
-#                         expanded.add(ch)
-#                         nxt.add(ch)
-#             frontier = nxt
-#             if not frontier:
-#                 break
-#         return list(expanded)
-
-#     def prepare_global(self, full_g: HeteroData) -> None:
-#         if len(full_g.node_types) != 1:
-#             raise ValueError("NegativeStatementSampler assumes a single node type.")
-#         self.node_type = full_g.node_types[0]
-#         N = self._infer_num_nodes(full_g, self.node_type)
-#         self.num_nodes = N
-
-#         instance_nodes: set[int] = set()
-#         if self.instance_rel is not None:
-#             inst_key = self._find_edge_key(full_g, self.instance_rel)
-#             if inst_key is not None and "edge_index" in full_g[inst_key]:
-#                 inst_src = full_g[inst_key].edge_index[0].tolist()
-#                 instance_nodes.update(int(x) for x in inst_src if 0 <= int(x) < N)
-
-#         if instance_nodes:
-#             is_instance = torch.zeros(N, dtype=torch.bool)
-#             is_instance[list(instance_nodes)] = True
-#             self._is_instance = is_instance
-#         else:
-#             self._is_instance = None
-
-#         self.pos_classes = [[] for _ in range(N)]
-#         self.neg_classes_direct = [[] for _ in range(N)]
-
-#         subclass_predecessors: Dict[int, Tensor] = {}
-#         sub_key = self._find_edge_key(full_g, self.subclass_rel)
-#         if sub_key is not None and "edge_index" in full_g[sub_key]:
-#             sub_src, sub_dst = full_g[sub_key].edge_index
-#             tmp: Dict[int, List[int]] = {}
-#             for child, parent in zip(sub_src.tolist(), sub_dst.tolist()):
-#                 if 0 <= child < N and 0 <= parent < N:
-#                     tmp.setdefault(int(parent), []).append(int(child))
-#             subclass_predecessors = {p: self._unique_cpu(ch) for p, ch in tmp.items()}
-
-#         class2pos_tmp: Dict[int, List[int]] = {}
-#         class2neg_tmp: Dict[int, List[int]] = {}
-#         anchor_sources: set[int] = set(instance_nodes)
-
-#         for (_, rel, _), eidx in full_g.edge_index_dict.items():
-#             if eidx.numel() == 0 or rel == self.subclass_rel:
-#                 continue
-
-#             is_neg_rel = rel.startswith(self.neg_prefix)
-#             src_list = eidx[0].tolist()
-#             dst_list = eidx[1].tolist()
-
-#             for a, b in zip(src_list, dst_list):
-#                 if not (0 <= a < N and 0 <= b < N):
-#                     continue
-#                 inst, cls = self._as_inst_class(int(a), int(b))
-#                 if inst is None or cls is None:
-#                     continue
-#                 anchor_sources.add(inst)
-#                 if is_neg_rel:
-#                     self.neg_classes_direct[inst].append(cls)
-#                     class2neg_tmp.setdefault(cls, []).append(inst)
-#                 else:
-#                     self.pos_classes[inst].append(cls)
-#                     class2pos_tmp.setdefault(cls, []).append(inst)
-
-#         self.anchors = sorted(anchor_sources) if anchor_sources else list(range(N))
-
-#         self.neg_classes_expanded = [[] for _ in range(N)]
-#         for u in self.anchors:
-#             self.neg_classes_expanded[u] = self._expand_negs(self.neg_classes_direct[u], subclass_predecessors)
-
-#         class2pos = {c: self._unique_cpu(vs) for c, vs in class2pos_tmp.items()}
-#         class2neg = {c: self._unique_cpu(vs) for c, vs in class2neg_tmp.items()}
-
-#         empty = torch.empty(0, dtype=torch.long)
-#         self.pool_shared_pos = [empty for _ in range(N)]
-#         self.pool_shared_neg = [empty for _ in range(N)]
-#         self.pool_pos_to_u_neg = [empty for _ in range(N)]
-#         self.pool_neg_to_u_pos = [empty for _ in range(N)]
-
-#         for u in self.anchors:
-#             pos_cls = self.pos_classes[u]
-#             neg_cls = self.neg_classes_expanded[u]
-
-#             self.pool_shared_pos[u] = self._collect_instances(pos_cls, class2pos, exclude=u)
-#             self.pool_shared_neg[u] = self._collect_instances(neg_cls, class2neg, exclude=u)
-#             self.pool_pos_to_u_neg[u] = self._collect_instances(neg_cls, class2pos, exclude=u)
-#             self.pool_neg_to_u_pos[u] = self._collect_instances(pos_cls, class2neg, exclude=u)
-
-#         self._global2local_cpu = None
-#         self._in_batch_mask_cpu = None
-
-#     def prepare_batch(self, batch: HeteroData, pos_index: Optional[Tensor] = None) -> None:
-#         return
-
-#     def _sample_k_locals(
-#         self,
-#         pool_globals: Tensor,
-#         *,
-#         in_batch: Tensor,
-#         global2local: Tensor,
-#         fallback_local: int,
-#         k: int,
-#         device: torch.device,
-#     ) -> Tensor:
-#         if pool_globals.numel() == 0:
-#             return torch.full((k,), fallback_local, dtype=torch.long, device=device)
-
-#         pool_in_batch = pool_globals[in_batch[pool_globals]]
-#         if pool_in_batch.numel() == 0:
-#             return torch.full((k,), fallback_local, dtype=torch.long, device=device)
-
-#         if pool_in_batch.numel() >= k:
-#             chosen = pool_in_batch[torch.randperm(pool_in_batch.numel())[:k]]
-#         else:
-#             chosen = pool_in_batch[torch.randint(0, pool_in_batch.numel(), (k,), dtype=torch.long)]
-
-#         chosen_locals = global2local[chosen]
-#         bad = chosen_locals < 0
-#         if bad.any():
-#             chosen_locals[bad] = fallback_local
-#         return chosen_locals.to(device)
-
-#     def get_contrastive_samples(
-#         self,
-#         z: Tensor,
-#         anchor_nodes: Optional[Tensor] = None,
-#         n_id: Optional[Tensor] = None,
-#     ):
-#         device = z.device
-#         B_rows, D = z.shape
-#         k = self.k
-
-#         global_for_row = torch.arange(B_rows) if n_id is None else n_id.detach().long().cpu()
-
-#         if self._global2local_cpu is None or self._global2local_cpu.numel() < self.num_nodes:
-#             self._global2local_cpu = torch.full((self.num_nodes,), -1, dtype=torch.long)
-#         global2local = self._global2local_cpu
-#         global2local.fill_(-1)
-#         global2local[global_for_row] = torch.arange(global_for_row.numel(), dtype=torch.long)
-
-#         if self._in_batch_mask_cpu is None or self._in_batch_mask_cpu.numel() < self.num_nodes:
-#             self._in_batch_mask_cpu = torch.zeros(self.num_nodes, dtype=torch.bool)
-#         in_batch = self._in_batch_mask_cpu
-#         in_batch.zero_()
-#         in_batch[global_for_row] = True
-
-#         if anchor_nodes is not None and anchor_nodes.numel() > 0:
-#             anchor_globals = global_for_row[anchor_nodes.detach().long().cpu().unique()]
-#         else:
-#             anchor_globals = torch.tensor(self.anchors, dtype=torch.long)
-
-#         anchor_globals = anchor_globals[in_batch[anchor_globals]]
-
-#         anchors_local_list, shneg_idx, pos2neg_idx, neg2pos_idx, shpos_idx = [], [], [], [], []
-
-#         for u in anchor_globals.tolist():
-#             u_local = int(global2local[u].item())
-#             if u_local < 0:
-#                 continue
-
-#             # Skip anchors with no examples at all
-#             if (self.pool_shared_pos[u].numel() == 0 and self.pool_shared_neg[u].numel() == 0 and
-#                 self.pool_pos_to_u_neg[u].numel() == 0 and self.pool_neg_to_u_pos[u].numel() == 0):
-#                 continue
-
-#             anchors_local_list.append(u_local)
-#             shneg_idx.append(self._sample_k_locals(self.pool_shared_neg[u], in_batch=in_batch, global2local=global2local,
-#                                                   fallback_local=u_local, k=k, device=device).unsqueeze(0))
-#             pos2neg_idx.append(self._sample_k_locals(self.pool_pos_to_u_neg[u], in_batch=in_batch, global2local=global2local,
-#                                                     fallback_local=u_local, k=k, device=device).unsqueeze(0))
-#             neg2pos_idx.append(self._sample_k_locals(self.pool_neg_to_u_pos[u], in_batch=in_batch, global2local=global2local,
-#                                                     fallback_local=u_local, k=k, device=device).unsqueeze(0))
-#             shpos_idx.append(self._sample_k_locals(self.pool_shared_pos[u], in_batch=in_batch, global2local=global2local,
-#                                                   fallback_local=u_local, k=k, device=device).unsqueeze(0))
-
-#         if not anchors_local_list:
-#             empty = torch.empty(0, D, device=device)
-#             empty_k = torch.empty(0, k, D, device=device)
-#             return empty, empty_k, empty_k, empty_k, empty_k
-
-#         anchors_local_t = torch.tensor(anchors_local_list, dtype=torch.long, device=device)
-#         shneg_t = torch.cat(shneg_idx, dim=0)
-#         pos2neg_t = torch.cat(pos2neg_idx, dim=0)
-#         neg2pos_t = torch.cat(neg2pos_idx, dim=0)
-#         shpos_t = torch.cat(shpos_idx, dim=0)
-
-#         return (
-#             z[anchors_local_t],
-#             z[shneg_t],
-#             z[pos2neg_t],
-#             z[neg2pos_t],
-#             z[shpos_t],
-#         )

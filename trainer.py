@@ -3,9 +3,8 @@ import torch.nn as nn
 from typing import Optional, Tuple, List, Dict
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
-from samplers import (NegativeInstanceSampler,
-    PartialInstanceSampler, RandomInstanceSampler)
-from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
+from samplers import (NegativeInstanceSampler, PartialInstanceSampler, RandomInstanceSampler)
+from losses import ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 
 import subprocess
 
@@ -458,7 +457,6 @@ class Train:
         overall_best_metrics = None
         overall_best_lr = None
         overall_best_state = None
-
         per_lr_results: Dict[float, Dict[str, object]] = {}
 
         use_neighbor_mode = (self.train_loader is not None) and (self.val_loader is not None)
@@ -570,4 +568,4 @@ class Train:
                 f"Best epoch={overall_best_epoch} | "
                 f"Best val loss={overall_best_val_loss:.4f}")
 
-        return overall_best_val_loss, overall_best_epoch, overall_best_metrics, overall_best_lr #, per_lr_results
+        return overall_best_val_loss, overall_best_epoch, overall_best_metrics, overall_best_lr, per_lr_results

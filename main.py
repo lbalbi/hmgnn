@@ -12,7 +12,7 @@ import torch
 import torch.multiprocessing as mp
 from sklearn.model_selection import StratifiedShuffleSplit
 from torch_geometric.data import HeteroData
-from torch_geometric.loader import NeighborLoader, LinkNeighborLoader
+from torch_geometric.loader import LinkNeighborLoader
 
 from data_loader import DataLoader
 from models import *
@@ -20,12 +20,78 @@ from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
 from utils import Logger, load_config
 from samplers import (
-    PartialStatementSampler, NegativeStatementSampler, RandomStatementSampler,
     NegativeInstanceSampler, RandomInstanceSampler, PartialInstanceSampler
 )
 
 NEG_PREFIX = "NOT_"
 CLS_EDGE_TYPE = ("node", "cls_link", "node")
+
+def print_encoder_and_cls_totals(
+    *,
+    encoder_graph: HeteroData,
+    subclass_rel: str,
+    neg_prefix: str,
+    train_heads: torch.Tensor,
+    train_rels: torch.Tensor,
+    train_tails: torch.Tensor,
+    train_labels: torch.Tensor,
+    test_heads: torch.Tensor,
+    test_rels: torch.Tensor,
+    test_tails: torch.Tensor,
+    test_labels: torch.Tensor,
+) -> None:
+    # 1) positives in encoder graph: instance_of + any non-subclass, non-NOT_* (and pos_statement if present)
+    # 2) negatives in encoder graph: all NOT_* (and neg_statement if present)
+    # 3) subclass_of (subsumption) in encoder graph
+    pos_cnt = 0
+    neg_cnt = 0
+    sub_cnt = 0
+
+    for et in encoder_graph.edge_types:
+        if et == CLS_EDGE_TYPE:
+            continue
+
+        s, rel, d = et
+        if s != "node" or d != "node":
+            continue
+
+        ei = encoder_graph[et].edge_index
+        n = int(ei.size(1)) if (ei is not None and ei.numel() > 0) else 0
+        rel_s = str(rel)
+
+        if rel_s == str(subclass_rel):
+            sub_cnt += n
+        elif rel_s.startswith(str(neg_prefix)) or rel_s == "neg_statement":
+            neg_cnt += n
+        elif rel_s == "pos_statement":
+            pos_cnt += n
+        else:
+            pos_cnt += n
+
+    # 4) unique classification examples used in total (train + test)
+    def _unique_examples(h, r, t, y) -> torch.Tensor:
+        if h is None or h.numel() == 0:
+            return torch.empty((0, 4), dtype=torch.long)
+        yb = (y.detach().cpu() > 0.5).long()
+        return torch.stack(
+            [h.detach().cpu().long(), r.detach().cpu().long(), t.detach().cpu().long(), yb],
+            dim=1,
+        )
+
+    all_ex = torch.cat(
+        [
+            _unique_examples(train_heads, train_rels, train_tails, train_labels),
+            _unique_examples(test_heads, test_rels, test_tails, test_labels),
+        ],
+        dim=0,
+    )
+    uniq_cls_total = int(torch.unique(all_ex, dim=0).size(0)) if all_ex.numel() else 0
+
+    print(f"1) how many positive statements/triples are in the encoder graph: {pos_cnt}")
+    print(f"2) how many negative statements/triples are in the encoder graph: {neg_cnt}")
+    print(f"3) how many ontology subsumption relations (subclass_of) are in the encoder graph: {sub_cnt}")
+    print(f"4) how many unique classification examples are used in total (training + testing): {uniq_cls_total}")
+
 
 def report_unseen_test_nodes(
     *,
@@ -583,84 +649,6 @@ def build_classification_splits_from_train_files(
         "balance_stats": balance_stats,  # <-- used to compute leftovers for encoder
     }
 
-
-# ============================================================
-# Compute leftover (unused) classification examples for encoder
-# ============================================================
-# def compute_leftover_examples_for_encoder(
-#     data_dir: str,
-#     *,
-#     rel_list: List[str],
-#     balance_stats: Dict[str, Tuple[int, int, int]],
-#     seed: int,
-#     subclass_rel: str,
-#     instance_rel: str,
-#     min_pos_per_rel: int = 0,
-# ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-#     """
-#     Returns:
-#       leftover_pos_df: rows for rel_list that were NOT used in balanced dataset (positives)
-#       leftover_neg_df: rows for rel_list that were NOT used in balanced dataset (negatives)
-#       enc_only_neg_df: ONLY negatives for subclass_of/instance_of (if exist) from train2id_neg
-#     """
-#     train_pos_path = os.path.join(data_dir, "train2id_pos.txt")
-#     train_neg_path = os.path.join(data_dir, "train2id_neg.txt")
-
-#     df_pos_all = _read_edge_file(train_pos_path)
-#     df_neg_all = _read_edge_file(train_neg_path)
-
-#     df_pos_all["rel_base"] = df_pos_all["edge_type"].astype(str)
-#     df_neg_all["rel_base"] = df_neg_all["edge_type"].astype(str).map(_strip_not)
-
-#     encoder_only_bases = {str(subclass_rel), str(instance_rel), "subclass_of", "instance_of"}
-
-#     # Only these negatives go to encoder (from file), per your requirement:
-#     enc_only_neg_df = df_neg_all[df_neg_all["rel_base"].isin(encoder_only_bases)].copy()
-
-#     # Leftovers: only for relations that are classification relations (rel_list)
-#     df_pos_cls = df_pos_all[~df_pos_all["rel_base"].isin(encoder_only_bases)].copy()
-#     df_neg_cls = df_neg_all[~df_neg_all["rel_base"].isin(encoder_only_bases)].copy()
-
-#     if min_pos_per_rel and int(min_pos_per_rel) > 0:
-#         pos_counts = df_pos_cls["rel_base"].value_counts().to_dict()
-#         keep_rels = {r for r, c in pos_counts.items() if int(c) >= int(min_pos_per_rel)}
-#         df_pos_cls = df_pos_cls[df_pos_cls["rel_base"].isin(keep_rels)].copy()
-#         df_neg_cls = df_neg_cls[df_neg_cls["rel_base"].isin(keep_rels)].copy()
-
-#     leftover_pos_chunks = []
-#     leftover_neg_chunks = []
-
-#     rel_set = set(rel_list)
-#     for r in rel_list:
-#         if r not in balance_stats:
-#             continue
-#         pos_rows = df_pos_cls[df_pos_cls["rel_base"] == r]
-#         neg_rows = df_neg_cls[df_neg_cls["rel_base"] == r]
-#         npos = int(len(pos_rows))
-#         nneg = int(len(neg_rows))
-#         m = int(balance_stats[r][2])
-
-#         # Safety: if stats say keep m, but data changed, recompute m.
-#         m = max(0, min(m, npos, nneg))
-
-#         rng = np.random.RandomState(int(seed) + _stable_hash_int(r, 1_000_000))
-#         pos_idx = pos_rows.index.to_numpy(dtype=np.int64).copy()
-#         neg_idx = neg_rows.index.to_numpy(dtype=np.int64).copy()
-#         rng.shuffle(pos_idx)
-#         rng.shuffle(neg_idx)
-
-#         pos_left = pos_idx[m:]
-#         neg_left = neg_idx[m:]
-
-#         if pos_left.size:
-#             leftover_pos_chunks.append(df_pos_cls.loc[pos_left].copy())
-#         if neg_left.size:
-#             leftover_neg_chunks.append(df_neg_cls.loc[neg_left].copy())
-
-#     leftover_pos_df = pd.concat(leftover_pos_chunks, ignore_index=True) if leftover_pos_chunks else pd.DataFrame(columns=df_pos_all.columns.tolist())
-#     leftover_neg_df = pd.concat(leftover_neg_chunks, ignore_index=True) if leftover_neg_chunks else pd.DataFrame(columns=df_neg_all.columns.tolist())
-
-#     return leftover_pos_df, leftover_neg_df, enc_only_neg_df
 def compute_leftover_examples_for_encoder(data_dir: str, *,
     rel_list: List[str], balance_stats: Dict[str, Tuple[int, int, int]],
     seed: int, subclass_rel: str, instance_rel: str,
@@ -1012,19 +1000,10 @@ def main():
 
     # -----------------------------------------------------------------
     # Build encoder graph:
-    #   - include ALL graph relations from data_dict
-    #   - add ONLY:
-    #       (a) file negatives for subclass_of / instance_of (NOT_ prefixed)
-    #       (b) leftovers from balancing for classification relations (pos->rel, neg->NOT_rel)
     # -----------------------------------------------------------------
     struct_graph = HeteroData()
     struct_graph["node"].num_nodes = int(num_nodes)
     struct_graph["node"].x = base_x.clone()
-
-    # # Add all relations from data_dict (graph positives etc.)
-    # for etype in sorted(list(data_dict.keys()), key=lambda x: str(x)):
-    #     src, tgt = data_dict[etype]
-    #     _append_edges(struct_graph, str(etype), src, tgt)
 
     # Add ONLY structural relations needed for the encoder: subclass_of + instance_of
     for etype in (subclass_rel, instance_rel):
@@ -1036,17 +1015,11 @@ def main():
 
     # Compute leftovers + encoder-only subclass/instance negatives from file
     leftover_pos_df, leftover_neg_df, enc_only_neg_df = compute_leftover_examples_for_encoder(
-        args.path,
-        rel_list=rel_list,
-        balance_stats=balance_stats,
-        seed=int(args.balanced_seed),
-        subclass_rel=subclass_rel,
-        instance_rel=instance_rel,
-        min_pos_per_rel=int(args.min_pos_per_rel),
-    )
+        args.path, rel_list=rel_list, balance_stats=balance_stats, seed=int(args.balanced_seed),
+        subclass_rel=subclass_rel, instance_rel=instance_rel, min_pos_per_rel=int(args.min_pos_per_rel))
 
     # (a) Add ONLY subclass/instance negatives from file
-    if len(enc_only_neg_df) > 0:
+    if (not nflag) and len(enc_only_neg_df) > 0:
         enc_only_neg_df = enc_only_neg_df.copy()
         enc_only_neg_df["edge_type"] = enc_only_neg_df["rel_base"].astype(str).map(_ensure_not_prefixed)
         for et, g in enc_only_neg_df.groupby("edge_type"):
@@ -1054,37 +1027,26 @@ def main():
             tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
             _append_edges(struct_graph, str(et), src, tgt)
         print(f"\n[INFO] Encoder got ONLY subclass/instance negatives from train2id_neg: {len(enc_only_neg_df)}")
-
+    elif nflag: print("\n[INFO] --use_nstatementsampler: skipping subclass/instance NOT_* edges for encoder")
     # (b) Add leftover classification examples (unused after balancing)
     n_left_pos = int(len(leftover_pos_df))
     n_left_neg = int(len(leftover_neg_df))
-    if n_left_pos or n_left_neg:
-        if n_left_pos:
-            for r, g in leftover_pos_df.groupby("rel_base"):
-                src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
-                tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
-                _append_edges(struct_graph, str(r), src, tgt)
-
-        if n_left_neg:
-            for r, g in leftover_neg_df.groupby("rel_base"):
-                et = _ensure_not_prefixed(str(r))
-                src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
-                tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
-                _append_edges(struct_graph, et, src, tgt)
-
-        print(f"\n[INFO] Encoder augmented with leftover (unused) classification examples:")
-        print(f"       leftover positives added: {n_left_pos}")
-        print(f"       leftover negatives added: {n_left_neg}")
-    else:
-        print("\n[INFO] No leftover classification examples to add to encoder.")
-
-    # e_etypes_struct = list(struct_graph.edge_types)
-    # if args.model == "hgcn":
-    #     encoder_graph = build_hgcn_encoder_graph(struct_graph, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX)
-    #     encoder_e_etypes = list(encoder_graph.edge_types)
-    # else:
-    #     encoder_graph = struct_graph
-    #     encoder_e_etypes = e_etypes_struct
+    if n_left_pos:
+        for r, g in leftover_pos_df.groupby("rel_base"):
+            src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+            tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+            _append_edges(struct_graph, str(r), src, tgt)
+    if (not nflag) and n_left_neg:
+        for r, g in leftover_neg_df.groupby("rel_base"):
+            et = _ensure_not_prefixed(str(r))  # -> NOT_*
+            src = torch.tensor(g["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+            tgt = torch.tensor(g["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+            _append_edges(struct_graph, et, src, tgt)
+    elif nflag and n_left_neg:
+        print(f"\n[INFO] --use_nstatementsampler: skipping leftover NOT_* edges for encoder (count={n_left_neg})")
+    print(f"\n[INFO] Encoder augmented with leftover (unused) classification examples:")
+    print(f"       leftover positives added: {n_left_pos}")
+    print(f"       leftover negatives added: {0 if nflag else n_left_neg}")
 
 
     e_etypes_struct = list(struct_graph.edge_types)
@@ -1099,6 +1061,18 @@ def main():
     MP_EDGE_TYPES = [et for et in encoder_graph.edge_types if et != CLS_EDGE_TYPE]
     encoder_e_etypes = MP_EDGE_TYPES
 
+    print_encoder_and_cls_totals(
+        encoder_graph=encoder_graph,
+        subclass_rel=subclass_rel,
+        neg_prefix=NEG_PREFIX,
+        train_heads=cls_heads,
+        train_rels=cls_rels,
+        train_tails=cls_tails,
+        train_labels=cls_labels,
+        test_heads=test_heads_all,
+        test_rels=test_rels_all,
+        test_tails=test_tails_all,
+        test_labels=test_labels_all)
 
     print("\n=== Encoder graph summary ===")
     print(f"#Structural edge types: {len(e_etypes_struct)}")
@@ -1124,13 +1098,16 @@ def main():
         topk=25)
 
 
-    # -----------------------------------------------------------------
-    # Cross-Validation on TRAIN split (80%), stratified by (relation,label)
-    # -----------------------------------------------------------------
     neighbor_sizes = [15, 10]
-    best_epochs: List[int] = []
-    best_lrs: List[float] = []
+    # best_epochs: List[int] = []
+    # best_lrs: List[float] = []
+    # cv_metrics: List[torch.Tensor] = []
+
+    lr_to_fold_losses = defaultdict(list)
+    lr_to_fold_epochs = defaultdict(list)
+    lr_to_fold_metrics = defaultdict(list)
     cv_metrics: List[torch.Tensor] = []
+
 
     if args.finaltrain_only:
         if args.final_lr is None or args.final_epochs is None:
@@ -1194,36 +1171,11 @@ def main():
             train_idx = torch.tensor(train_idx_np, dtype=torch.long)
             val_idx = torch.tensor(val_idx_np, dtype=torch.long)
 
-            # train_nodes = torch.unique(torch.cat([cls_heads[train_idx], cls_tails[train_idx]], dim=0))
-            # val_nodes = torch.unique(torch.cat([cls_heads[val_idx], cls_tails[val_idx]], dim=0))
-            # num_neighbors = [20, 10]
-            # train_loader = NeighborLoader(
-            #     encoder_graph,
-            #     input_nodes=("node", train_nodes),
-            #     num_neighbors=num_neighbors,
-            #     batch_size=args.batch_size,
-            #     shuffle=True,
-            #     num_workers=2,
-            #     persistent_workers=True,
-            #     pin_memory=(device.type == "cuda"),
-            # )
-            # val_loader = NeighborLoader(
-            #     encoder_graph,
-            #     input_nodes=("node", val_nodes),
-            #     num_neighbors=num_neighbors,
-            #     batch_size=args.batch_size,
-            #     shuffle=False,
-            #     num_workers=2,
-            #     persistent_workers=True,
-            #     pin_memory=(device.type == "cuda"),
-            # )
-
             train_edge_label_index = torch.stack([cls_heads[train_idx], cls_tails[train_idx]], dim=0)
             train_edge_label = cls_labels[train_idx].to(torch.float)
             val_edge_label_index = torch.stack([cls_heads[val_idx], cls_tails[val_idx]], dim=0)
             val_edge_label = cls_labels[val_idx].to(torch.float)
 
-            # num_neighbors = {et: [20, 10] for et in encoder_graph.edge_types}
             num_neighbors = {et: [20, 10] for et in MP_EDGE_TYPES}
             num_neighbors[CLS_EDGE_TYPE] = [0, 0]   # <-- IMPORTANT: don't sample along cls_link
 
@@ -1266,7 +1218,7 @@ def main():
                     )
                     neg_stmt_sampler.prepare_global(sampler_graph)
                 else:
-                    neg_stmt_sampler = NegativeInstanceSampler(
+                    neg_stmt_sampler = NegativeInstanceSampler_NEW(
                         k=contrastive_k,
                         subclass_rel=subclass_rel,
                         neg_prefix=NEG_PREFIX,
@@ -1300,20 +1252,45 @@ def main():
                 no_contrastive=args.no_contrastive,
             )
 
-            best_val_loss, best_epoch, best_metrics, best_lr = trainer_fold.run()
-            best_epochs.append(int(best_epoch if best_epoch is not None else args.epochs))
-            best_lrs.append(float(best_lr if best_lr is not None else lr_candidates[0]))
+            best_val_loss, best_epoch, best_metrics, best_lr, per_lr = trainer_fold.run()
+            for lr in lr_candidates:
+                lr = float(lr)
+                rec = per_lr.get(lr, None)
+                if rec is None: continue
+                loss = float(rec["best_val_loss"])
+                ep = int(rec["best_epoch"])
+
+                if loss != float("inf"): lr_to_fold_losses[lr].append(loss)
+                if ep > 0: lr_to_fold_epochs[lr].append(ep)
+                if rec.get("best_metrics", None) is not None: lr_to_fold_metrics[lr].append(rec["best_metrics"])
             if best_metrics is not None:
                 cv_metrics.append(best_metrics)
 
-        final_epochs = int(statistics.median(best_epochs)) if best_epochs else int(args.epochs)
-        final_lr = float(statistics.mode(best_lrs)) if best_lrs else float(lr_candidates[0])
-
+        lr_summary = []
+        for lr in lr_candidates:
+            lr = float(lr)
+            losses = lr_to_fold_losses.get(lr, [])
+            if not losses: continue
+            mean_loss = statistics.mean(losses)
+            std_loss = statistics.pstdev(losses) if len(losses) > 1 else 0.0
+            n = len(losses)
+            lr_summary.append((mean_loss, std_loss, n, lr))
+        if not lr_summary:
+            final_lr = float(lr_candidates[0])
+            final_epochs = int(args.epochs)
+        else:
+            lr_summary.sort(key=lambda x: (x[0], x[1], x[3]))
+            best_mean, best_std, best_n, final_lr = lr_summary[0]
+            epochs_for_lr = lr_to_fold_epochs.get(final_lr, [])
+            final_epochs = int(statistics.median(epochs_for_lr)) if epochs_for_lr else int(args.epochs)
         print("\n=== Cross-validation summary (TRAIN split only) ===")
-        print(f"Per-split best epochs: {best_epochs}")
-        print(f"Per-split best learning rates: {best_lrs}")
-        print(f"Chosen final_epochs (median): {final_epochs}")
-        print(f"Chosen final_lr (mode):       {final_lr}")
+        print("LR aggregates (mean_val_loss ± std over folds):")
+        for mean_loss, std_loss, n, lr in sorted(lr_summary, key=lambda x: (x[0], x[1], x[3])):
+            print(f"  lr={lr:.3g} | mean={mean_loss:.6f} | std={std_loss:.6f} | folds={n}")
+        print(f"\nChosen final_lr (best mean over folds): {final_lr:.6g}")
+        print(f"Epochs for chosen LR across folds:      {lr_to_fold_epochs.get(final_lr, [])}")
+        print(f"Chosen final_epochs (median for LR):    {final_epochs}")
+
 
     # -----------------------------------------------------------------
     # Final training on TRAIN split
@@ -1329,18 +1306,6 @@ def main():
             edge_label_index=(CLS_EDGE_TYPE, final_edge_label_index),neg_sampling_ratio=0.0,
             edge_label=final_edge_label, batch_size=args.batch_size, shuffle=True,
             num_workers=2, persistent_workers=True, pin_memory=(device.type == "cuda"))
-
-        # final_nodes = torch.unique(torch.cat([cls_heads, cls_tails], dim=0))
-        # final_loader = NeighborLoader(
-        #     encoder_graph,
-        #     input_nodes=("node", final_nodes),
-        #     num_neighbors=neighbor_sizes,
-        #     batch_size=args.batch_size,
-        #     shuffle=True,
-        #     num_workers=2,
-        #     persistent_workers=True,
-        #     pin_memory=(device.type == "cuda"),
-        # )
 
         final_base_kwargs = dict(
             in_dim=in_dim,
@@ -1367,7 +1332,7 @@ def main():
                 )
                 final_contrastive_sampler.prepare_global(struct_graph)
             else:
-                final_contrastive_sampler = NegativeInstanceSampler(
+                final_contrastive_sampler = NegativeInstanceSampler_NEW(
                     k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel
                 )
                 final_contrastive_sampler.prepare_global(struct_graph)
@@ -1452,7 +1417,6 @@ def main():
         neg_cache_path=cache_path,
     )
     tester.run()
-
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
