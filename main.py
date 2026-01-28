@@ -800,6 +800,10 @@ def main():
         else [float(contrastive_temp_cfg)]
     )
 
+    clone_inputs = bool(cfg.get("clone_inputs", True))
+    cv_prune_ratio = float(cfg.get("cv_prune_ratio", 0.0))
+    cv_prune_warmup = int(cfg.get("cv_prune_warmup", 5))
+
     print(f"Learning rate candidates (per-fold sweep): {lr_candidates}")
 
     k_folds = int(cfg.get("k_folds", 10))
@@ -1026,6 +1030,9 @@ def main():
         contrastive_temp_candidates = [contrastive_temp_candidates[0]]
     print(f"Contrastive weight candidates: {contrastive_weight_candidates}")
     print(f"Contrastive temperature inits:  {contrastive_temp_candidates}")
+    print(f"Train clone_inputs: {clone_inputs}")
+    if cv_prune_ratio > 0.0:
+        print(f"CV prune: ratio={cv_prune_ratio:.3g}, warmup_epochs={cv_prune_warmup}")
 
     def _filter_model_kwargs(kwargs: Dict[str, object]) -> Dict[str, object]:
         return {k: v for k, v in kwargs.items() if k in model_params}
@@ -1140,6 +1147,29 @@ def main():
             print(f"\n=== CV Split {fold}/{k_folds} ===")
             print(f"  Train cls examples: {train_idx.numel()} | Val cls examples: {val_idx.numel()}")
 
+            sampler_graph = struct_graph
+            if not args.no_contrastive:
+                if use_random_sampler:
+                    neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                    neg_stmt_sampler.prepare_global(sampler_graph)
+                elif use_partial_sampler:
+                    edges_are_negative = nflag
+                    neg_stmt_sampler = PartialInstanceSampler(
+                        k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                    )
+                    neg_stmt_sampler.prepare_global(sampler_graph)
+                else:
+                    neg_stmt_sampler = NegativeInstanceSampler_NEW(
+                        k=contrastive_k,
+                        subclass_rel=subclass_rel,
+                        neg_prefix=NEG_PREFIX,
+                        instance_rel=instance_rel,
+                    )
+                    neg_stmt_sampler.prepare_global(sampler_graph)
+            else:
+                neg_stmt_sampler = None
+
+            fold_best_val = float("inf")
             for hp_i, (dropout_val, contr_w, contr_temp_init) in enumerate(hyperparam_grid, start=1):
                 base_model_kwargs = dict(
                     in_dim=in_dim,
@@ -1153,28 +1183,6 @@ def main():
                     model_fold = ModelCls(**model_kwargs, rel2id=rel2id).to(device)
                 else:
                     model_fold = ModelCls(**model_kwargs).to(device)
-
-                sampler_graph = struct_graph
-                if not args.no_contrastive:
-                    if use_random_sampler:
-                        neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                        neg_stmt_sampler.prepare_global(sampler_graph)
-                    elif use_partial_sampler:
-                        edges_are_negative = nflag
-                        neg_stmt_sampler = PartialInstanceSampler(
-                            k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
-                        )
-                        neg_stmt_sampler.prepare_global(sampler_graph)
-                    else:
-                        neg_stmt_sampler = NegativeInstanceSampler_NEW(
-                            k=contrastive_k,
-                            subclass_rel=subclass_rel,
-                            neg_prefix=NEG_PREFIX,
-                            instance_rel=instance_rel,
-                        )
-                        neg_stmt_sampler.prepare_global(sampler_graph)
-                else:
-                    neg_stmt_sampler = None
 
                 dtag = "default" if dropout_val is None else f"{dropout_val:.3g}"
                 log_fold = Logger(f"train_cv_split{fold}_d{dtag}_cw{contr_w:.3g}_t{contr_temp_init:.3g}",
@@ -1202,9 +1210,15 @@ def main():
                     train_loader=train_loader,
                     val_loader=val_loader,
                     no_contrastive=args.no_contrastive,
+                    clone_inputs=clone_inputs,
+                    prune_ratio=cv_prune_ratio,
+                    prune_warmup_epochs=cv_prune_warmup,
+                    prune_target=(fold_best_val if fold_best_val < float("inf") else None),
                 )
 
                 best_val_loss, best_epoch, best_metrics, best_lr, per_lr = trainer_fold.run()
+                if best_val_loss is not None and best_val_loss < fold_best_val:
+                    fold_best_val = float(best_val_loss)
                 for lr in lr_candidates:
                     lr = float(lr)
                     rec = per_lr.get(lr, None)

@@ -17,17 +17,26 @@ class Train:
         early_stopping_patience: int = 15, train_idx: Optional[torch.Tensor] = None,
         val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeInstanceSampler] = None,
         contrastive_weight: float = 0.1, train_loader=None, val_loader=None, no_contrastive: bool = False,
-        contrastive_temperature: float = 0.5, learnable_contrastive_temperature: bool = True):
+        contrastive_temperature: float = 0.5, learnable_contrastive_temperature: bool = True,
+        clone_inputs: bool = False, prune_ratio: float = 0.0, prune_warmup_epochs: int = 0,
+        prune_target: Optional[float] = None):
 
         self.model = model.to(device)
         print(model.__class__.__name__)
         self.graph = graph
         self.device = device
         self.log = log
-        self.heads = heads.clone().long()
-        self.rels = rel_ids.clone().long()
-        self.tails = tails.clone().long()
-        self.labels = labels.clone().float()
+        def _prep_tensor(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+            if clone_inputs:
+                return x.clone().to(dtype)
+            if x.dtype != dtype:
+                return x.to(dtype)
+            return x
+
+        self.heads = _prep_tensor(heads, torch.long)
+        self.rels = _prep_tensor(rel_ids, torch.long)
+        self.tails = _prep_tensor(tails, torch.long)
+        self.labels = _prep_tensor(labels, torch.float)
         self.lr_candidates = [float(lr) for lr in lr_candidates]
         self.max_epochs = int(epochs)
         self.batch_size = int(batch_size)
@@ -40,6 +49,10 @@ class Train:
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
         self.learnable_contrastive_temperature = bool(learnable_contrastive_temperature)
         self.contrastive_temperature_init = float(contrastive_temperature)
+        self.clone_inputs = bool(clone_inputs)
+        self.prune_ratio = float(prune_ratio)
+        self.prune_warmup_epochs = int(prune_warmup_epochs)
+        self.prune_target = (float(prune_target) if prune_target is not None else None)
 
         self.dual_view = bool(getattr(self.model, "dual_view", False))
         if contrastive_sampler is not None:
@@ -461,6 +474,18 @@ class Train:
                     best_metrics_lr = val_metrics
                     best_state_lr = {k:v.detach().clone() for k,v in self.model.state_dict().items()}
                     best_temperature_lr = self._get_contrastive_temperature_value()
+
+                if (self.prune_ratio > 0.0 and self.prune_target is not None
+                    and self.prune_target != float("inf")
+                    and epoch >= max(1, self.prune_warmup_epochs)):
+                    if val_bce > self.prune_target * (1.0 + self.prune_ratio):
+                        if not getattr(self.log, "non_verbose", False):
+                            self.log.log(
+                                f"[lr={lr:.3g}] Pruned at epoch {epoch} "
+                                f"(val {val_bce:.4f} > target {self.prune_target:.4f} * "
+                                f"{1.0 + self.prune_ratio:.2f})"
+                            )
+                        break
 
                 if lr_early_stopping.step(val_bce, self.model):
                     if not getattr(self.log, "non_verbose", False):
