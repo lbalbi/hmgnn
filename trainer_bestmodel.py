@@ -3,8 +3,7 @@ import torch.nn as nn
 from typing import Dict, Optional, Tuple, List
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
-from samplers import (NegativeSampler, NegativeInstanceSampler, 
-    PartialInstanceSampler, RandomInstanceSampler)
+from samplers import (NegativeInstanceSampler, PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 import os
 
