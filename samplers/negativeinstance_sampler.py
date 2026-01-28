@@ -41,6 +41,9 @@ class NegativeInstanceSampler:
         self.pool_neg_to_u_pos_by_pred = None
         self.preds_seen = None
         self.primary_pred = instance_rel  # "instance_of"
+        self._anchors_with_pool: Optional[List[int]] = None
+        self._anchors_with_pool_set: Optional[set[int]] = None
+        self._pred_order_by_anchor: Optional[List[Optional[list[str]]]] = None
 
 
     @staticmethod
@@ -251,29 +254,71 @@ class NegativeInstanceSampler:
                     neg_cls, class2neg_by_pred.get(pred, {}), exclude=u)
                 self.pool_pos_to_u_neg_by_pred[u][pred] = self._collect_instances(
                     neg_cls, class2pos_by_pred.get(pred, {}), exclude=u)
-                self.pool_neg_to_u_pos_by_pred[u][pred] = self._collect_instances(
+        self.pool_neg_to_u_pos_by_pred[u][pred] = self._collect_instances(
                     pos_cls, class2neg_by_pred.get(pred, {}), exclude=u)
         self._g2l_cpu = torch.empty(self.num_nodes, dtype=torch.long)
         self._stamp_cpu = torch.zeros(self.num_nodes, dtype=torch.int32)
         self._cur_stamp = 0
+        self._build_anchor_caches()
 
 
     def prepare_batch(self, batch: HeteroData, pos_index: Optional[Tensor] = None) -> None:
         return
 
-    def _pred_priority(self, u_g: int) -> list[str]:
-        # Deterministic ordering (set -> sorted list)
+    def _pred_priority_uncached(self, u_g: int) -> list[str]:
         preds = sorted(self.preds_seen[u_g]) if self.preds_seen is not None else []
         if self.primary_pred in preds:
             preds.remove(self.primary_pred)
             return [self.primary_pred] + preds
         return preds
 
+    def _pred_priority(self, u_g: int) -> list[str]:
+        if self._pred_order_by_anchor is not None and 0 <= u_g < len(self._pred_order_by_anchor):
+            cached = self._pred_order_by_anchor[u_g]
+            if cached is not None:
+                return cached
+        return self._pred_priority_uncached(u_g)
+
+    def _build_anchor_caches(self) -> None:
+        if self.num_nodes <= 0:
+            self._anchors_with_pool = []
+            self._anchors_with_pool_set = set()
+            self._pred_order_by_anchor = []
+            return
+        self._anchors_with_pool = []
+        self._anchors_with_pool_set = set()
+        self._pred_order_by_anchor = [None for _ in range(self.num_nodes)]
+        for u in self.anchors:
+            if 0 <= u < self.num_nodes:
+                self._pred_order_by_anchor[u] = self._pred_priority_uncached(u)
+                if self._has_any_pool(u):
+                    self._anchors_with_pool.append(u)
+                    self._anchors_with_pool_set.add(u)
+
 
     def _sample_k_priority_cpu(self, pools_by_pred: dict, pred_order: list[str], *, stamp: int,
         fallback_global: int, fallback_local: int, k: int, full_graph_mode: bool) -> torch.Tensor:
         chosen_globals: list[int] = []
         chosen_set: set[int] = set()
+        chosen_list: list[int] = []
+        chosen_tensor: Optional[torch.Tensor] = None
+        chosen_tensor_dirty = False
+
+        def _mark_chosen(x: int) -> None:
+            nonlocal chosen_tensor_dirty
+            if x not in chosen_set:
+                chosen_set.add(x)
+                chosen_list.append(x)
+                chosen_tensor_dirty = True
+
+        def _ensure_chosen_tensor(dtype: torch.dtype) -> Optional[torch.Tensor]:
+            nonlocal chosen_tensor_dirty, chosen_tensor
+            if not chosen_list:
+                return None
+            if chosen_tensor is None or chosen_tensor_dirty:
+                chosen_tensor = torch.tensor(chosen_list, dtype=dtype)
+                chosen_tensor_dirty = False
+            return chosen_tensor
 
         def _filter_in_batch(globals_: torch.Tensor) -> torch.Tensor:
             if globals_.numel() == 0:
@@ -294,8 +339,9 @@ class NegativeInstanceSampler:
                 continue
 
             if chosen_set:
-                chosen_t = torch.tensor(list(chosen_set), dtype=pool_g.dtype)
-                pool_g = pool_g[~torch.isin(pool_g, chosen_t)]
+                chosen_t = _ensure_chosen_tensor(pool_g.dtype)
+                if chosen_t is not None:
+                    pool_g = pool_g[~torch.isin(pool_g, chosen_t)]
                 # mask = torch.tensor([int(x) not in chosen_set for x in pool_g.tolist()], dtype=torch.bool)
                 # pool_g = pool_g[mask]
                 if pool_g.numel() == 0: continue
@@ -308,7 +354,7 @@ class NegativeInstanceSampler:
             for x in pool_g[idx].tolist():
                 x = int(x)
                 if x not in chosen_set:
-                    chosen_set.add(x)
+                    _mark_chosen(x)
                     chosen_globals.append(x)
                     if len(chosen_globals) >= k:
                         break
@@ -325,8 +371,9 @@ class NegativeInstanceSampler:
                 union = torch.unique(torch.cat(all_parts, dim=0))
                 if union.numel() > 0:
                     if chosen_set:
-                        chosen_t = torch.tensor(list(chosen_set), dtype=union.dtype)
-                        union = union[~torch.isin(union, chosen_t)]
+                        chosen_t = _ensure_chosen_tensor(union.dtype)
+                        if chosen_t is not None:
+                            union = union[~torch.isin(union, chosen_t)]
                         # mask = torch.tensor([int(x) not in chosen_set for x in union.tolist()], dtype=torch.bool)
                         # union = union[mask]
                     if union.numel() > 0:
@@ -378,7 +425,10 @@ class NegativeInstanceSampler:
 
         if n_id is None:
             if anchor_nodes is None or anchor_nodes.numel() == 0:
-                anchor_globals_cpu = torch.tensor(self.anchors, dtype=torch.long)
+                if self._anchors_with_pool is not None and len(self._anchors_with_pool) > 0:
+                    anchor_globals_cpu = torch.tensor(self._anchors_with_pool, dtype=torch.long)
+                else:
+                    anchor_globals_cpu = torch.tensor(self.anchors, dtype=torch.long)
             else: anchor_globals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
             anchor_globals_cpu = anchor_globals_cpu[(anchor_globals_cpu >= 0) & (anchor_globals_cpu < self.num_nodes)]
 
@@ -387,7 +437,11 @@ class NegativeInstanceSampler:
 
             for u in anchor_globals_cpu.tolist():
                 
-                if not self._has_any_pool(u): continue
+                if self._anchors_with_pool_set is not None:
+                    if u not in self._anchors_with_pool_set:
+                        continue
+                elif not self._has_any_pool(u):
+                    continue
                 pred_order = self._pred_priority(u)
 
                 anchors_cpu.append(u)
@@ -424,7 +478,10 @@ class NegativeInstanceSampler:
         # Determine anchor locals and corresponding anchor globals
         if anchor_nodes is None or anchor_nodes.numel() == 0:
             # fallback: try all known anchors, but only those in batch
-            anchor_globals_cpu = torch.tensor(self.anchors, dtype=torch.long)
+            if self._anchors_with_pool is not None and len(self._anchors_with_pool) > 0:
+                anchor_globals_cpu = torch.tensor(self._anchors_with_pool, dtype=torch.long)
+            else:
+                anchor_globals_cpu = torch.tensor(self.anchors, dtype=torch.long)
             in_batch = (self._stamp_cpu[anchor_globals_cpu] == stamp)
             anchor_globals_cpu = anchor_globals_cpu[in_batch]
             anchor_locals_cpu = self._g2l_cpu[anchor_globals_cpu]
@@ -434,13 +491,26 @@ class NegativeInstanceSampler:
             # safety filter
             anchor_locals_cpu = anchor_locals_cpu[(anchor_locals_cpu >= 0) & (anchor_locals_cpu < n_id_cpu.numel())]
             anchor_globals_cpu = n_id_cpu[anchor_locals_cpu]
+            if self._anchors_with_pool_set is not None and anchor_globals_cpu.numel() > 0:
+                keep = [int(g) in self._anchors_with_pool_set for g in anchor_globals_cpu.tolist()]
+                if any(keep):
+                    keep_t = torch.tensor(keep, dtype=torch.bool)
+                    anchor_globals_cpu = anchor_globals_cpu[keep_t]
+                    anchor_locals_cpu = anchor_locals_cpu[keep_t]
+                else:
+                    anchor_globals_cpu = anchor_globals_cpu[:0]
+                    anchor_locals_cpu = anchor_locals_cpu[:0]
 
         anchors_local_cpu: List[int] = []
         shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
 
         for u_g, u_l in zip(anchor_globals_cpu.tolist(), anchor_locals_cpu.tolist()):
             if u_l < 0: continue
-            if not self._has_any_pool(u_g):  continue
+            if self._anchors_with_pool_set is not None:
+                if u_g not in self._anchors_with_pool_set:
+                    continue
+            elif not self._has_any_pool(u_g):
+                continue
 
             anchors_local_cpu.append(u_l)
             pred_order = self._pred_priority(u_g)
