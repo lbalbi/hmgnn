@@ -976,6 +976,40 @@ def main():
         test_tails=test_tails_all,
         test_labels=test_labels_all)
 
+    # -----------------------------------------------------------------
+    # Classification examples with at least one NEG relation in encoder graph
+    # -----------------------------------------------------------------
+    neg_node_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    for et in encoder_graph.edge_types:
+        if et == CLS_EDGE_TYPE:
+            continue
+        rel_s = str(et[1])
+        if rel_s.startswith(NEG_PREFIX) or rel_s == "neg_statement":
+            ei = encoder_graph[et].edge_index
+            if ei is None or ei.numel() == 0:
+                continue
+            neg_node_mask[ei[0].long()] = True
+            neg_node_mask[ei[1].long()] = True
+
+    def _count_with_neg(h: torch.Tensor, t: torch.Tensor) -> Tuple[int, int]:
+        if h.numel() == 0:
+            return 0, 0
+        mask = neg_node_mask[h.long()] | neg_node_mask[t.long()]
+        return int(mask.sum().item()), int(mask.numel())
+
+    n_train_with_neg, n_train_total = _count_with_neg(cls_heads, cls_tails)
+    n_test_with_neg, n_test_total = _count_with_neg(test_heads_all, test_tails_all)
+    n_all_with_neg = n_train_with_neg + n_test_with_neg
+    n_all_total = n_train_total + n_test_total
+
+    def _pct(num: int, den: int) -> float:
+        return (100.0 * num / den) if den > 0 else 0.0
+
+    print("\n=== Classification examples with NEG relation in encoder graph ===")
+    print(f"Train: {n_train_with_neg}/{n_train_total} ({_pct(n_train_with_neg, n_train_total):.2f}%)")
+    print(f"Test:  {n_test_with_neg}/{n_test_total} ({_pct(n_test_with_neg, n_test_total):.2f}%)")
+    print(f"All:   {n_all_with_neg}/{n_all_total} ({_pct(n_all_with_neg, n_all_total):.2f}%)")
+
     print("\n=== Encoder graph summary ===")
     print(f"#Structural edge types: {len(e_etypes_struct)}")
     print(f"#Encoder edge types:    {len(encoder_e_etypes)}")

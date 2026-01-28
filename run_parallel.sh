@@ -15,7 +15,7 @@ OUTDIR="${LOG_DIR}/output_wikidata_test_rargcn_protCL_${RUN_TAG}"
 LOGFILE="${LOG_DIR}/output_wikidata_test_rargcn_protCL_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
-python -u main_NEW.py \
+python -u main.py \
   --path "data/wikidata_data" \
   --task "wikidata" \
   --model "ra_rgcn" \
