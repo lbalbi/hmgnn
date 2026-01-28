@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Dict, Optional, Tuple, List
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
-from samplers import (NegativeInstanceSampler, PartialInstanceSampler, RandomInstanceSampler)
+from samplers import (FileNegativeSampler,NegativeInstanceSampler, PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 import os
 
@@ -338,7 +338,7 @@ class Test_BestModel:
 
     def __init__(self, model: nn.Module, graph: HeteroData, test_heads: torch.Tensor,
         test_rels: torch.Tensor, test_tails: torch.Tensor, id2rel: Dict[int, str],
-        neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int, 
+        neg_samplers: Dict[str, FileNegativeSampler], num_neg_per_pos: int, 
         device: torch.device, log, batch_size: int = 1024,
         neg_cache_path: Optional[str] = None, force_regen_negs: bool = True):
         self.model = model.to(device)
@@ -412,7 +412,7 @@ class Test_BestModel:
                 all_probs.append(probs.detach().cpu())
         return torch.cat(all_probs, dim=0) if all_probs else torch.empty(0)
 
-    def _sample_negatives_excluding_test(self, sampler: NegativeSampler, rel_name: str,
+    def _sample_negatives_excluding_test(self, sampler: FileNegativeSampler, rel_name: str,
         num_to_sample: int) -> torch.Tensor:
         """
         Use NegativeSampler to sample candidate negatives, then filter out any
