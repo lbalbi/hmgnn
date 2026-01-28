@@ -447,12 +447,8 @@ def _balanced_downsample_per_relation(
     df_bal = pd.concat(chunks, ignore_index=True)
     return df_bal, stats
 
-def _per_relation_label_split_indices(
-    df: pd.DataFrame,
-    *,
-    test_ratio: float,
-    seed: int,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Dict[int, Tuple[int, int]]]]:
+def _per_relation_label_split_indices(df: pd.DataFrame, *, test_ratio: float,
+    seed: int) -> Tuple[np.ndarray, np.ndarray, Dict[str, Dict[int, Tuple[int, int]]]]:
     train_idx: List[int] = []
     test_idx: List[int] = []
     counts: Dict[str, Dict[int, Tuple[int, int]]] = {}
@@ -751,14 +747,11 @@ def main():
     parser.add_argument("--balanced_test_ratio", type=float, default=0.20)
     parser.add_argument("--balanced_seed", type=int, default=42)
     parser.add_argument("--min_pos_per_rel", type=int, default=0)
-
     parser.add_argument("--cv_val_ratio", type=float, default=0.15)
     parser.add_argument("--split_cache_path", type=str, default=None)
     parser.add_argument("--force_resplit", action="store_true")
-
     args = parser.parse_args()
     print("output_dir:", args.output_dir)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cfg = load_config(task=args.task)
@@ -770,10 +763,8 @@ def main():
         if isinstance(in_feats_cfg, dict):
             n_type_cfg = mcfg.get("n_type", "node")
             in_dim = int(in_feats_cfg.get(n_type_cfg, list(in_feats_cfg.values())[0]))
-        else:
-            in_dim = int(in_feats_cfg)
-    else:
-        in_dim = mcfg["in_feats"]
+        else: in_dim = int(in_feats_cfg)
+    else: in_dim = mcfg["in_feats"]
 
     lr_cfg = cfg.get("lr", 1e-3)
     lr_candidates = [float(lr) for lr in lr_cfg] if isinstance(lr_cfg, (list, tuple)) else [float(lr_cfg)]
@@ -781,24 +772,20 @@ def main():
     dropout_cfg = cfg.get("dropout", mcfg.get("dropout", None))
     if isinstance(dropout_cfg, (list, tuple)):
         dropout_candidates = [float(d) for d in dropout_cfg]
-    elif dropout_cfg is None:
-        dropout_candidates = [None]
-    else:
-        dropout_candidates = [float(dropout_cfg)]
+    elif dropout_cfg is None: dropout_candidates = [None]
+    else: dropout_candidates = [float(dropout_cfg)]
 
     contrastive_weight_cfg = cfg.get("contrastive_weight", 0.1)
     contrastive_weight_candidates = (
         [float(w) for w in contrastive_weight_cfg]
         if isinstance(contrastive_weight_cfg, (list, tuple))
-        else [float(contrastive_weight_cfg)]
-    )
+        else [float(contrastive_weight_cfg)])
 
     contrastive_temp_cfg = cfg.get("contrastive_temperature", 0.5)
     contrastive_temp_candidates = (
         [float(t) for t in contrastive_temp_cfg]
         if isinstance(contrastive_temp_cfg, (list, tuple))
-        else [float(contrastive_temp_cfg)]
-    )
+        else [float(contrastive_temp_cfg)])
 
     clone_inputs = bool(cfg.get("clone_inputs", True))
     cv_prune_ratio = float(cfg.get("cv_prune_ratio", 0.0))
