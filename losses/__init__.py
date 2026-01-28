@@ -1,6 +1,2 @@
-from .contrastive_CE import ContrastiveLoss_CE
-from .dualcontrastive_margin import DualContrastiveLoss_Margin
-from .contradict_dualcontrastive_CE import Contradiction_ContrastiveLoss
-from .composed_contrastive_CE import ComposedContrastiveLoss_CE
 from .contrastiveinstance_CE import ContrastiveInstanceLoss
 from .dual_contrastiveinstance import DualContrastiveInstanceLoss
