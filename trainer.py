@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List, Dict
@@ -19,7 +20,7 @@ class Train:
         contrastive_weight: float = 0.1, train_loader=None, val_loader=None, no_contrastive: bool = False,
         contrastive_temperature: float = 0.5, learnable_contrastive_temperature: bool = True,
         clone_inputs: bool = False, prune_ratio: float = 0.0, prune_warmup_epochs: int = 0,
-        prune_target: Optional[float] = None):
+        prune_target: Optional[float] = None, timing_profile: bool = False):
 
         self.model = model.to(device)
         print(model.__class__.__name__)
@@ -53,6 +54,7 @@ class Train:
         self.prune_ratio = float(prune_ratio)
         self.prune_warmup_epochs = int(prune_warmup_epochs)
         self.prune_target = (float(prune_target) if prune_target is not None else None)
+        self.timing_profile = bool(timing_profile)
 
         self.dual_view = bool(getattr(self.model, "dual_view", False))
         if contrastive_sampler is not None:
@@ -188,7 +190,7 @@ class Train:
             if train and not self.no_contrastive and self.contrastive_sampler is not None and self.contrastive_weight > 0.0:
                 batch_nodes = torch.unique(torch.cat([h, t], dim=0))
                 samples = self.contrastive_sampler.get_contrastive_samples(
-                    z, anchor_nodes=batch_nodes, n_id=None)
+                    z, anchor_nodes=batch_nodes, n_id=None, anchor_nodes_are_unique=True)
                 contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
@@ -262,20 +264,32 @@ class Train:
         total_bce = 0.0
         total_contr = 0.0
         total_examples = 0
+        if self.timing_profile:
+            t_cpu = t_to = t_encode = t_loss = t_contr = t_bwd = 0.0
+            t_contr_sample = t_contr_loss = 0.0
+            n_batches = 0
 
         for batch in self.train_loader:
-            batch = batch.to(self.device)
-
-            edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
+            t0 = time.perf_counter() if self.timing_profile else 0.0
+            edge_label_index_cpu, edge_label_cpu, input_id = self._get_link_supervision(batch)
             if input_id is None:
                 raise RuntimeError("Batch is missing input_id; ensure you're using LinkNeighborLoader. "
                                 "input_id is required to recover rel_ids.")  # :contentReference[oaicite:2]{index=2}
 
-            # input_id may be on GPU; index CPU tensors safely:
-            input_id_cpu = input_id.detach().to("cpu").long()
+            input_id_cpu = input_id.detach().long()
+            n_id_cpu = None
+            if isinstance(batch, HeteroData):
+                n_id_cpu = getattr(batch["node"], "n_id", None)
+            if n_id_cpu is not None:
+                n_id_cpu = n_id_cpu.detach().long()
+            batch_nodes_cpu = None
+            if edge_label_index_cpu is not None and edge_label_index_cpu.numel() > 0:
+                batch_nodes_cpu = torch.unique(edge_label_index_cpu.view(-1).long())
+            if self.timing_profile:
+                t_cpu += time.perf_counter() - t0
 
             # Labels: prefer what loader provides; fallback to cached subset:
-            labels = (edge_label if edge_label is not None else self.train_labels_sub[input_id_cpu])
+            labels = (edge_label_cpu if edge_label_cpu is not None else self.train_labels_sub[input_id_cpu])
             labels = labels.to(self.device).float()
 
             # Relation ids come from your original triple dataset:
@@ -284,16 +298,25 @@ class Train:
             if labels.numel() == 0:
                 continue
 
+            t1 = time.perf_counter() if self.timing_profile else 0.0
+            batch = batch.to(self.device)
+            edge_label_index, _, _ = self._get_link_supervision(batch)
+            if self.timing_profile:
+                t_to += time.perf_counter() - t1
+
             if (not self.no_contrastive and self.contrastive_sampler is not None
                 and hasattr(self.contrastive_sampler, "prepare_batch")):
                 self.contrastive_sampler.prepare_batch(batch)
 
             optimizer.zero_grad()
 
+            t2 = time.perf_counter() if self.timing_profile else 0.0
             h_dict = self.model.encode(batch)
             self._maybe_switch_to_dual(h_dict, n_type, optimizer=optimizer)
             z = h_dict[n_type]
             del h_dict
+            if self.timing_profile:
+                t_encode += time.perf_counter() - t2
 
             if edge_label_index.numel() > 0:
                 if int(edge_label_index.max()) >= int(z.size(0)):
@@ -301,24 +324,37 @@ class Train:
                         "You need to map endpoints via batch['node'].n_id -> local.")
             assert rel_ids.numel() == labels.numel() == edge_label_index.size(1)
 
+            t3 = time.perf_counter() if self.timing_profile else 0.0
             logits, probs = self.model.score_triples(z, edge_label_index, rel_ids)
             bce_loss = self.criterion(logits, labels)
+            if self.timing_profile:
+                t_loss += time.perf_counter() - t3
 
             loss = bce_loss
             contr_loss_val = 0.0
 
             if (not self.no_contrastive and self.contrastive_sampler is not None
                 and self.contrastive_weight > 0.0):
-                batch_nodes = torch.unique(edge_label_index.view(-1))
+                if self.timing_profile:
+                    t4 = time.perf_counter()
                 samples = self.contrastive_sampler.get_contrastive_samples(
-                    z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id
+                    z, anchor_nodes=batch_nodes_cpu, n_id=n_id_cpu, anchor_nodes_are_unique=True
                 )
+                if self.timing_profile:
+                    t_contr_sample += time.perf_counter() - t4
+                    t5 = time.perf_counter()
                 contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
                 contr_loss_val = float(contr_loss.detach().cpu().item())
+                if self.timing_profile:
+                    t_contr_loss += time.perf_counter() - t5
 
+            t5 = time.perf_counter() if self.timing_profile else 0.0
             loss.backward()
             optimizer.step()
+            if self.timing_profile:
+                t_bwd += time.perf_counter() - t5
+                n_batches += 1
 
             bs = labels.size(0)
             total_bce += float(bce_loss.detach().cpu().item()) * bs
@@ -327,6 +363,18 @@ class Train:
 
         avg_bce = total_bce / total_examples if total_examples else 0.0
         avg_contr = total_contr / total_examples if total_examples else 0.0
+        if self.timing_profile and n_batches > 0:
+            t_contr = t_contr_sample + t_contr_loss
+            total_t = t_cpu + t_to + t_encode + t_loss + t_contr + t_bwd
+            msg = (
+                f"[Timing][train] batches={n_batches} total={total_t:.2f}s | "
+                f"cpu={t_cpu:.2f}s to_device={t_to:.2f}s encode={t_encode:.2f}s "
+                f"loss={t_loss:.2f}s contr={t_contr:.2f}s "
+                f"(sample={t_contr_sample:.2f}s loss={t_contr_loss:.2f}s) "
+                f"bwd+step={t_bwd:.2f}s"
+            )
+            if not getattr(self.log, "non_verbose", False):
+                self.log.log(msg)
         return avg_bce, avg_contr
 
 
@@ -337,26 +385,39 @@ class Train:
         total_examples = 0
         all_probs = []
         all_labels = []
+        if self.timing_profile:
+            t_cpu = t_to = t_encode = t_loss = 0.0
+            n_batches = 0
 
         with torch.no_grad():
             for batch in self.val_loader:
-                batch = batch.to(self.device)
-
-                edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
+                t0 = time.perf_counter() if self.timing_profile else 0.0
+                edge_label_index_cpu, edge_label_cpu, input_id = self._get_link_supervision(batch)
                 if input_id is None:
                     raise RuntimeError("Batch is missing input_id; ensure you're using LinkNeighborLoader.")
 
-                input_id_cpu = input_id.detach().to("cpu").long()
+                input_id_cpu = input_id.detach().long()
 
-                labels = (edge_label if edge_label is not None else self.val_labels_sub[input_id_cpu])
+                labels = (edge_label_cpu if edge_label_cpu is not None else self.val_labels_sub[input_id_cpu])
                 labels = labels.to(self.device).float()
                 rel_ids = self.val_rels_sub[input_id_cpu].to(self.device).long()
+                if self.timing_profile:
+                    t_cpu += time.perf_counter() - t0
 
                 if labels.numel() == 0:
                     continue
 
+                t1 = time.perf_counter() if self.timing_profile else 0.0
+                batch = batch.to(self.device)
+                edge_label_index, _, _ = self._get_link_supervision(batch)
+                if self.timing_profile:
+                    t_to += time.perf_counter() - t1
+
+                t2 = time.perf_counter() if self.timing_profile else 0.0
                 h_dict = self.model.encode(batch)
                 z = h_dict[n_type]
+                if self.timing_profile:
+                    t_encode += time.perf_counter() - t2
 
                 if edge_label_index.numel() > 0:
                     if int(edge_label_index.max()) >= int(z.size(0)):
@@ -364,8 +425,12 @@ class Train:
                             "You need to map endpoints via batch['node'].n_id -> local.")
                 assert rel_ids.numel() == labels.numel() == edge_label_index.size(1)
 
+                t3 = time.perf_counter() if self.timing_profile else 0.0
                 logits, probs = self.model.score_triples(z, edge_label_index, rel_ids)
                 bce_loss = self.criterion(logits, labels)
+                if self.timing_profile:
+                    t_loss += time.perf_counter() - t3
+                    n_batches += 1
 
                 bs = labels.size(0)
                 total_bce += float(bce_loss.detach().cpu().item()) * bs
@@ -379,6 +444,15 @@ class Train:
             all_labels = torch.cat(all_labels, dim=0)
         else:
             all_probs, all_labels = None, None
+        if self.timing_profile and n_batches > 0:
+            total_t = t_cpu + t_to + t_encode + t_loss
+            msg = (
+                f"[Timing][val] batches={n_batches} total={total_t:.2f}s | "
+                f"cpu={t_cpu:.2f}s to_device={t_to:.2f}s encode={t_encode:.2f}s "
+                f"loss={t_loss:.2f}s"
+            )
+            if not getattr(self.log, "non_verbose", False):
+                self.log.log(msg)
         return avg_bce, 0.0, all_probs, all_labels
 
 

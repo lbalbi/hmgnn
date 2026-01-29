@@ -1,5 +1,6 @@
 # main.py
 import os, hashlib, re, statistics, inspect
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import product
 from collections import defaultdict
 from typing import Dict, Tuple, List, Optional, Set
@@ -750,6 +751,8 @@ def main():
     parser.add_argument("--cv_val_ratio", type=float, default=0.15)
     parser.add_argument("--split_cache_path", type=str, default=None)
     parser.add_argument("--force_resplit", action="store_true")
+    parser.add_argument("--parallel_grid", action="store_true")
+    parser.add_argument("--parallel_grid_workers", type=int, default=None)
     args = parser.parse_args()
     print("output_dir:", args.output_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -790,6 +793,13 @@ def main():
     clone_inputs = bool(cfg.get("clone_inputs", True))
     cv_prune_ratio = float(cfg.get("cv_prune_ratio", 0.0))
     cv_prune_warmup = int(cfg.get("cv_prune_warmup", 5))
+    prefetch_factor = int(cfg.get("prefetch_factor", 2))
+    timing_profile = bool(cfg.get("timing_profile", False))
+    parallel_grid = bool(cfg.get("parallel_grid", False) or args.parallel_grid)
+    parallel_grid_workers = args.parallel_grid_workers
+    if parallel_grid_workers is None:
+        parallel_grid_workers = int(cfg.get("parallel_grid_workers", 2))
+    print("timing_profile:", timing_profile)
 
     print(f"Learning rate candidates (per-fold sweep): {lr_candidates}")
 
@@ -1054,6 +1064,10 @@ def main():
     print(f"Train clone_inputs: {clone_inputs}")
     if cv_prune_ratio > 0.0:
         print(f"CV prune: ratio={cv_prune_ratio:.3g}, warmup_epochs={cv_prune_warmup}")
+    if timing_profile:
+        print("Timing profile: enabled")
+    if parallel_grid:
+        print(f"Parallel grid: enabled (workers={parallel_grid_workers})")
 
     def _filter_model_kwargs(kwargs: Dict[str, object]) -> Dict[str, object]:
         return {k: v for k, v in kwargs.items() if k in model_params}
@@ -1151,110 +1165,218 @@ def main():
             val_edge_label_index = torch.stack([cls_heads[val_idx], cls_tails[val_idx]], dim=0)
             val_edge_label = cls_labels[val_idx].to(torch.float)
 
-            num_neighbors = {et: [20, 10] for et in MP_EDGE_TYPES}
-            num_neighbors[CLS_EDGE_TYPE] = [0, 0]   # <-- IMPORTANT: don't sample along cls_link
-
-            train_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
-                edge_label_index=(CLS_EDGE_TYPE, train_edge_label_index), edge_label=train_edge_label,
-                batch_size=args.batch_size, shuffle=True, num_workers=2, persistent_workers=True,
-                pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0)
-
-            val_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
-                edge_label_index=(CLS_EDGE_TYPE, val_edge_label_index), edge_label=val_edge_label,
-                batch_size=args.batch_size, shuffle=False, num_workers=2, persistent_workers=True,
-                pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0,)
-
-
             print(f"\n=== CV Split {fold}/{k_folds} ===")
             print(f"  Train cls examples: {train_idx.numel()} | Val cls examples: {val_idx.numel()}")
+            if parallel_grid:
+                if cv_prune_ratio > 0.0:
+                    print("[WARN] parallel_grid enabled; pruning disabled for parallel runs.")
 
-            sampler_graph = struct_graph
-            if not args.no_contrastive:
-                if use_random_sampler:
-                    neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                    neg_stmt_sampler.prepare_global(sampler_graph)
-                elif use_partial_sampler:
-                    edges_are_negative = nflag
-                    neg_stmt_sampler = PartialInstanceSampler(
-                        k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                def _run_hparam(hparams):
+                    dropout_val, contr_w, contr_temp_init = hparams
+                    num_neighbors = {et: [20, 10] for et in MP_EDGE_TYPES}
+                    num_neighbors[CLS_EDGE_TYPE] = [0, 0]
+                    train_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
+                        edge_label_index=(CLS_EDGE_TYPE, train_edge_label_index), edge_label=train_edge_label,
+                        batch_size=args.batch_size, shuffle=True, num_workers=2, persistent_workers=True,
+                        pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0,
+                        prefetch_factor=prefetch_factor)
+                    val_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
+                        edge_label_index=(CLS_EDGE_TYPE, val_edge_label_index), edge_label=val_edge_label,
+                        batch_size=args.batch_size, shuffle=False, num_workers=2, persistent_workers=True,
+                        pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0,
+                        prefetch_factor=prefetch_factor)
+
+                    base_model_kwargs = dict(
+                        in_dim=in_dim,
+                        hidden_dim=mcfg["hidden_dim"],
+                        out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
+                        e_etypes=encoder_e_etypes,
+                        n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
                     )
-                    neg_stmt_sampler.prepare_global(sampler_graph)
-                else:
-                    neg_stmt_sampler = NegativeInstanceSampler(
-                        k=contrastive_k,
-                        subclass_rel=subclass_rel,
-                        neg_prefix=NEG_PREFIX,
-                        instance_rel=instance_rel,
+                    model_kwargs = _build_model_kwargs(base_model_kwargs, dropout_val)
+                    if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
+                        model_fold = ModelCls(**model_kwargs, rel2id=rel2id).to(device)
+                    else:
+                        model_fold = ModelCls(**model_kwargs).to(device)
+
+                    sampler_graph = struct_graph
+                    if not args.no_contrastive:
+                        if use_random_sampler:
+                            neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                            neg_stmt_sampler.prepare_global(sampler_graph)
+                        elif use_partial_sampler:
+                            edges_are_negative = nflag
+                            neg_stmt_sampler = PartialInstanceSampler(
+                                k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                            )
+                            neg_stmt_sampler.prepare_global(sampler_graph)
+                        else:
+                            neg_stmt_sampler = NegativeInstanceSampler(
+                                k=contrastive_k,
+                                subclass_rel=subclass_rel,
+                                neg_prefix=NEG_PREFIX,
+                                instance_rel=instance_rel,
+                            )
+                            neg_stmt_sampler.prepare_global(sampler_graph)
+                    else:
+                        neg_stmt_sampler = None
+
+                    dtag = "default" if dropout_val is None else f"{dropout_val:.3g}"
+                    log_fold = Logger(f"train_cv_split{fold}_d{dtag}_cw{contr_w:.3g}_t{contr_temp_init:.3g}",
+                                      dir=args.output_dir)
+                    trainer_fold = Train(
+                        model=model_fold,
+                        graph=encoder_graph,
+                        heads=cls_heads,
+                        rel_ids=cls_rels,
+                        tails=cls_tails,
+                        labels=cls_labels,
+                        lr_candidates=lr_candidates,
+                        epochs=args.epochs,
+                        device=device,
+                        log=log_fold,
+                        batch_size=args.batch_size,
+                        val_ratio=0.0,
+                        early_stopping_patience=cfg.get("patience", 15),
+                        train_idx=train_idx,
+                        val_idx=val_idx,
+                        contrastive_sampler=neg_stmt_sampler,
+                        contrastive_weight=contr_w,
+                        contrastive_temperature=contr_temp_init,
+                        learnable_contrastive_temperature=True,
+                        train_loader=train_loader,
+                        val_loader=val_loader,
+                        no_contrastive=args.no_contrastive,
+                        clone_inputs=clone_inputs,
+                        prune_ratio=0.0,
+                        prune_warmup_epochs=cv_prune_warmup,
+                        prune_target=None,
+                        timing_profile=timing_profile,
                     )
-                    neg_stmt_sampler.prepare_global(sampler_graph)
+                    return (dropout_val, contr_w, contr_temp_init, *trainer_fold.run())
+
+                with ThreadPoolExecutor(max_workers=int(parallel_grid_workers)) as executor:
+                    futures = [executor.submit(_run_hparam, h) for h in hyperparam_grid]
+                    for fut in as_completed(futures):
+                        dropout_val, contr_w, contr_temp_init, best_val_loss, best_epoch, best_metrics, best_lr, per_lr = fut.result()
+                        for lr in lr_candidates:
+                            lr = float(lr)
+                            rec = per_lr.get(lr, None)
+                            if rec is None: continue
+                            loss = float(rec["best_val_loss"])
+                            ep = int(rec["best_epoch"])
+                            temp = rec.get("best_temperature", None)
+                            key = (lr, dropout_val, float(contr_w), float(contr_temp_init))
+                            if loss != float("inf"): hp_to_fold_losses[key].append(loss)
+                            if ep > 0: hp_to_fold_epochs[key].append(ep)
+                            if temp is not None: hp_to_fold_temperatures[key].append(float(temp))
+                            if rec.get("best_metrics", None) is not None: hp_to_fold_metrics[key].append(rec["best_metrics"])
+                        if best_metrics is not None:
+                            cv_metrics.append(best_metrics)
             else:
-                neg_stmt_sampler = None
+                num_neighbors = {et: [20, 10] for et in MP_EDGE_TYPES}
+                num_neighbors[CLS_EDGE_TYPE] = [0, 0]   # <-- IMPORTANT: don't sample along cls_link
 
-            fold_best_val = float("inf")
-            for hp_i, (dropout_val, contr_w, contr_temp_init) in enumerate(hyperparam_grid, start=1):
-                base_model_kwargs = dict(
-                    in_dim=in_dim,
-                    hidden_dim=mcfg["hidden_dim"],
-                    out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
-                    e_etypes=encoder_e_etypes,
-                    n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
-                )
-                model_kwargs = _build_model_kwargs(base_model_kwargs, dropout_val)
-                if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
-                    model_fold = ModelCls(**model_kwargs, rel2id=rel2id).to(device)
+                train_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
+                    edge_label_index=(CLS_EDGE_TYPE, train_edge_label_index), edge_label=train_edge_label,
+                    batch_size=args.batch_size, shuffle=True, num_workers=2, persistent_workers=True,
+                    pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0,
+                    prefetch_factor=prefetch_factor)
+
+                val_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
+                    edge_label_index=(CLS_EDGE_TYPE, val_edge_label_index), edge_label=val_edge_label,
+                    batch_size=args.batch_size, shuffle=False, num_workers=2, persistent_workers=True,
+                    pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0,
+                    prefetch_factor=prefetch_factor)
+
+                sampler_graph = struct_graph
+                if not args.no_contrastive:
+                    if use_random_sampler:
+                        neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    elif use_partial_sampler:
+                        edges_are_negative = nflag
+                        neg_stmt_sampler = PartialInstanceSampler(
+                            k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                        )
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    else:
+                        neg_stmt_sampler = NegativeInstanceSampler(
+                            k=contrastive_k,
+                            subclass_rel=subclass_rel,
+                            neg_prefix=NEG_PREFIX,
+                            instance_rel=instance_rel,
+                        )
+                        neg_stmt_sampler.prepare_global(sampler_graph)
                 else:
-                    model_fold = ModelCls(**model_kwargs).to(device)
+                    neg_stmt_sampler = None
 
-                dtag = "default" if dropout_val is None else f"{dropout_val:.3g}"
-                log_fold = Logger(f"train_cv_split{fold}_d{dtag}_cw{contr_w:.3g}_t{contr_temp_init:.3g}",
-                                  dir=args.output_dir)
-                trainer_fold = Train(
-                    model=model_fold,
-                    graph=encoder_graph,
-                    heads=cls_heads,
-                    rel_ids=cls_rels,
-                    tails=cls_tails,
-                    labels=cls_labels,
-                    lr_candidates=lr_candidates,
-                    epochs=args.epochs,
-                    device=device,
-                    log=log_fold,
-                    batch_size=args.batch_size,
-                    val_ratio=0.0,
-                    early_stopping_patience=cfg.get("patience", 15),
-                    train_idx=train_idx,
-                    val_idx=val_idx,
-                    contrastive_sampler=neg_stmt_sampler,
-                    contrastive_weight=contr_w,
-                    contrastive_temperature=contr_temp_init,
-                    learnable_contrastive_temperature=True,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    no_contrastive=args.no_contrastive,
-                    clone_inputs=clone_inputs,
-                    prune_ratio=cv_prune_ratio,
-                    prune_warmup_epochs=cv_prune_warmup,
-                    prune_target=(fold_best_val if fold_best_val < float("inf") else None),
-                )
+                fold_best_val = float("inf")
+                for hp_i, (dropout_val, contr_w, contr_temp_init) in enumerate(hyperparam_grid, start=1):
+                    base_model_kwargs = dict(
+                        in_dim=in_dim,
+                        hidden_dim=mcfg["hidden_dim"],
+                        out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
+                        e_etypes=encoder_e_etypes,
+                        n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
+                    )
+                    model_kwargs = _build_model_kwargs(base_model_kwargs, dropout_val)
+                    if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
+                        model_fold = ModelCls(**model_kwargs, rel2id=rel2id).to(device)
+                    else:
+                        model_fold = ModelCls(**model_kwargs).to(device)
 
-                best_val_loss, best_epoch, best_metrics, best_lr, per_lr = trainer_fold.run()
-                if best_val_loss is not None and best_val_loss < fold_best_val:
-                    fold_best_val = float(best_val_loss)
-                for lr in lr_candidates:
-                    lr = float(lr)
-                    rec = per_lr.get(lr, None)
-                    if rec is None: continue
-                    loss = float(rec["best_val_loss"])
-                    ep = int(rec["best_epoch"])
-                    temp = rec.get("best_temperature", None)
+                    dtag = "default" if dropout_val is None else f"{dropout_val:.3g}"
+                    log_fold = Logger(f"train_cv_split{fold}_d{dtag}_cw{contr_w:.3g}_t{contr_temp_init:.3g}",
+                                      dir=args.output_dir)
+                    trainer_fold = Train(
+                        model=model_fold,
+                        graph=encoder_graph,
+                        heads=cls_heads,
+                        rel_ids=cls_rels,
+                        tails=cls_tails,
+                        labels=cls_labels,
+                        lr_candidates=lr_candidates,
+                        epochs=args.epochs,
+                        device=device,
+                        log=log_fold,
+                        batch_size=args.batch_size,
+                        val_ratio=0.0,
+                        early_stopping_patience=cfg.get("patience", 15),
+                        train_idx=train_idx,
+                        val_idx=val_idx,
+                        contrastive_sampler=neg_stmt_sampler,
+                        contrastive_weight=contr_w,
+                        contrastive_temperature=contr_temp_init,
+                        learnable_contrastive_temperature=True,
+                        train_loader=train_loader,
+                        val_loader=val_loader,
+                        no_contrastive=args.no_contrastive,
+                        clone_inputs=clone_inputs,
+                        prune_ratio=cv_prune_ratio,
+                        prune_warmup_epochs=cv_prune_warmup,
+                        prune_target=(fold_best_val if fold_best_val < float("inf") else None),
+                        timing_profile=timing_profile,
+                    )
 
-                    key = (lr, dropout_val, float(contr_w), float(contr_temp_init))
-                    if loss != float("inf"): hp_to_fold_losses[key].append(loss)
-                    if ep > 0: hp_to_fold_epochs[key].append(ep)
-                    if temp is not None: hp_to_fold_temperatures[key].append(float(temp))
-                    if rec.get("best_metrics", None) is not None: hp_to_fold_metrics[key].append(rec["best_metrics"])
-                if best_metrics is not None:
-                    cv_metrics.append(best_metrics)
+                    best_val_loss, best_epoch, best_metrics, best_lr, per_lr = trainer_fold.run()
+                    if best_val_loss is not None and best_val_loss < fold_best_val:
+                        fold_best_val = float(best_val_loss)
+                    for lr in lr_candidates:
+                        lr = float(lr)
+                        rec = per_lr.get(lr, None)
+                        if rec is None: continue
+                        loss = float(rec["best_val_loss"])
+                        ep = int(rec["best_epoch"])
+                        temp = rec.get("best_temperature", None)
+
+                        key = (lr, dropout_val, float(contr_w), float(contr_temp_init))
+                        if loss != float("inf"): hp_to_fold_losses[key].append(loss)
+                        if ep > 0: hp_to_fold_epochs[key].append(ep)
+                        if temp is not None: hp_to_fold_temperatures[key].append(float(temp))
+                        if rec.get("best_metrics", None) is not None: hp_to_fold_metrics[key].append(rec["best_metrics"])
+                    if best_metrics is not None:
+                        cv_metrics.append(best_metrics)
 
         hp_summary = []
         for key, losses in hp_to_fold_losses.items():
@@ -1313,7 +1435,8 @@ def main():
         final_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
             edge_label_index=(CLS_EDGE_TYPE, final_edge_label_index),neg_sampling_ratio=0.0,
             edge_label=final_edge_label, batch_size=args.batch_size, shuffle=True,
-            num_workers=2, persistent_workers=True, pin_memory=(device.type == "cuda"))
+            num_workers=2, persistent_workers=True, pin_memory=(device.type == "cuda"),
+            prefetch_factor=prefetch_factor)
 
         final_base_kwargs = dict(
             in_dim=in_dim,
@@ -1370,6 +1493,7 @@ def main():
             no_contrastive=args.no_contrastive,
             contrastive_temperature=final_contrastive_temperature,
             learnable_contrastive_temperature=True,
+            timing_profile=timing_profile,
         )
         final_loss = final_trainer.run()
         print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}")

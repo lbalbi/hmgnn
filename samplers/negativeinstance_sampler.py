@@ -44,6 +44,11 @@ class NegativeInstanceSampler:
         self._anchors_with_pool: Optional[List[int]] = None
         self._anchors_with_pool_set: Optional[set[int]] = None
         self._pred_order_by_anchor: Optional[List[Optional[list[str]]]] = None
+        self._has_pool_mask: Optional[Tensor] = None
+        self._pred_order_nonempty_shared_pos: Optional[List[Optional[list[str]]]] = None
+        self._pred_order_nonempty_shared_neg: Optional[List[Optional[list[str]]]] = None
+        self._pred_order_nonempty_pos_to_u_neg: Optional[List[Optional[list[str]]]] = None
+        self._pred_order_nonempty_neg_to_u_pos: Optional[List[Optional[list[str]]]] = None
 
 
     @staticmethod
@@ -284,20 +289,104 @@ class NegativeInstanceSampler:
             self._anchors_with_pool = []
             self._anchors_with_pool_set = set()
             self._pred_order_by_anchor = []
+            self._has_pool_mask = torch.zeros(0, dtype=torch.bool)
+            self._pred_order_nonempty_shared_pos = []
+            self._pred_order_nonempty_shared_neg = []
+            self._pred_order_nonempty_pos_to_u_neg = []
+            self._pred_order_nonempty_neg_to_u_pos = []
             return
         self._anchors_with_pool = []
         self._anchors_with_pool_set = set()
         self._pred_order_by_anchor = [None for _ in range(self.num_nodes)]
+        self._has_pool_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
+        self._pred_order_nonempty_shared_pos = [None for _ in range(self.num_nodes)]
+        self._pred_order_nonempty_shared_neg = [None for _ in range(self.num_nodes)]
+        self._pred_order_nonempty_pos_to_u_neg = [None for _ in range(self.num_nodes)]
+        self._pred_order_nonempty_neg_to_u_pos = [None for _ in range(self.num_nodes)]
         for u in self.anchors:
             if 0 <= u < self.num_nodes:
-                self._pred_order_by_anchor[u] = self._pred_priority_uncached(u)
+                pred_order = self._pred_priority_uncached(u)
+                self._pred_order_by_anchor[u] = pred_order
                 if self._has_any_pool(u):
                     self._anchors_with_pool.append(u)
                     self._anchors_with_pool_set.add(u)
+                    self._has_pool_mask[u] = True
+                # prefilter preds by non-empty pools for each pool type
+                if self.pool_shared_pos_by_pred is not None:
+                    pools = self.pool_shared_pos_by_pred[u]
+                    self._pred_order_nonempty_shared_pos[u] = [
+                        p for p in pred_order if (p in pools and pools[p].numel() > 0)
+                    ]
+                if self.pool_shared_neg_by_pred is not None:
+                    pools = self.pool_shared_neg_by_pred[u]
+                    self._pred_order_nonempty_shared_neg[u] = [
+                        p for p in pred_order if (p in pools and pools[p].numel() > 0)
+                    ]
+                if self.pool_pos_to_u_neg_by_pred is not None:
+                    pools = self.pool_pos_to_u_neg_by_pred[u]
+                    self._pred_order_nonempty_pos_to_u_neg[u] = [
+                        p for p in pred_order if (p in pools and pools[p].numel() > 0)
+                    ]
+                if self.pool_neg_to_u_pos_by_pred is not None:
+                    pools = self.pool_neg_to_u_pos_by_pred[u]
+                    self._pred_order_nonempty_neg_to_u_pos[u] = [
+                        p for p in pred_order if (p in pools and pools[p].numel() > 0)
+                    ]
 
 
     def _sample_k_priority_cpu(self, pools_by_pred: dict, pred_order: list[str], *, stamp: int,
         fallback_global: int, fallback_local: int, k: int, full_graph_mode: bool) -> torch.Tensor:
+        if k == 1:
+            # Fast path: pick a single example without building exclusion sets.
+            if full_graph_mode:
+                for pred in pred_order:
+                    pool_g = pools_by_pred.get(pred, None)
+                    if pool_g is None or pool_g.numel() == 0:
+                        continue
+                    idx = torch.randint(0, int(pool_g.numel()), (1,), dtype=torch.long)
+                    return pool_g[idx].long()
+            else:
+                assert self._stamp_cpu is not None and self._g2l_cpu is not None
+                for pred in pred_order:
+                    pool_g = pools_by_pred.get(pred, None)
+                    if pool_g is None or pool_g.numel() == 0:
+                        continue
+                    mask = (self._stamp_cpu[pool_g] == stamp)
+                    pool_in = pool_g[mask]
+                    if pool_in.numel() == 0:
+                        continue
+                    idx = torch.randint(0, int(pool_in.numel()), (1,), dtype=torch.long)
+                    chosen_g = pool_in[idx]
+                    chosen_l = self._g2l_cpu[chosen_g]
+                    if chosen_l.numel() == 0:
+                        break
+                    if (self._stamp_cpu[chosen_g] != stamp).any() or (chosen_l < 0).any():
+                        return torch.tensor([int(fallback_local)], dtype=torch.long)
+                    return chosen_l.long()
+            # fallback: union across predicates
+            all_parts = []
+            for pred in pred_order:
+                p = pools_by_pred.get(pred, None)
+                if p is None or p.numel() == 0:
+                    continue
+                if full_graph_mode:
+                    all_parts.append(p)
+                else:
+                    mask = (self._stamp_cpu[p] == stamp)
+                    all_parts.append(p[mask])
+            if all_parts:
+                union = torch.unique(torch.cat(all_parts, dim=0))
+                if union.numel() > 0:
+                    idx = torch.randint(0, int(union.numel()), (1,), dtype=torch.long)
+                    chosen_g = union[idx]
+                    if full_graph_mode:
+                        return chosen_g.long()
+                    chosen_l = self._g2l_cpu[chosen_g]
+                    if (self._stamp_cpu[chosen_g] != stamp).any() or (chosen_l < 0).any():
+                        return torch.tensor([int(fallback_local)], dtype=torch.long)
+                    return chosen_l.long()
+            return torch.tensor([int(fallback_global if full_graph_mode else fallback_local)], dtype=torch.long)
+
         chosen_globals: list[int] = []
         chosen_set: set[int] = set()
         chosen_list: list[int] = []
@@ -412,7 +501,7 @@ class NegativeInstanceSampler:
         return False
 
     def get_contrastive_samples(self, z: Tensor, anchor_nodes: Optional[Tensor] = None,
-        n_id: Optional[Tensor] = None):
+        n_id: Optional[Tensor] = None, anchor_nodes_are_unique: bool = False):
         """   Returns: (z_anchor, z_shared_neg, z_pos_to_u_neg, z_neg_to_u_pos, z_shared_pos)
         with shapes:
             z_anchor: (B,D)
@@ -429,8 +518,14 @@ class NegativeInstanceSampler:
                     anchor_globals_cpu = torch.tensor(self._anchors_with_pool, dtype=torch.long)
                 else:
                     anchor_globals_cpu = torch.tensor(self.anchors, dtype=torch.long)
-            else: anchor_globals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
+            else:
+                anchor_globals_cpu = anchor_nodes.detach().long().cpu()
+                if not anchor_nodes_are_unique:
+                    anchor_globals_cpu = torch.unique(anchor_globals_cpu)
             anchor_globals_cpu = anchor_globals_cpu[(anchor_globals_cpu >= 0) & (anchor_globals_cpu < self.num_nodes)]
+            if self._has_pool_mask is not None and anchor_nodes is not None and anchor_nodes.numel() > 0:
+                mask = self._has_pool_mask[anchor_globals_cpu]
+                anchor_globals_cpu = anchor_globals_cpu[mask]
 
             anchors_cpu: List[int] = []
             shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
@@ -442,16 +537,27 @@ class NegativeInstanceSampler:
                         continue
                 elif not self._has_any_pool(u):
                     continue
-                pred_order = self._pred_priority(u)
+                pred_order_shneg = (self._pred_order_nonempty_shared_neg[u]
+                    if self._pred_order_nonempty_shared_neg is not None else None)
+                pred_order_pos2neg = (self._pred_order_nonempty_pos_to_u_neg[u]
+                    if self._pred_order_nonempty_pos_to_u_neg is not None else None)
+                pred_order_neg2pos = (self._pred_order_nonempty_neg_to_u_pos[u]
+                    if self._pred_order_nonempty_neg_to_u_pos is not None else None)
+                pred_order_shpos = (self._pred_order_nonempty_shared_pos[u]
+                    if self._pred_order_nonempty_shared_pos is not None else None)
+                if pred_order_shneg is None: pred_order_shneg = self._pred_priority(u)
+                if pred_order_pos2neg is None: pred_order_pos2neg = self._pred_priority(u)
+                if pred_order_neg2pos is None: pred_order_neg2pos = self._pred_priority(u)
+                if pred_order_shpos is None: pred_order_shpos = self._pred_priority(u)
 
                 anchors_cpu.append(u)
-                shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u], pred_order, stamp=0,
+                shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u], pred_order_shneg, stamp=0,
                                             fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                pos2neg_cpu.append(self._sample_k_priority_cpu(self.pool_pos_to_u_neg_by_pred[u], pred_order, stamp=0,
+                pos2neg_cpu.append(self._sample_k_priority_cpu(self.pool_pos_to_u_neg_by_pred[u], pred_order_pos2neg, stamp=0,
                                             fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                neg2pos_cpu.append(self._sample_k_priority_cpu(self.pool_neg_to_u_pos_by_pred[u], pred_order, stamp=0,
+                neg2pos_cpu.append(self._sample_k_priority_cpu(self.pool_neg_to_u_pos_by_pred[u], pred_order_neg2pos, stamp=0,
                                             fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u], pred_order, stamp=0,
+                shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u], pred_order_shpos, stamp=0,
                                             fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
 
             if not anchors_cpu:
@@ -487,19 +593,16 @@ class NegativeInstanceSampler:
             anchor_locals_cpu = self._g2l_cpu[anchor_globals_cpu]
         else:
             # In your code, anchor_nodes are LOCAL indices when n_id is not None.
-            anchor_locals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
+            anchor_locals_cpu = anchor_nodes.detach().long().cpu()
+            if not anchor_nodes_are_unique:
+                anchor_locals_cpu = torch.unique(anchor_locals_cpu)
             # safety filter
             anchor_locals_cpu = anchor_locals_cpu[(anchor_locals_cpu >= 0) & (anchor_locals_cpu < n_id_cpu.numel())]
             anchor_globals_cpu = n_id_cpu[anchor_locals_cpu]
-            if self._anchors_with_pool_set is not None and anchor_globals_cpu.numel() > 0:
-                keep = [int(g) in self._anchors_with_pool_set for g in anchor_globals_cpu.tolist()]
-                if any(keep):
-                    keep_t = torch.tensor(keep, dtype=torch.bool)
-                    anchor_globals_cpu = anchor_globals_cpu[keep_t]
-                    anchor_locals_cpu = anchor_locals_cpu[keep_t]
-                else:
-                    anchor_globals_cpu = anchor_globals_cpu[:0]
-                    anchor_locals_cpu = anchor_locals_cpu[:0]
+            if self._has_pool_mask is not None and anchor_globals_cpu.numel() > 0:
+                mask = self._has_pool_mask[anchor_globals_cpu]
+                anchor_globals_cpu = anchor_globals_cpu[mask]
+                anchor_locals_cpu = anchor_locals_cpu[mask]
 
         anchors_local_cpu: List[int] = []
         shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
@@ -513,14 +616,25 @@ class NegativeInstanceSampler:
                 continue
 
             anchors_local_cpu.append(u_l)
-            pred_order = self._pred_priority(u_g)
-            shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u_g], pred_order, stamp=stamp,
+            pred_order_shneg = (self._pred_order_nonempty_shared_neg[u_g]
+                if self._pred_order_nonempty_shared_neg is not None else None)
+            pred_order_pos2neg = (self._pred_order_nonempty_pos_to_u_neg[u_g]
+                if self._pred_order_nonempty_pos_to_u_neg is not None else None)
+            pred_order_neg2pos = (self._pred_order_nonempty_neg_to_u_pos[u_g]
+                if self._pred_order_nonempty_neg_to_u_pos is not None else None)
+            pred_order_shpos = (self._pred_order_nonempty_shared_pos[u_g]
+                if self._pred_order_nonempty_shared_pos is not None else None)
+            if pred_order_shneg is None: pred_order_shneg = self._pred_priority(u_g)
+            if pred_order_pos2neg is None: pred_order_pos2neg = self._pred_priority(u_g)
+            if pred_order_neg2pos is None: pred_order_neg2pos = self._pred_priority(u_g)
+            if pred_order_shpos is None: pred_order_shpos = self._pred_priority(u_g)
+            shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u_g], pred_order_shneg, stamp=stamp,
                                         fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            pos2neg_cpu.append(self._sample_k_priority_cpu(self.pool_pos_to_u_neg_by_pred[u_g], pred_order, stamp=stamp,
+            pos2neg_cpu.append(self._sample_k_priority_cpu(self.pool_pos_to_u_neg_by_pred[u_g], pred_order_pos2neg, stamp=stamp,
                                         fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            neg2pos_cpu.append(self._sample_k_priority_cpu(self.pool_neg_to_u_pos_by_pred[u_g], pred_order, stamp=stamp,
+            neg2pos_cpu.append(self._sample_k_priority_cpu(self.pool_neg_to_u_pos_by_pred[u_g], pred_order_neg2pos, stamp=stamp,
                                         fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u_g], pred_order, stamp=stamp,
+            shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u_g], pred_order_shpos, stamp=stamp,
                                         fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
 
         if not anchors_local_cpu:
