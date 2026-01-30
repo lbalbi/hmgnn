@@ -78,6 +78,8 @@ class GCN(nn.Module):
         edges = []
         for (s, r, d), eidx in data.edge_index_dict.items():
             if s == self.n_type and d == self.n_type:
+                if r == "cls_link":
+                    continue
                 edges.append(eidx)
 
         if len(edges) == 0:

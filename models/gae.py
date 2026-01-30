@@ -195,6 +195,8 @@ class GCN_GAE(nn.Module):
         for et, store in data.edge_items():
             # data.edge_items() yields ((src, rel, dst), edge_store)
             if isinstance(et, tuple) and len(et) == 3:
+                if et[1] == "cls_link":
+                    continue
                 if "edge_index" in store and store.edge_index is not None and store.edge_index.numel() > 0:
                     parts.append(store.edge_index)
         if not parts:

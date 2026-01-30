@@ -1,4 +1,5 @@
 import random
+import time
 from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor
@@ -49,6 +50,17 @@ class NegativeInstanceSampler:
         self._pred_order_nonempty_shared_neg: Optional[List[Optional[list[str]]]] = None
         self._pred_order_nonempty_pos_to_u_neg: Optional[List[Optional[list[str]]]] = None
         self._pred_order_nonempty_neg_to_u_pos: Optional[List[Optional[list[str]]]] = None
+        self._pools_shared_pos_ordered: Optional[List[Optional[List[Tensor]]]] = None
+        self._pools_shared_neg_ordered: Optional[List[Optional[List[Tensor]]]] = None
+        self._pools_pos_to_u_neg_ordered: Optional[List[Optional[List[Tensor]]]] = None
+        self._pools_neg_to_u_pos_ordered: Optional[List[Optional[List[Tensor]]]] = None
+        self._pools_shared_pos_nonempty: Optional[List[Optional[List[Tensor]]]] = None
+        self._pools_shared_neg_nonempty: Optional[List[Optional[List[Tensor]]]] = None
+        self._pools_pos_to_u_neg_nonempty: Optional[List[Optional[List[Tensor]]]] = None
+        self._pools_neg_to_u_pos_nonempty: Optional[List[Optional[List[Tensor]]]] = None
+        self.timing_profile: bool = False
+        self.last_timing: Optional[Dict[str, float]] = None
+        self.last_stats: Optional[Dict[str, float]] = None
 
 
     @staticmethod
@@ -121,6 +133,7 @@ class NegativeInstanceSampler:
             self._stamp_cpu.zero_()
             self._cur_stamp = 1
         return self._cur_stamp
+
 
     @staticmethod
     def _choose_indices(n: int, k: int) -> Tensor:
@@ -259,7 +272,7 @@ class NegativeInstanceSampler:
                     neg_cls, class2neg_by_pred.get(pred, {}), exclude=u)
                 self.pool_pos_to_u_neg_by_pred[u][pred] = self._collect_instances(
                     neg_cls, class2pos_by_pred.get(pred, {}), exclude=u)
-        self.pool_neg_to_u_pos_by_pred[u][pred] = self._collect_instances(
+                self.pool_neg_to_u_pos_by_pred[u][pred] = self._collect_instances(
                     pos_cls, class2neg_by_pred.get(pred, {}), exclude=u)
         self._g2l_cpu = torch.empty(self.num_nodes, dtype=torch.long)
         self._stamp_cpu = torch.zeros(self.num_nodes, dtype=torch.int32)
@@ -294,6 +307,14 @@ class NegativeInstanceSampler:
             self._pred_order_nonempty_shared_neg = []
             self._pred_order_nonempty_pos_to_u_neg = []
             self._pred_order_nonempty_neg_to_u_pos = []
+            self._pools_shared_pos_ordered = []
+            self._pools_shared_neg_ordered = []
+            self._pools_pos_to_u_neg_ordered = []
+            self._pools_neg_to_u_pos_ordered = []
+            self._pools_shared_pos_nonempty = []
+            self._pools_shared_neg_nonempty = []
+            self._pools_pos_to_u_neg_nonempty = []
+            self._pools_neg_to_u_pos_nonempty = []
             return
         self._anchors_with_pool = []
         self._anchors_with_pool_set = set()
@@ -303,6 +324,14 @@ class NegativeInstanceSampler:
         self._pred_order_nonempty_shared_neg = [None for _ in range(self.num_nodes)]
         self._pred_order_nonempty_pos_to_u_neg = [None for _ in range(self.num_nodes)]
         self._pred_order_nonempty_neg_to_u_pos = [None for _ in range(self.num_nodes)]
+        self._pools_shared_pos_ordered = [None for _ in range(self.num_nodes)]
+        self._pools_shared_neg_ordered = [None for _ in range(self.num_nodes)]
+        self._pools_pos_to_u_neg_ordered = [None for _ in range(self.num_nodes)]
+        self._pools_neg_to_u_pos_ordered = [None for _ in range(self.num_nodes)]
+        self._pools_shared_pos_nonempty = [None for _ in range(self.num_nodes)]
+        self._pools_shared_neg_nonempty = [None for _ in range(self.num_nodes)]
+        self._pools_pos_to_u_neg_nonempty = [None for _ in range(self.num_nodes)]
+        self._pools_neg_to_u_pos_nonempty = [None for _ in range(self.num_nodes)]
         for u in self.anchors:
             if 0 <= u < self.num_nodes:
                 pred_order = self._pred_priority_uncached(u)
@@ -317,42 +346,87 @@ class NegativeInstanceSampler:
                     self._pred_order_nonempty_shared_pos[u] = [
                         p for p in pred_order if (p in pools and pools[p].numel() > 0)
                     ]
+                    preds = self._pred_order_nonempty_shared_pos[u] or []
+                    pools_list = [pools[p] for p in preds]
+                    self._pools_shared_pos_ordered[u] = pools_list
+                    self._pools_shared_pos_nonempty[u] = [p for p in pools_list if p.numel() > 0]
                 if self.pool_shared_neg_by_pred is not None:
                     pools = self.pool_shared_neg_by_pred[u]
                     self._pred_order_nonempty_shared_neg[u] = [
                         p for p in pred_order if (p in pools and pools[p].numel() > 0)
                     ]
+                    preds = self._pred_order_nonempty_shared_neg[u] or []
+                    pools_list = [pools[p] for p in preds]
+                    self._pools_shared_neg_ordered[u] = pools_list
+                    self._pools_shared_neg_nonempty[u] = [p for p in pools_list if p.numel() > 0]
                 if self.pool_pos_to_u_neg_by_pred is not None:
                     pools = self.pool_pos_to_u_neg_by_pred[u]
                     self._pred_order_nonempty_pos_to_u_neg[u] = [
                         p for p in pred_order if (p in pools and pools[p].numel() > 0)
                     ]
+                    preds = self._pred_order_nonempty_pos_to_u_neg[u] or []
+                    pools_list = [pools[p] for p in preds]
+                    self._pools_pos_to_u_neg_ordered[u] = pools_list
+                    self._pools_pos_to_u_neg_nonempty[u] = [p for p in pools_list if p.numel() > 0]
                 if self.pool_neg_to_u_pos_by_pred is not None:
                     pools = self.pool_neg_to_u_pos_by_pred[u]
                     self._pred_order_nonempty_neg_to_u_pos[u] = [
                         p for p in pred_order if (p in pools and pools[p].numel() > 0)
                     ]
+                    preds = self._pred_order_nonempty_neg_to_u_pos[u] or []
+                    pools_list = [pools[p] for p in preds]
+                    self._pools_neg_to_u_pos_ordered[u] = pools_list
+                    self._pools_neg_to_u_pos_nonempty[u] = [p for p in pools_list if p.numel() > 0]
 
 
-    def _sample_k_priority_cpu(self, pools_by_pred: dict, pred_order: list[str], *, stamp: int,
-        fallback_global: int, fallback_local: int, k: int, full_graph_mode: bool) -> torch.Tensor:
+    def _sample_k_priority_cpu(self, pools_in_order: Optional[List[Tensor]],
+        pools_nonempty: Optional[List[Tensor]], *, stamp: int,
+        fallback_global: int, fallback_local: int, k: int, full_graph_mode: bool,
+        stats: Optional[Dict[str, float]] = None) -> torch.Tensor:
+        pools_in_order = pools_in_order or []
+        pools_nonempty = pools_nonempty or pools_in_order
+        if stats is not None:
+            stats["calls"] += 1
         if k == 1:
             # Fast path: pick a single example without building exclusion sets.
             if full_graph_mode:
-                for pred in pred_order:
-                    pool_g = pools_by_pred.get(pred, None)
-                    if pool_g is None or pool_g.numel() == 0:
-                        continue
-                    idx = torch.randint(0, int(pool_g.numel()), (1,), dtype=torch.long)
-                    return pool_g[idx].long()
+                if pools_nonempty:
+                    if stats is not None:
+                        stats["pools_checked"] += 1
+                    pool_g = pools_nonempty[0]
+                    if pool_g.numel() > 0:
+                        idx = torch.randint(0, int(pool_g.numel()), (1,), dtype=torch.long)
+                        return pool_g[idx].long()
             else:
                 assert self._stamp_cpu is not None and self._g2l_cpu is not None
-                for pred in pred_order:
-                    pool_g = pools_by_pred.get(pred, None)
-                    if pool_g is None or pool_g.numel() == 0:
-                        continue
+                if pools_nonempty:
+                    pool_g = pools_nonempty[0]
+                    if stats is not None:
+                        stats["pools_checked"] += 1
                     mask = (self._stamp_cpu[pool_g] == stamp)
                     pool_in = pool_g[mask]
+                    if stats is not None:
+                        stats["pool_in_checks"] += 1
+                        stats["pool_in_total"] += int(pool_in.numel())
+                    if pool_in.numel() > 0:
+                        idx = torch.randint(0, int(pool_in.numel()), (1,), dtype=torch.long)
+                        chosen_g = pool_in[idx]
+                        chosen_l = self._g2l_cpu[chosen_g]
+                        if chosen_l.numel() == 0:
+                            return torch.tensor([int(fallback_local)], dtype=torch.long)
+                        if (self._stamp_cpu[chosen_g] != stamp).any() or (chosen_l < 0).any():
+                            return torch.tensor([int(fallback_local)], dtype=torch.long)
+                        return chosen_l.long()
+                for pool_g in pools_nonempty[1:]:
+                    if pool_g.numel() == 0:
+                        continue
+                    if stats is not None:
+                        stats["pools_checked"] += 1
+                    mask = (self._stamp_cpu[pool_g] == stamp)
+                    pool_in = pool_g[mask]
+                    if stats is not None:
+                        stats["pool_in_checks"] += 1
+                        stats["pool_in_total"] += int(pool_in.numel())
                     if pool_in.numel() == 0:
                         continue
                     idx = torch.randint(0, int(pool_in.numel()), (1,), dtype=torch.long)
@@ -363,17 +437,24 @@ class NegativeInstanceSampler:
                     if (self._stamp_cpu[chosen_g] != stamp).any() or (chosen_l < 0).any():
                         return torch.tensor([int(fallback_local)], dtype=torch.long)
                     return chosen_l.long()
-            # fallback: union across predicates
+            # fallback: union across predicates (built on the fly)
             all_parts = []
-            for pred in pred_order:
-                p = pools_by_pred.get(pred, None)
-                if p is None or p.numel() == 0:
+            for p in pools_in_order:
+                if p.numel() == 0:
                     continue
                 if full_graph_mode:
+                    if stats is not None:
+                        stats["pools_checked"] += 1
                     all_parts.append(p)
                 else:
+                    if stats is not None:
+                        stats["pools_checked"] += 1
                     mask = (self._stamp_cpu[p] == stamp)
-                    all_parts.append(p[mask])
+                    p_in = p[mask]
+                    if stats is not None:
+                        stats["pool_in_checks"] += 1
+                        stats["pool_in_total"] += int(p_in.numel())
+                    all_parts.append(p_in)
             if all_parts:
                 union = torch.unique(torch.cat(all_parts, dim=0))
                 if union.numel() > 0:
@@ -385,6 +466,8 @@ class NegativeInstanceSampler:
                     if (self._stamp_cpu[chosen_g] != stamp).any() or (chosen_l < 0).any():
                         return torch.tensor([int(fallback_local)], dtype=torch.long)
                     return chosen_l.long()
+            if stats is not None:
+                stats["fallback"] += 1
             return torch.tensor([int(fallback_global if full_graph_mode else fallback_local)], dtype=torch.long)
 
         chosen_globals: list[int] = []
@@ -413,15 +496,21 @@ class NegativeInstanceSampler:
             if globals_.numel() == 0:
                 return globals_
             if full_graph_mode:
+                if stats is not None:
+                    stats["pools_checked"] += 1
                 return globals_
-            # neighbor-mode filter (globals only)
+            if stats is not None:
+                stats["pools_checked"] += 1
             mask = (self._stamp_cpu[globals_] == stamp)
-            return globals_[mask]
+            pool_in = globals_[mask]
+            if stats is not None:
+                stats["pool_in_checks"] += 1
+                stats["pool_in_total"] += int(pool_in.numel())
+            return pool_in
 
         # take from predicates in priority order
-        for pred in pred_order:
-            pool_g = pools_by_pred.get(pred, None)
-            if pool_g is None or pool_g.numel() == 0:
+        for pool_g in pools_in_order:
+            if pool_g.numel() == 0:
                 continue
             pool_g = _filter_in_batch(pool_g)
             if pool_g.numel() == 0:
@@ -451,9 +540,8 @@ class NegativeInstanceSampler:
         # fallback: union across predicates (still global ids)
         if len(chosen_globals) < k:
             all_parts = []
-            for pred in pred_order:
-                p = pools_by_pred.get(pred, None)
-                if p is None or p.numel() == 0:
+            for p in pools_in_order:
+                if p.numel() == 0:
                     continue
                 all_parts.append(_filter_in_batch(p))
             if all_parts:
@@ -463,12 +551,12 @@ class NegativeInstanceSampler:
                         chosen_t = _ensure_chosen_tensor(union.dtype)
                         if chosen_t is not None:
                             union = union[~torch.isin(union, chosen_t)]
-                        # mask = torch.tensor([int(x) not in chosen_set for x in union.tolist()], dtype=torch.bool)
-                        # union = union[mask]
                     if union.numel() > 0:
                         need = k - len(chosen_globals)
                         idx = self._choose_indices(int(union.numel()), need)
                         chosen_globals.extend([int(x) for x in union[idx].tolist()])
+            if stats is not None:
+                stats["fallback"] += 1
 
         # pad with GLOBAL fallback
         if len(chosen_globals) < k:
@@ -511,8 +599,15 @@ class NegativeInstanceSampler:
         device = z.device
         B_rows, D = z.shape
         k = self.k
+        t_start = time.perf_counter() if self.timing_profile else 0.0
+        t_anchor = t_loop = t_assemble = 0.0
 
         if n_id is None:
+            stats = None
+            if self.timing_profile:
+                stats = {"pools_checked": 0.0, "fallback": 0.0, "pool_in_checks": 0.0,
+                         "pool_in_total": 0.0, "calls": 0.0}
+            t_a0 = time.perf_counter() if self.timing_profile else 0.0
             if anchor_nodes is None or anchor_nodes.numel() == 0:
                 if self._anchors_with_pool is not None and len(self._anchors_with_pool) > 0:
                     anchor_globals_cpu = torch.tensor(self._anchors_with_pool, dtype=torch.long)
@@ -523,13 +618,16 @@ class NegativeInstanceSampler:
                 if not anchor_nodes_are_unique:
                     anchor_globals_cpu = torch.unique(anchor_globals_cpu)
             anchor_globals_cpu = anchor_globals_cpu[(anchor_globals_cpu >= 0) & (anchor_globals_cpu < self.num_nodes)]
-            if self._has_pool_mask is not None and anchor_nodes is not None and anchor_nodes.numel() > 0:
+            if self._has_pool_mask is not None:
                 mask = self._has_pool_mask[anchor_globals_cpu]
                 anchor_globals_cpu = anchor_globals_cpu[mask]
+            if self.timing_profile:
+                t_anchor = time.perf_counter() - t_a0
 
             anchors_cpu: List[int] = []
             shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
 
+            t_l0 = time.perf_counter() if self.timing_profile else 0.0
             for u in anchor_globals_cpu.tolist():
                 
                 if self._anchors_with_pool_set is not None:
@@ -537,43 +635,55 @@ class NegativeInstanceSampler:
                         continue
                 elif not self._has_any_pool(u):
                     continue
-                pred_order_shneg = (self._pred_order_nonempty_shared_neg[u]
-                    if self._pred_order_nonempty_shared_neg is not None else None)
-                pred_order_pos2neg = (self._pred_order_nonempty_pos_to_u_neg[u]
-                    if self._pred_order_nonempty_pos_to_u_neg is not None else None)
-                pred_order_neg2pos = (self._pred_order_nonempty_neg_to_u_pos[u]
-                    if self._pred_order_nonempty_neg_to_u_pos is not None else None)
-                pred_order_shpos = (self._pred_order_nonempty_shared_pos[u]
-                    if self._pred_order_nonempty_shared_pos is not None else None)
-                if pred_order_shneg is None: pred_order_shneg = self._pred_priority(u)
-                if pred_order_pos2neg is None: pred_order_pos2neg = self._pred_priority(u)
-                if pred_order_neg2pos is None: pred_order_neg2pos = self._pred_priority(u)
-                if pred_order_shpos is None: pred_order_shpos = self._pred_priority(u)
-
                 anchors_cpu.append(u)
-                shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u], pred_order_shneg, stamp=0,
-                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                pos2neg_cpu.append(self._sample_k_priority_cpu(self.pool_pos_to_u_neg_by_pred[u], pred_order_pos2neg, stamp=0,
-                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                neg2pos_cpu.append(self._sample_k_priority_cpu(self.pool_neg_to_u_pos_by_pred[u], pred_order_neg2pos, stamp=0,
-                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u], pred_order_shpos, stamp=0,
-                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
+                shneg_cpu.append(self._sample_k_priority_cpu(self._pools_shared_neg_ordered[u], self._pools_shared_neg_nonempty[u], stamp=0,
+                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True, stats=stats).unsqueeze(0))
+                pos2neg_cpu.append(self._sample_k_priority_cpu(self._pools_pos_to_u_neg_ordered[u], self._pools_pos_to_u_neg_nonempty[u], stamp=0,
+                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True, stats=stats).unsqueeze(0))
+                neg2pos_cpu.append(self._sample_k_priority_cpu(self._pools_neg_to_u_pos_ordered[u], self._pools_neg_to_u_pos_nonempty[u], stamp=0,
+                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True, stats=stats).unsqueeze(0))
+                shpos_cpu.append(self._sample_k_priority_cpu(self._pools_shared_pos_ordered[u], self._pools_shared_pos_nonempty[u], stamp=0,
+                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True, stats=stats).unsqueeze(0))
+            if self.timing_profile:
+                t_loop = time.perf_counter() - t_l0
 
             if not anchors_cpu:
                 empty = torch.empty(0, D, device=device)
                 empty_k = torch.empty(0, k, D, device=device)
+                if self.timing_profile:
+                    self.last_timing = {
+                        "anchor": t_anchor,
+                        "loop": t_loop,
+                        "assemble": 0.0,
+                        "total": time.perf_counter() - t_start,
+                    }
+                    self.last_stats = stats
                 return empty, empty_k, empty_k, empty_k, empty_k
 
+            t_c0 = time.perf_counter() if self.timing_profile else 0.0
             anchors = torch.tensor(anchors_cpu, dtype=torch.long, device=device)
             shneg = torch.cat(shneg_cpu, dim=0).to(device)
             pos2neg = torch.cat(pos2neg_cpu, dim=0).to(device)
             neg2pos = torch.cat(neg2pos_cpu, dim=0).to(device)
             shpos = torch.cat(shpos_cpu, dim=0).to(device)
+            if self.timing_profile:
+                t_assemble = time.perf_counter() - t_c0
+                self.last_timing = {
+                    "anchor": t_anchor,
+                    "loop": t_loop,
+                    "assemble": t_assemble,
+                    "total": time.perf_counter() - t_start,
+                }
+                self.last_stats = stats
             return z[anchors], z[shneg], z[pos2neg], z[neg2pos], z[shpos]
 
         assert self._stamp_cpu is not None and self._g2l_cpu is not None
 
+        stats = None
+        if self.timing_profile:
+            stats = {"pools_checked": 0.0, "fallback": 0.0, "pool_in_checks": 0.0,
+                     "pool_in_total": 0.0, "calls": 0.0}
+        t_a0 = time.perf_counter() if self.timing_profile else 0.0
         n_id_cpu = n_id.detach().long().cpu()
         stamp = self._bump_stamp()
 
@@ -603,10 +713,13 @@ class NegativeInstanceSampler:
                 mask = self._has_pool_mask[anchor_globals_cpu]
                 anchor_globals_cpu = anchor_globals_cpu[mask]
                 anchor_locals_cpu = anchor_locals_cpu[mask]
+        if self.timing_profile:
+            t_anchor = time.perf_counter() - t_a0
 
         anchors_local_cpu: List[int] = []
         shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
 
+        t_l0 = time.perf_counter() if self.timing_profile else 0.0
         for u_g, u_l in zip(anchor_globals_cpu.tolist(), anchor_locals_cpu.tolist()):
             if u_l < 0: continue
             if self._anchors_with_pool_set is not None:
@@ -616,35 +729,43 @@ class NegativeInstanceSampler:
                 continue
 
             anchors_local_cpu.append(u_l)
-            pred_order_shneg = (self._pred_order_nonempty_shared_neg[u_g]
-                if self._pred_order_nonempty_shared_neg is not None else None)
-            pred_order_pos2neg = (self._pred_order_nonempty_pos_to_u_neg[u_g]
-                if self._pred_order_nonempty_pos_to_u_neg is not None else None)
-            pred_order_neg2pos = (self._pred_order_nonempty_neg_to_u_pos[u_g]
-                if self._pred_order_nonempty_neg_to_u_pos is not None else None)
-            pred_order_shpos = (self._pred_order_nonempty_shared_pos[u_g]
-                if self._pred_order_nonempty_shared_pos is not None else None)
-            if pred_order_shneg is None: pred_order_shneg = self._pred_priority(u_g)
-            if pred_order_pos2neg is None: pred_order_pos2neg = self._pred_priority(u_g)
-            if pred_order_neg2pos is None: pred_order_neg2pos = self._pred_priority(u_g)
-            if pred_order_shpos is None: pred_order_shpos = self._pred_priority(u_g)
-            shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u_g], pred_order_shneg, stamp=stamp,
-                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            pos2neg_cpu.append(self._sample_k_priority_cpu(self.pool_pos_to_u_neg_by_pred[u_g], pred_order_pos2neg, stamp=stamp,
-                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            neg2pos_cpu.append(self._sample_k_priority_cpu(self.pool_neg_to_u_pos_by_pred[u_g], pred_order_neg2pos, stamp=stamp,
-                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-            shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u_g], pred_order_shpos, stamp=stamp,
-                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+            shneg_cpu.append(self._sample_k_priority_cpu(self._pools_shared_neg_ordered[u_g], self._pools_shared_neg_nonempty[u_g], stamp=stamp,
+                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False, stats=stats).unsqueeze(0))
+            pos2neg_cpu.append(self._sample_k_priority_cpu(self._pools_pos_to_u_neg_ordered[u_g], self._pools_pos_to_u_neg_nonempty[u_g], stamp=stamp,
+                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False, stats=stats).unsqueeze(0))
+            neg2pos_cpu.append(self._sample_k_priority_cpu(self._pools_neg_to_u_pos_ordered[u_g], self._pools_neg_to_u_pos_nonempty[u_g], stamp=stamp,
+                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False, stats=stats).unsqueeze(0))
+            shpos_cpu.append(self._sample_k_priority_cpu(self._pools_shared_pos_ordered[u_g], self._pools_shared_pos_nonempty[u_g], stamp=stamp,
+                                        fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False, stats=stats).unsqueeze(0))
+        if self.timing_profile:
+            t_loop = time.perf_counter() - t_l0
 
         if not anchors_local_cpu:
             empty = torch.empty(0, D, device=device)
             empty_k = torch.empty(0, k, D, device=device)
+            if self.timing_profile:
+                self.last_timing = {
+                    "anchor": t_anchor,
+                    "loop": t_loop,
+                    "assemble": 0.0,
+                    "total": time.perf_counter() - t_start,
+                }
+                self.last_stats = stats
             return empty, empty_k, empty_k, empty_k, empty_k
 
+        t_c0 = time.perf_counter() if self.timing_profile else 0.0
         anchors_local = torch.tensor(anchors_local_cpu, dtype=torch.long, device=device)
         shneg = torch.cat(shneg_cpu, dim=0).to(device)
         pos2neg = torch.cat(pos2neg_cpu, dim=0).to(device)
         neg2pos = torch.cat(neg2pos_cpu, dim=0).to(device)
         shpos = torch.cat(shpos_cpu, dim=0).to(device)
+        if self.timing_profile:
+            t_assemble = time.perf_counter() - t_c0
+            self.last_timing = {
+                "anchor": t_anchor,
+                "loop": t_loop,
+                "assemble": t_assemble,
+                "total": time.perf_counter() - t_start,
+            }
+            self.last_stats = stats
         return z[anchors_local], z[shneg], z[pos2neg], z[neg2pos], z[shpos]

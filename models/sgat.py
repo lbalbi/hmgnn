@@ -186,6 +186,8 @@ class SGAT(nn.Module):
         for (src, rel, dst) in data.edge_types:
             if src != self.n_type or dst != self.n_type:
                 continue
+            if rel == "cls_link":
+                continue
             store = data[(src, rel, dst)]
             if "edge_index" not in store or store.edge_index is None or store.edge_index.numel() == 0:
                 continue

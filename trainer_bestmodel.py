@@ -1,4 +1,5 @@
 import time
+import os
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple, List
@@ -66,6 +67,8 @@ class Train_BestModel:
         self.contrastive_temperature_init = float(contrastive_temperature)
         self.timing_profile = bool(timing_profile)
         self.dual_view = bool(getattr(self.model, "dual_view", False))
+        if self.contrastive_sampler is not None:
+            self.contrastive_sampler.timing_profile = self.timing_profile
         if contrastive_sampler is not None:
             self.contrastive_loss_fn = self._make_contrastive_loss_fn(self.dual_view, self.contrastive_temperature_init)
         else: self.contrastive_loss_fn = None
@@ -195,6 +198,8 @@ class Train_BestModel:
         if self.timing_profile:
             t_cpu = t_to = t_encode = t_loss = t_contr = t_bwd = 0.0
             t_contr_sample = t_contr_loss = 0.0
+            t_contr_anchor = t_contr_loop = t_contr_assemble = 0.0
+            stats_pools_checked = stats_pool_in_avg = stats_fallback = stats_calls = 0.0
             n_batches = 0
 
         for batch in self.loader:
@@ -264,6 +269,21 @@ class Train_BestModel:
                 )
                 if self.timing_profile:
                     t_contr_sample += time.perf_counter() - t4
+                    if self.contrastive_sampler is not None and self.contrastive_sampler.last_timing is not None:
+                        lt = self.contrastive_sampler.last_timing
+                        t_contr_anchor += float(lt.get("anchor", 0.0))
+                        t_contr_loop += float(lt.get("loop", 0.0))
+                        t_contr_assemble += float(lt.get("assemble", 0.0))
+                    if self.contrastive_sampler is not None and self.contrastive_sampler.last_stats is not None:
+                        st = self.contrastive_sampler.last_stats
+                        pools_checked = float(st.get("pools_checked", 0.0))
+                        pool_in_checks = float(st.get("pool_in_checks", 0.0))
+                        pool_in_total = float(st.get("pool_in_total", 0.0))
+                        stats_pools_checked += pools_checked
+                        stats_fallback += float(st.get("fallback", 0.0))
+                        stats_calls += float(st.get("calls", 0.0))
+                        if pool_in_checks > 0:
+                            stats_pool_in_avg += (pool_in_total / pool_in_checks)
                     t5 = time.perf_counter()
                 contr_loss = self.contrastive_loss_fn(*samples)
                 loss = loss + self.contrastive_weight * contr_loss
@@ -292,7 +312,13 @@ class Train_BestModel:
                 f"[Timing][final-train] batches={n_batches} total={total_t:.2f}s | "
                 f"cpu={t_cpu:.2f}s to_device={t_to:.2f}s encode={t_encode:.2f}s "
                 f"loss={t_loss:.2f}s contr={t_contr:.2f}s "
-                f"(sample={t_contr_sample:.2f}s loss={t_contr_loss:.2f}s) "
+                f"(sample={t_contr_sample:.2f}s "
+                f"anchor={t_contr_anchor:.2f}s loop={t_contr_loop:.2f}s "
+                f"assemble={t_contr_assemble:.2f}s loss={t_contr_loss:.2f}s "
+                f"pools={stats_pools_checked:.0f} calls={stats_calls:.0f} "
+                f"pool_in_avg={(stats_pool_in_avg / n_batches) if n_batches > 0 else 0.0:.2f} "
+                f"fallback={stats_fallback:.0f} "
+                f"fallback_rate={(stats_fallback / stats_calls) if stats_calls > 0 else 0.0:.3f}) "
                 f"bwd+step={t_bwd:.2f}s"
             )
             if not getattr(self.log, "non_verbose", False):
@@ -597,6 +623,11 @@ class Test_BestModel:
                 all_labels = torch.cat([pos_labels, neg_labels], dim=0)
             else:
                 all_probs, all_labels = pos_probs, pos_labels
+
+            # Save test probabilities and labels in the same output directory as logs/model.
+            save_path = os.path.join(self.log.dir, "test_predictions.pt")
+            torch.save({"probs": all_probs.detach().cpu(),
+                        "labels": all_labels.detach().cpu()}, save_path)
 
             # print("labels mean:", all_labels.float().mean().item())   # in Train_BestModel
             # print("unique labels:", torch.unique(all_labels).tolist())
