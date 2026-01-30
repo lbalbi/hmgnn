@@ -7,7 +7,6 @@
 #SBATCH --nodelist=liseda-01
 #SBATCH --gpus=1
 #SBATCH --partition=gpu_hi
-#SBATCH --chdir=/home/lbalbi/datasets/hmgnn
 
 set -euo pipefail
 
@@ -17,7 +16,7 @@ OUTDIR="${LOG_DIR}/output_wikidata_test_gcn_noCL_${RUN_TAG}"
 LOGFILE="${LOG_DIR}/output_wikidata_test_gcn_noCL_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
-python -u main.py \
+python -u /mnt/datasets/lbalbi/hmgnn/main.py \
   --path "data/wikidata_data" \
   --task "wikidata" \
   --model "gcn" \
