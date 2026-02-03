@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
+mp.set_sharing_strategy('file_system')
 from sklearn.model_selection import StratifiedKFold
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import LinkNeighborLoader
@@ -19,7 +20,12 @@ from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
 from utils import Logger, load_config
 from samplers import (
-    NegativeInstanceSampler, RandomInstanceSampler, PartialInstanceSampler, FileNegativeSampler
+    NegativeEntitySampler,
+    NegativeEntitySampler2,
+    NegativeInstanceSampler,
+    RandomInstanceSampler,
+    PartialInstanceSampler,
+    FileNegativeSampler,
 )
 
 NEG_PREFIX = "NOT_"
@@ -359,6 +365,8 @@ def _append_edges(struct_graph: HeteroData, rel: str, src: torch.Tensor, tgt: to
     rel = str(rel)
     src = src.long()
     tgt = tgt.long()
+    if src.numel() == 0 or tgt.numel() == 0:
+        return
     edge_index = torch.stack([src, tgt], dim=0) if src.numel() else torch.empty(2, 0, dtype=torch.long)
 
     key = ("node", rel, "node")
@@ -589,18 +597,18 @@ def print_pos_neg_summary_train_test(
     *,
     topk: int = 200,
 ) -> None:
-    _p("\n================ POS/NEG COUNTS PER RELATION ================")
+    # _p("\n================ POS/NEG COUNTS PER RELATION ================")
     df_train = _counts_per_relation(train_rels, train_labels, id2rel)
     df_test = _counts_per_relation(test_rels, test_labels, id2rel) if test_rels.numel() else pd.DataFrame()
 
-    _p("\n--- TRAIN (pos/neg/total) ---")
-    _p("(empty)" if len(df_train) == 0 else df_train.head(topk).to_string(index=False))
-
-    _p("\n--- TEST (pos/neg/total) ---")
-    if test_rels.numel() == 0 or len(df_test) == 0:
-        _p("(empty)")
-    else:
-        _p(df_test.head(topk).to_string(index=False))
+    # Per-relation table prints suppressed.
+    # _p("\n--- TRAIN (pos/neg/total) ---")
+    # _p("(empty)" if len(df_train) == 0 else df_train.head(topk).to_string(index=False))
+    # _p("\n--- TEST (pos/neg/total) ---")
+    # if test_rels.numel() == 0 or len(df_test) == 0:
+    #     _p("(empty)")
+    # else:
+    #     _p(df_test.head(topk).to_string(index=False))
 
     if train_rels.numel():
         _p("\n--- TRAIN totals ---")
@@ -840,8 +848,8 @@ def make_rel_label_strat_y(rels: torch.Tensor, labels: torch.Tensor) -> np.ndarr
 
 def main():
     import resource
-    print("RLIMIT_NOFILE:", resource.getrlimit(resource.RLIMIT_NOFILE))
-    print("Open FDs now:", len(os.listdir("/proc/self/fd")))
+    # _p("RLIMIT_NOFILE:", resource.getrlimit(resource.RLIMIT_NOFILE))
+    # _p("Open FDs now:", len(os.listdir("/proc/self/fd")))
 
     import argparse
     parser = argparse.ArgumentParser()
@@ -860,11 +868,14 @@ def main():
     parser.add_argument("--use_nstatementsampler", action="store_true")
     parser.add_argument("--use_pstatementsampler", action="store_true")
     parser.add_argument("--use_rstatement_sampler", action="store_true")
+    parser.add_argument("--use_negativeentity_sampler", action="store_true")
+    parser.add_argument("--use_negativeentity_sampler2", action="store_true")
     parser.add_argument("--no_contrastive", action="store_true")
     parser.add_argument("--finaltrain_only", action="store_true")
     parser.add_argument("--test_only", action="store_true")
     parser.add_argument("--final_lr", type=float, default=None)
     parser.add_argument("--final_epochs", type=int, default=None)
+    parser.add_argument("--final_contrastive_temperature", type=float, default=None)
 
     parser.add_argument("--balanced_test_ratio", type=float, default=0.20)
     parser.add_argument("--balanced_seed", type=int, default=42)
@@ -876,11 +887,12 @@ def main():
     parser.add_argument("--parallel_grid_workers", type=int, default=None)
     parser.add_argument("--parallel_grid_loader_workers", type=int, default=None)
     parser.add_argument("--parallel_grid_pin_memory", action="store_true")
+    parser.add_argument("--contrastive_weight", type=float, default=None)
     args = parser.parse_args()
 
-    print("output_dir:", args.output_dir, flush=True)
+    # _p("output_dir:", args.output_dir, flush=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}", flush=True)
+    _p(f"device: {device}", flush=True)
 
     cfg = load_config(task=args.task)
     ModelCls = eval(args.model.upper()) if args.model != "gae" else eval("GCN_" + args.model.upper())
@@ -899,6 +911,8 @@ def main():
 
     dropout_candidates = [0.2]
     contrastive_weight_candidates = [0.1]
+    if args.contrastive_weight is not None:
+        contrastive_weight_candidates = [float(args.contrastive_weight)]
 
     contrastive_temp_cfg = cfg.get("contrastive_temperature", 0.5)
     contrastive_temp_candidates = (
@@ -928,6 +942,9 @@ def main():
     subclass_rel = str(cfg.get("subclass_rel", "subclass_of"))
     instance_rel = str(cfg.get("instance_rel", "instance_of"))
     contrastive_k = int(cfg.get("contrastive_k", 1))
+    contrastive_pool_cap = int(cfg.get("contrastive_pool_cap", 512))
+    if contrastive_pool_cap <= 0:
+        contrastive_pool_cap = None
 
     dl = DataLoader(
         args.path + "/",
@@ -944,6 +961,8 @@ def main():
     nflag, pflag, rflag = args.use_nstatementsampler, args.use_pstatementsampler, args.use_rstatement_sampler
     use_partial_sampler = nflag or pflag
     use_random_sampler = rflag
+    use_negativeentity_sampler = bool(args.use_negativeentity_sampler)
+    use_negativeentity_sampler2 = bool(args.use_negativeentity_sampler2)
 
     external_edges = dl.get_state_list()
     if nflag:
@@ -966,6 +985,8 @@ def main():
     if inst_set:
         is_instance[torch.tensor(sorted(inst_set), dtype=torch.long)] = True
     print(f"Total instance nodes in graph: {int(is_instance.sum().item())} / {num_nodes}")
+
+    # Anchor coverage vs classification nodes (computed later after cls_* are set)
 
     min_pos_fixed = 80
     cache_path = args.split_cache_path or _make_split_cache_path(
@@ -1124,7 +1145,6 @@ def main():
     print(f"       leftover positives added: {n_left_pos}")
     print(f"       leftover negatives added: {0 if nflag else n_left_neg}")
 
-
     e_etypes_struct = list(struct_graph.edge_types)
     if args.model == "hgcn":
         encoder_graph = build_hgcn_encoder_graph(struct_graph, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX)
@@ -1138,6 +1158,7 @@ def main():
     encoder_e_etypes = MP_EDGE_TYPES
 
     # (suppressed) detailed encoder/classification totals
+
 
     # -----------------------------------------------------------------
     # Classification examples with at least one NEG relation in encoder graph
@@ -1411,11 +1432,16 @@ def main():
         final_epochs = int(args.final_epochs)
         final_dropout = dropout_candidates[0]
         final_contrastive_weight = float(contrastive_weight_candidates[0])
-        final_contrastive_temp_init = float(contrastive_temp_candidates[0])
-        final_contrastive_temperature = float(contrastive_temp_candidates[0])
+        if args.final_contrastive_temperature is not None:
+            final_contrastive_temp_init = float(args.final_contrastive_temperature)
+            final_contrastive_temperature = float(args.final_contrastive_temperature)
+        else:
+            final_contrastive_temp_init = float(contrastive_temp_candidates[0])
+            final_contrastive_temperature = float(contrastive_temp_candidates[0])
         print("\n=== Final-only mode (CV skipped) ===")
         print(f"final_epochs: {final_epochs}")
         print(f"final_lr:     {final_lr}")
+        print(f"final_contrastive_temperature: {final_contrastive_temperature}")
 
     elif args.test_only:
         model_path = os.path.join("output/" + args.output_dir, f"final_model_{args.model}.pt")
@@ -1539,7 +1565,27 @@ def main():
                         elif use_partial_sampler:
                             edges_are_negative = nflag
                             neg_stmt_sampler = PartialInstanceSampler(
-                                k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                                k=contrastive_k,
+                                neg_edges=external_edges,
+                                edges_are_negative=edges_are_negative,
+                            )
+                            neg_stmt_sampler.prepare_global(sampler_graph)
+                        elif use_negativeentity_sampler2:
+                            neg_stmt_sampler = NegativeEntitySampler2(
+                                k=contrastive_k,
+                                max_pool_size=contrastive_pool_cap,
+                                subclass_rel=subclass_rel,
+                                neg_prefix=NEG_PREFIX,
+                                instance_rel=instance_rel,
+                            )
+                            neg_stmt_sampler.prepare_global(sampler_graph)
+                        elif use_negativeentity_sampler:
+                            neg_stmt_sampler = NegativeEntitySampler(
+                                k=contrastive_k,
+                                max_pool_size=contrastive_pool_cap,
+                                subclass_rel=subclass_rel,
+                                neg_prefix=NEG_PREFIX,
+                                instance_rel=instance_rel,
                             )
                             neg_stmt_sampler.prepare_global(sampler_graph)
                         else:
@@ -1631,7 +1677,27 @@ def main():
                     elif use_partial_sampler:
                         edges_are_negative = nflag
                         neg_stmt_sampler = PartialInstanceSampler(
-                            k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                            k=contrastive_k,
+                            neg_edges=external_edges,
+                            edges_are_negative=edges_are_negative,
+                        )
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    elif use_negativeentity_sampler2:
+                        neg_stmt_sampler = NegativeEntitySampler2(
+                            k=contrastive_k,
+                            max_pool_size=contrastive_pool_cap,
+                            subclass_rel=subclass_rel,
+                            neg_prefix=NEG_PREFIX,
+                            instance_rel=instance_rel,
+                        )
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    elif use_negativeentity_sampler:
+                        neg_stmt_sampler = NegativeEntitySampler(
+                            k=contrastive_k,
+                            max_pool_size=contrastive_pool_cap,
+                            subclass_rel=subclass_rel,
+                            neg_prefix=NEG_PREFIX,
+                            instance_rel=instance_rel,
                         )
                         neg_stmt_sampler.prepare_global(sampler_graph)
                     else:
@@ -1742,21 +1808,21 @@ def main():
                 final_contrastive_temperature = float(statistics.median(temps_for_key))
             else:
                 final_contrastive_temperature = float(final_contrastive_temp_init)
-        print("\n=== Cross-validation summary (TRAIN split only) ===")
-        print("Grid aggregates (mean_val_loss ± std over folds):")
+        _p("\n=== Cross-validation summary (TRAIN split only) ===")
+        _p("Grid aggregates (mean_val_loss ± std over folds):")
         for mean_loss, std_loss, n, key in sorted(hp_summary, key=lambda x: (x[0], x[1], x[3][0])):
             lr, d, cw, ct = key
             dtag = "default" if d is None else f"{d:.3g}"
-            print(f"  lr={lr:.3g} | dropout={dtag} | c_w={cw:.3g} | c_t0={ct:.3g} | "
+            _p(f"  lr={lr:.3g} | dropout={dtag} | c_w={cw:.3g} | c_t0={ct:.3g} | "
                   f"mean={mean_loss:.6f} | std={std_loss:.6f} | folds={n}")
         dtag = "default" if final_dropout is None else f"{final_dropout:.3g}"
-        print(f"\nChosen final_lr (best mean over folds): {final_lr:.6g}")
-        print(f"Chosen final_dropout:                    {dtag}")
-        print(f"Chosen final_contrastive_weight:         {final_contrastive_weight:.6g}")
-        print(f"Chosen final_contrastive_temperature:    {final_contrastive_temperature:.6g}")
+        _p(f"\nChosen final_lr (best mean over folds): {final_lr:.6g}")
+        _p(f"Chosen final_dropout:                    {dtag}")
+        _p(f"Chosen final_contrastive_weight:         {final_contrastive_weight:.6g}")
+        _p(f"Chosen final_contrastive_temperature:    {final_contrastive_temperature:.6g}")
         final_key = (final_lr, final_dropout, float(final_contrastive_weight), float(final_contrastive_temp_init))
-        print(f"Epochs for chosen grid key across folds: {hp_to_fold_epochs.get(final_key, [])}")
-        print(f"Chosen final_epochs (median for key):    {final_epochs}")
+        _p(f"Epochs for chosen grid key across folds: {hp_to_fold_epochs.get(final_key, [])}")
+        _p(f"Chosen final_epochs (median for key):    {final_epochs}")
 
 
     # -----------------------------------------------------------------
@@ -1796,12 +1862,35 @@ def main():
             elif use_partial_sampler:
                 edges_are_negative = nflag
                 final_contrastive_sampler = PartialInstanceSampler(
-                    k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                    k=contrastive_k,
+                    neg_edges=external_edges,
+                    edges_are_negative=edges_are_negative,
+                )
+                final_contrastive_sampler.prepare_global(struct_graph)
+            elif use_negativeentity_sampler2:
+                final_contrastive_sampler = NegativeEntitySampler2(
+                    k=contrastive_k,
+                    max_pool_size=contrastive_pool_cap,
+                    subclass_rel=subclass_rel,
+                    neg_prefix=NEG_PREFIX,
+                    instance_rel=instance_rel,
+                )
+                final_contrastive_sampler.prepare_global(struct_graph)
+            elif use_negativeentity_sampler:
+                final_contrastive_sampler = NegativeEntitySampler(
+                    k=contrastive_k,
+                    max_pool_size=contrastive_pool_cap,
+                    subclass_rel=subclass_rel,
+                    neg_prefix=NEG_PREFIX,
+                    instance_rel=instance_rel,
                 )
                 final_contrastive_sampler.prepare_global(struct_graph)
             else:
                 final_contrastive_sampler = NegativeInstanceSampler(
-                    k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel
+                    k=contrastive_k,
+                    subclass_rel=subclass_rel,
+                    neg_prefix=NEG_PREFIX,
+                    instance_rel=instance_rel,
                 )
                 final_contrastive_sampler.prepare_global(struct_graph)
         else:
@@ -1832,7 +1921,7 @@ def main():
             timing_profile=timing_profile,
         )
         final_loss = final_trainer.run()
-        print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}")
+        _p(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}")
     test_log = Logger("test_global", dir=args.output_dir)
 
     import gc
@@ -1868,10 +1957,10 @@ def main():
                 device=torch.device("cpu"))
 
     else:
-        print("[WARN] No TEST negatives found; Test_BestModel may not be able to evaluate properly.")
+        _p("[WARN] No TEST negatives found; Test_BestModel may not be able to evaluate properly.")
 
     cache_path = os.path.join("data/neg_cache", f"test_negs_{args.task}_numneg{args.num_neg_test}.pt")
-    print("neg cache abs path:", os.path.abspath(cache_path))
+    _p("neg cache abs path:", os.path.abspath(cache_path))
 
     tester = Test_BestModel(
         model=final_model,

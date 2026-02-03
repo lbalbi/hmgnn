@@ -4,8 +4,8 @@ import torch.nn as nn
 from typing import Optional, Tuple, List, Dict
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
-from samplers import (NegativeInstanceSampler, PartialInstanceSampler, RandomInstanceSampler)
-from losses import ContrastiveInstanceLoss, DualContrastiveInstanceLoss
+from samplers import NegativeInstanceSampler #, PartialInstanceSampler, RandomInstanceSampler)
+from losses import ContrastiveEntityLoss, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 
 import subprocess
 
@@ -101,6 +101,11 @@ class Train:
         self.cls_edge_type = CLS_EDGE_TYPE
 
     def _make_contrastive_loss_fn(self, dual_view: bool, temperature: float):
+        if bool(getattr(self.contrastive_sampler, "contrastive_entity_pools", False)):
+            loss_fn = ContrastiveEntityLoss(
+                temperature=temperature, learnable_temperature=self.learnable_contrastive_temperature
+            )
+            return loss_fn.to(self.device)
         if dual_view:
             loss_fn = DualContrastiveInstanceLoss(
                 temperature=temperature, learnable_temperature=self.learnable_contrastive_temperature

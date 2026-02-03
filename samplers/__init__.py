@@ -1,4 +1,6 @@
 from .filenegative_sampler import FileNegativeSampler
+from .negativeentitysampler import NegativeEntitySampler
+from .negativeentitysampler2 import NegativeEntitySampler2
 from .negativeinstance_sampler import NegativeInstanceSampler
 from .randominstance_sampler import RandomInstanceSampler
 from .partialinstance_sampler import PartialInstanceSampler

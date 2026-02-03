@@ -60,7 +60,6 @@ class DataLoader:
 
         dfs = []
         for f in edge_files:
-            print(f)
             if f.endswith(".tsv"):
                 df = pd.read_csv(f, sep="\t")
             else:

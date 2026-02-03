@@ -1,4 +1,4 @@
-import random, torch
+import os, random, time, torch
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 from torch_geometric.data import HeteroData
 from .negativeinstance_sampler import NegativeInstanceSampler
@@ -61,6 +61,12 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         self._batch_global_for_row: Optional[torch.Tensor] = None   # CPU [B_rows]
         self._batch_pos_map: Optional[Dict[int, torch.Tensor]] = None  # key(int) -> local inst ids (CPU)
         self._batch_neg_map: Optional[Dict[int, torch.Tensor]] = None  # key(int) -> local inst ids (CPU)
+
+        # Timing diagnostics
+        self._timing = True
+        self._timing_every = int(os.environ.get("RANDOM_SAMPLER_TIMING_EVERY", "50"))
+        self._timing_batch_idx = 0
+        self._timing_sample_idx = 0
 
         print("Using RandomInstanceSampler")
 
@@ -130,6 +136,7 @@ class RandomInstanceSampler(NegativeInstanceSampler):
     # global prep
     # -----------------------
     def prepare_global(self, full_g: HeteroData) -> None:
+        t0 = time.perf_counter()
         if self.seed is not None:
             random.seed(self.seed)
             torch.manual_seed(self.seed)
@@ -158,6 +165,7 @@ class RandomInstanceSampler(NegativeInstanceSampler):
             self._is_instance = None
 
         # collect positive statements per node, per base-rel (typed)
+        t_edges = time.perf_counter()
         self._pos_keys = [[] for _ in range(N)]
         self._pos_by_rel = [dict() for _ in range(N)]
         anchor_sources: set[int] = set(instance_nodes) if instance_nodes else set()
@@ -195,6 +203,7 @@ class RandomInstanceSampler(NegativeInstanceSampler):
                     uni_tmp.setdefault(rid, set()).add(int(cls))
 
         self.anchors = sorted(anchor_sources) if anchor_sources else list(range(N))
+        t_edges_done = time.perf_counter()
 
         # finalize universes
         self._universe_by_rid = {rid: tuple(sorted(list(s))) for rid, s in uni_tmp.items()}
@@ -204,6 +213,7 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         self._global_universe = tuple(sorted(list(all_classes)))
 
         # build synthetic negatives per node, per rel
+        t_corrupt = time.perf_counter()
         self._neg_keys_synth = [[] for _ in range(N)]
         for u in self.anchors:
             # corrupt per rel
@@ -213,8 +223,10 @@ class RandomInstanceSampler(NegativeInstanceSampler):
                 neg_classes = self._corrupt_for_rel(rid, pos_set, n_draw)
                 for c in neg_classes:
                     self._neg_keys_synth[u].append(self._mk_key(rid, int(c)))
+        t_corrupt_done = time.perf_counter()
 
         # Optional external neg statements (typed) indexed by instance for batch augmentation
+        t_ext = time.perf_counter()
         self._ext_neg_by_inst = {}
         warned_pairs = False
         for item in self.external_negs:
@@ -230,12 +242,22 @@ class RandomInstanceSampler(NegativeInstanceSampler):
             rid = self._rel_id(base_rel)
             key = self._mk_key(rid, cls)
             self._ext_neg_by_inst.setdefault(int(inst), []).append(int(key))
+        t_ext_done = time.perf_counter()
 
         if warned_pairs and self.external_negs:
             print(
                 "[RandomInstanceSampler] WARNING: external_negs provided as (src,dst) pairs. "
                 "They will be treated as rel='__external__' and will NOT enforce matching against graph relation types. "
                 "Provide triples (src, rel, dst) for full type-aware behavior."
+            )
+
+        t1 = time.perf_counter()
+        if self._timing:
+            print(
+                "[RandomInstanceSampler][timing][prepare_global] total="
+                f"{t1 - t0:.3f}s edges={t_edges_done - t_edges:.3f}s "
+                f"corrupt={t_corrupt_done - t_corrupt:.3f}s ext={t_ext_done - t_ext:.3f}s "
+                f"anchors={len(self.anchors)} nodes={N}"
             )
 
         # reset batch caches
@@ -247,6 +269,7 @@ class RandomInstanceSampler(NegativeInstanceSampler):
     # batch-local map build (fast)
     # -----------------------
     def prepare_batch(self, batch: HeteroData) -> None:
+        t0 = time.perf_counter()
         ntype = self.node_type or "node"
         if ntype not in batch.node_types:
             ntype = batch.node_types[0]
@@ -262,6 +285,7 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         neg_acc: Dict[int, List[int]] = {}
 
         # iterate batch edges
+        t_edges = time.perf_counter()
         for key, eidx in batch.edge_index_dict.items():
             if not (isinstance(key, tuple) and len(key) == 3):
                 continue
@@ -307,8 +331,10 @@ class RandomInstanceSampler(NegativeInstanceSampler):
             for c, il in zip(cls_g.tolist(), inst_l.tolist()):
                 k_int = self._mk_key(rid, int(c))
                 acc.setdefault(int(k_int), []).append(int(il))
+        t_edges_done = time.perf_counter()
 
         # add external neg statements for instances in batch (cheap)
+        t_ext = time.perf_counter()
         if self._ext_neg_by_inst:
             # map global->local for batch rows
             # (build a tiny dict, avoids O(num_nodes) tensors)
@@ -319,10 +345,22 @@ class RandomInstanceSampler(NegativeInstanceSampler):
                     continue
                 for k_int in keys:
                     neg_acc.setdefault(int(k_int), []).append(int(il))
+        t_ext_done = time.perf_counter()
 
         # unique tensors
+        t_unique = time.perf_counter()
         self._batch_pos_map = {k: torch.unique(torch.tensor(v, dtype=torch.long)) for k, v in pos_acc.items()}
         self._batch_neg_map = {k: torch.unique(torch.tensor(v, dtype=torch.long)) for k, v in neg_acc.items()}
+        t_unique_done = time.perf_counter()
+
+        self._timing_batch_idx += 1
+        if self._timing and (self._timing_batch_idx % self._timing_every == 0):
+            print(
+                "[RandomInstanceSampler][timing][prepare_batch] "
+                f"total={t_unique_done - t0:.3f}s edges={t_edges_done - t_edges:.3f}s "
+                f"ext={t_ext_done - t_ext:.3f}s unique={t_unique_done - t_unique:.3f}s "
+                f"batch_nodes={int(global_for_row.numel())}"
+            )
 
     # -----------------------
     # sampling (fast, type-aware)
@@ -357,9 +395,15 @@ class RandomInstanceSampler(NegativeInstanceSampler):
             return parts[0]
         return torch.unique(torch.cat(parts, dim=0))
 
-    def get_contrastive_samples(self, z: torch.Tensor,
+    def get_contrastive_samples(
+        self,
+        z: torch.Tensor,
         anchor_nodes: Optional[torch.Tensor] = None,
-        n_id: Optional[torch.Tensor] = None):
+        n_id: Optional[torch.Tensor] = None,
+        anchor_nodes_are_unique: Optional[bool] = None,
+        **_: object,
+    ):
+        t0 = time.perf_counter()
         device = z.device
         B_rows, D = z.shape
         k = self.k
@@ -413,6 +457,7 @@ class RandomInstanceSampler(NegativeInstanceSampler):
             shneg_idx.append(self._sample_k(cand_shneg, u_local, k, device).unsqueeze(0))
             pos2neg_idx.append(self._sample_k(cand_pos2neg, u_local, k, device).unsqueeze(0))
             neg2pos_idx.append(self._sample_k(cand_neg2pos, u_local, k, device).unsqueeze(0))
+        t_loop_done = time.perf_counter()
 
         if not anchors_local_list:
             empty = torch.empty(0, D, device=device)
@@ -424,6 +469,14 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         pos2neg_t = torch.cat(pos2neg_idx, dim=0)
         neg2pos_t = torch.cat(neg2pos_idx, dim=0)
         shpos_t = torch.cat(shpos_idx, dim=0)
+        t_end = time.perf_counter()
+        self._timing_sample_idx += 1
+        if self._timing and (self._timing_sample_idx % self._timing_every == 0):
+            print(
+                "[RandomInstanceSampler][timing][get_contrastive_samples] "
+                f"total={t_end - t0:.3f}s loop={t_loop_done - t0:.3f}s "
+                f"anchors={int(anchors_local_t.numel())} B_rows={int(B_rows)}"
+            )
 
         return (z[anchors_local_t], z[shneg_t],
             z[pos2neg_t], z[neg2pos_t], z[shpos_t])

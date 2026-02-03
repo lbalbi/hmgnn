@@ -1,2 +1,3 @@
 from .contrastiveinstance_CE import ContrastiveInstanceLoss
+from .contrastiveentity_CE import ContrastiveEntityLoss
 from .dual_contrastiveinstance import DualContrastiveInstanceLoss

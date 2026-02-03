@@ -58,6 +58,7 @@ class NegativeInstanceSampler:
         self._pools_shared_neg_nonempty: Optional[List[Optional[List[Tensor]]]] = None
         self._pools_pos_to_u_neg_nonempty: Optional[List[Optional[List[Tensor]]]] = None
         self._pools_neg_to_u_pos_nonempty: Optional[List[Optional[List[Tensor]]]] = None
+        self._cache_built_for: Optional[set[int]] = None
         self.timing_profile: bool = False
         self.last_timing: Optional[Dict[str, float]] = None
         self.last_stats: Optional[Dict[str, float]] = None
@@ -297,7 +298,7 @@ class NegativeInstanceSampler:
                 return cached
         return self._pred_priority_uncached(u_g)
 
-    def _build_anchor_caches(self) -> None:
+    def _init_anchor_caches(self) -> None:
         if self.num_nodes <= 0:
             self._anchors_with_pool = []
             self._anchors_with_pool_set = set()
@@ -332,6 +333,71 @@ class NegativeInstanceSampler:
         self._pools_shared_neg_nonempty = [None for _ in range(self.num_nodes)]
         self._pools_pos_to_u_neg_nonempty = [None for _ in range(self.num_nodes)]
         self._pools_neg_to_u_pos_nonempty = [None for _ in range(self.num_nodes)]
+        self._cache_built_for = set()
+
+    def _ensure_anchor_caches(self, anchors: List[int]) -> None:
+        if self._pred_order_by_anchor is None or self._cache_built_for is None:
+            self._init_anchor_caches()
+        if self.num_nodes <= 0:
+            return
+        for u in anchors:
+            if not (0 <= u < self.num_nodes):
+                continue
+            if self._cache_built_for is not None and u in self._cache_built_for:
+                continue
+            pred_order = self._pred_priority_uncached(u)
+            self._pred_order_by_anchor[u] = pred_order
+            if self._has_any_pool(u):
+                if self._anchors_with_pool is not None:
+                    self._anchors_with_pool.append(u)
+                if self._anchors_with_pool_set is not None:
+                    self._anchors_with_pool_set.add(u)
+                if self._has_pool_mask is not None:
+                    self._has_pool_mask[u] = True
+            if self.pool_shared_pos_by_pred is not None:
+                pools = self.pool_shared_pos_by_pred[u] or {}
+                self._pred_order_nonempty_shared_pos[u] = [
+                    p for p in pred_order if (p in pools and pools[p].numel() > 0)
+                ]
+                preds = self._pred_order_nonempty_shared_pos[u] or []
+                pools_list = [pools[p] for p in preds]
+                self._pools_shared_pos_ordered[u] = pools_list
+                self._pools_shared_pos_nonempty[u] = [p for p in pools_list if p.numel() > 0]
+            if self.pool_shared_neg_by_pred is not None:
+                pools = self.pool_shared_neg_by_pred[u] or {}
+                self._pred_order_nonempty_shared_neg[u] = [
+                    p for p in pred_order if (p in pools and pools[p].numel() > 0)
+                ]
+                preds = self._pred_order_nonempty_shared_neg[u] or []
+                pools_list = [pools[p] for p in preds]
+                self._pools_shared_neg_ordered[u] = pools_list
+                self._pools_shared_neg_nonempty[u] = [p for p in pools_list if p.numel() > 0]
+            if self.pool_pos_to_u_neg_by_pred is not None:
+                pools = self.pool_pos_to_u_neg_by_pred[u] or {}
+                self._pred_order_nonempty_pos_to_u_neg[u] = [
+                    p for p in pred_order if (p in pools and pools[p].numel() > 0)
+                ]
+                preds = self._pred_order_nonempty_pos_to_u_neg[u] or []
+                pools_list = [pools[p] for p in preds]
+                self._pools_pos_to_u_neg_ordered[u] = pools_list
+                self._pools_pos_to_u_neg_nonempty[u] = [p for p in pools_list if p.numel() > 0]
+            if self.pool_neg_to_u_pos_by_pred is not None:
+                pools = self.pool_neg_to_u_pos_by_pred[u] or {}
+                self._pred_order_nonempty_neg_to_u_pos[u] = [
+                    p for p in pred_order if (p in pools and pools[p].numel() > 0)
+                ]
+                preds = self._pred_order_nonempty_neg_to_u_pos[u] or []
+                pools_list = [pools[p] for p in preds]
+                self._pools_neg_to_u_pos_ordered[u] = pools_list
+                self._pools_neg_to_u_pos_nonempty[u] = [p for p in pools_list if p.numel() > 0]
+            if self._cache_built_for is not None:
+                self._cache_built_for.add(u)
+
+    def _build_anchor_caches(self) -> None:
+        self._init_anchor_caches()
+        for u in self.anchors:
+            if 0 <= u < self.num_nodes:
+                self._ensure_anchor_caches([u])
         for u in self.anchors:
             if 0 <= u < self.num_nodes:
                 pred_order = self._pred_priority_uncached(u)
@@ -342,7 +408,7 @@ class NegativeInstanceSampler:
                     self._has_pool_mask[u] = True
                 # prefilter preds by non-empty pools for each pool type
                 if self.pool_shared_pos_by_pred is not None:
-                    pools = self.pool_shared_pos_by_pred[u]
+                    pools = self.pool_shared_pos_by_pred[u] or {}
                     self._pred_order_nonempty_shared_pos[u] = [
                         p for p in pred_order if (p in pools and pools[p].numel() > 0)
                     ]
@@ -351,7 +417,7 @@ class NegativeInstanceSampler:
                     self._pools_shared_pos_ordered[u] = pools_list
                     self._pools_shared_pos_nonempty[u] = [p for p in pools_list if p.numel() > 0]
                 if self.pool_shared_neg_by_pred is not None:
-                    pools = self.pool_shared_neg_by_pred[u]
+                    pools = self.pool_shared_neg_by_pred[u] or {}
                     self._pred_order_nonempty_shared_neg[u] = [
                         p for p in pred_order if (p in pools and pools[p].numel() > 0)
                     ]
@@ -360,7 +426,7 @@ class NegativeInstanceSampler:
                     self._pools_shared_neg_ordered[u] = pools_list
                     self._pools_shared_neg_nonempty[u] = [p for p in pools_list if p.numel() > 0]
                 if self.pool_pos_to_u_neg_by_pred is not None:
-                    pools = self.pool_pos_to_u_neg_by_pred[u]
+                    pools = self.pool_pos_to_u_neg_by_pred[u] or {}
                     self._pred_order_nonempty_pos_to_u_neg[u] = [
                         p for p in pred_order if (p in pools and pools[p].numel() > 0)
                     ]
@@ -369,7 +435,7 @@ class NegativeInstanceSampler:
                     self._pools_pos_to_u_neg_ordered[u] = pools_list
                     self._pools_pos_to_u_neg_nonempty[u] = [p for p in pools_list if p.numel() > 0]
                 if self.pool_neg_to_u_pos_by_pred is not None:
-                    pools = self.pool_neg_to_u_pos_by_pred[u]
+                    pools = self.pool_neg_to_u_pos_by_pred[u] or {}
                     self._pred_order_nonempty_neg_to_u_pos[u] = [
                         p for p in pred_order if (p in pools and pools[p].numel() > 0)
                     ]
@@ -583,6 +649,8 @@ class NegativeInstanceSampler:
             self.pool_pos_to_u_neg_by_pred[u],
             self.pool_neg_to_u_pos_by_pred[u],
         ):
+            if d is None:
+                continue
             for t in d.values():
                 if t is not None and t.numel() > 0:
                     return True
