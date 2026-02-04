@@ -4,7 +4,7 @@
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
-#SBATCH --nodelist=liseda-05
+#SBATCH --nodelist=liseda-01
 #SBATCH --partition=gpu_hi
 
 set -euo pipefail
