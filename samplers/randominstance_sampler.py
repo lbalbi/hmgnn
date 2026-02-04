@@ -74,23 +74,18 @@ class RandomInstanceSampler(NegativeInstanceSampler):
     # typed-key helpers
     # -----------------------
     def _base_rel(self, rel: str) -> str:
-        r = str(rel)
-        if r.startswith(self.neg_prefix):
-            return r[len(self.neg_prefix) :]
-        if self.neg_prefix in r:
-            return r.replace(self.neg_prefix, "", 1)
-        return r
+        # Relation-agnostic: collapse all relations into a single bucket
+        return "__all__"
 
     def _rel_id(self, base_rel: str) -> int:
-        base_rel = str(base_rel)
-        rid = self._base_rel2id.get(base_rel)
-        if rid is None:
-            rid = len(self._base_rel2id)
-            self._base_rel2id[base_rel] = rid
-        return rid
+        # Relation-agnostic: single relation id
+        if "__all__" not in self._base_rel2id:
+            self._base_rel2id["__all__"] = 0
+        return 0
 
     def _mk_key(self, rid: int, cls: int) -> int:
-        return int(rid) * int(self._stride) + int(cls)
+        # Relation-agnostic: key is just target id (cls can be instance or class)
+        return int(cls)
 
     def _parse_external_item(self, item: ExternalStmt) -> Tuple[int, str, int]:
         if len(item) == 2:
@@ -105,9 +100,8 @@ class RandomInstanceSampler(NegativeInstanceSampler):
     # corruption
     # -----------------------
     def _corrupt_for_rel(self, rid: int, pos_set: set[int], n_draw: int) -> List[int]:
-        uni = self._universe_by_rid.get(rid, ())
-        if not uni:
-            uni = self._global_universe
+        # Relation-agnostic: corrupt from global universe
+        uni = self._global_universe
         if not uni:
             return []
 
