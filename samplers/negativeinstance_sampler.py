@@ -1,4 +1,5 @@
 import random
+import time
 from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor
@@ -10,12 +11,15 @@ class NegativeInstanceSampler:
     Negative statements: relation DOES start with 'NOT_'
     Ontological expansion: subclass_of children expansion for negative classes  """
     def __init__(self, k: int = 2, subclass_rel: str = "subclass_of",
-        neg_prefix: str = "NOT_", instance_rel: str = "2",neg_expansion_hops: int = 1):
+        neg_prefix: str = "NOT_", instance_rel: str = "2", neg_expansion_hops: int = 3,
+        max_pool_size: int = 100):
         self.k = int(k)
         self.subclass_rel = subclass_rel
         self.neg_prefix = neg_prefix
         self.instance_rel = instance_rel
         self.neg_expansion_hops = int(neg_expansion_hops)
+        self.max_pool_size = int(max_pool_size)
+        self.max_class_pool_size = int(max_pool_size)
         self.node_type: str = "node"
         self.num_nodes: int = 0
         self._is_instance: Optional[Tensor] = None
@@ -33,6 +37,8 @@ class NegativeInstanceSampler:
         self._g2l_cpu: Optional[Tensor] = None
         self._stamp_cpu: Optional[Tensor] = None        
         self._cur_stamp: int = 0
+        self._dbg_ctr = 0
+        self._dbg_every = 20
 
 
     @staticmethod
@@ -59,24 +65,45 @@ class NegativeInstanceSampler:
         ib = bool(self._is_instance[b])
         if ia and not ib: return a, b
         if ib and not ia: return b, a
-        return None, None
+        if ia and ib: return a, b
+        return a, b
 
     @staticmethod
     def _unique_cpu(x: List[int]) -> Tensor:
         if not x: return torch.empty(0, dtype=torch.long)
         return torch.unique(torch.tensor(x, dtype=torch.long))
 
-    @staticmethod
-    def _collect_instances(classes: List[int], class2inst: Dict[int, Tensor],
+    def _cap_tensor(self, t: Tensor, cap: int) -> Tensor:
+        if t.numel() <= cap:
+            return t
+        idx = torch.randperm(int(t.numel()))[:cap]
+        return t[idx]
+
+    def _collect_instances_fast(self, classes: List[int], class2inst: Dict[int, Tensor],
         exclude: Optional[int] = None) -> Tensor:
-        if not classes: return torch.empty(0, dtype=torch.long)
-        parts = [class2inst[c] for c in classes if c in class2inst and class2inst[c].numel() > 0]
+        if not classes:
+            return torch.empty(0, dtype=torch.long)
+        parts: List[Tensor] = []
+        for c in classes:
+            t = class2inst.get(c)
+            if t is None or t.numel() == 0:
+                continue
+            parts.append(t)
         if not parts:
             return torch.empty(0, dtype=torch.long)
-        out = torch.unique(torch.cat(parts, dim=0))
+        if len(parts) == 1:
+            out = parts[0]
+        else:
+            out = torch.unique(torch.cat(parts, dim=0))
         if exclude is not None and out.numel() > 0:
             out = out[out != int(exclude)]
         return out
+
+    def _cap_pool(self, pool: Tensor) -> Tensor:
+        if pool.numel() <= self.max_pool_size:
+            return pool
+        idx = torch.randperm(int(pool.numel()))[: self.max_pool_size]
+        return pool[idx]
 
     def _expand_negs(self, direct: List[int], subclass_predecessors: Dict[int, Tensor]) -> List[int]:
         if not direct: return []
@@ -148,11 +175,13 @@ class NegativeInstanceSampler:
         return chosen_l.long()
 
     def prepare_global(self, full_g: HeteroData) -> None:
+        t0 = time.time()
         if len(full_g.node_types) != 1:
             raise ValueError("NegativeInstanceSampler assumes a single node type.")
         self.node_type = full_g.node_types[0]
         N = self._infer_num_nodes(full_g, self.node_type)
         self.num_nodes = N
+        print(f"[NegativeInstanceSampler] prepare_global: start (num_nodes={N})")
         # Detect instance nodes
         instance_nodes: set[int] = set()
         if self.instance_rel is not None:
@@ -166,6 +195,7 @@ class NegativeInstanceSampler:
             is_instance[list(instance_nodes)] = True
             self._is_instance = is_instance
         else: self._is_instance = None
+        print(f"[NegativeInstanceSampler] prepare_global: instance_nodes={len(instance_nodes)}")
 
         self.pos_classes = [[] for _ in range(N)]
         self.neg_classes_direct = [[] for _ in range(N)]
@@ -179,11 +209,13 @@ class NegativeInstanceSampler:
                 if 0 <= child < N and 0 <= parent < N:
                     tmp.setdefault(int(parent), []).append(int(child))
             subclass_predecessors = {p: self._unique_cpu(ch) for p, ch in tmp.items()}
+        print(f"[NegativeInstanceSampler] prepare_global: subclass_predecessors={len(subclass_predecessors)}")
 
         class2pos_tmp: Dict[int, List[int]] = {}
         class2neg_tmp: Dict[int, List[int]] = {}
         anchor_sources: set[int] = set(instance_nodes)
         # Scan all edges, collect (inst -> class) and inverse maps (class -> inst)
+        t_scan = time.time()
         for (_, rel, _), eidx in full_g.edge_index_dict.items():
             if eidx.numel() == 0 or rel == self.subclass_rel:
                 continue
@@ -202,15 +234,20 @@ class NegativeInstanceSampler:
                 else:
                     self.pos_classes[inst].append(cls)
                     class2pos_tmp.setdefault(cls, []).append(inst)
+        print(f"[NegativeInstanceSampler] prepare_global: edge scan took {time.time() - t_scan:.2f}s")
         self.anchors = sorted(anchor_sources) if anchor_sources else list(range(N))
 
         # Expand negative classes via subclass graph
         self.neg_classes_expanded = [[] for _ in range(N)]
+        t_expand = time.time()
         for u in self.anchors:
             self.neg_classes_expanded[u] = self._expand_negs(self.neg_classes_direct[u], subclass_predecessors)
+        print(f"[NegativeInstanceSampler] prepare_global: neg expansion took {time.time() - t_expand:.2f}s")
 
-        class2pos = {c: self._unique_cpu(vs) for c, vs in class2pos_tmp.items()}
-        class2neg = {c: self._unique_cpu(vs) for c, vs in class2neg_tmp.items()}
+        class2pos = {c: self._cap_tensor(self._unique_cpu(vs), self.max_class_pool_size)
+                     for c, vs in class2pos_tmp.items()}
+        class2neg = {c: self._cap_tensor(self._unique_cpu(vs), self.max_class_pool_size)
+                     for c, vs in class2neg_tmp.items()}
 
         empty = torch.empty(0, dtype=torch.long)
         self.pool_shared_pos = [empty for _ in range(N)]
@@ -219,18 +256,37 @@ class NegativeInstanceSampler:
         self.pool_neg_to_u_pos = [empty for _ in range(N)]
 
         # Build pools per anchor u (global ids)
+        t_pools = time.time()
         for u in self.anchors:
             pos_cls = self.pos_classes[u]
             neg_cls = self.neg_classes_expanded[u]
-            self.pool_shared_pos[u] = self._collect_instances(pos_cls, class2pos, exclude=u)
-            self.pool_shared_neg[u] = self._collect_instances(neg_cls, class2neg, exclude=u)
-            self.pool_pos_to_u_neg[u] = self._collect_instances(neg_cls, class2pos, exclude=u)
-            self.pool_neg_to_u_pos[u] = self._collect_instances(pos_cls, class2neg, exclude=u)
+            if pos_cls:
+                self.pool_shared_pos[u] = self._cap_pool(self._collect_instances_fast(pos_cls, class2pos, exclude=u))
+            if neg_cls:
+                self.pool_shared_neg[u] = self._cap_pool(self._collect_instances_fast(neg_cls, class2neg, exclude=u))
+                self.pool_pos_to_u_neg[u] = self._cap_pool(self._collect_instances_fast(neg_cls, class2pos, exclude=u))
+            if pos_cls:
+                self.pool_neg_to_u_pos[u] = self._cap_pool(self._collect_instances_fast(pos_cls, class2neg, exclude=u))
+        print(f"[NegativeInstanceSampler] prepare_global: pool build took {time.time() - t_pools:.2f}s")
+
+        if self.anchors:
+            empty_shpos = sum(1 for u in self.anchors if self.pool_shared_pos[u].numel() == 0)
+            empty_shneg = sum(1 for u in self.anchors if self.pool_shared_neg[u].numel() == 0)
+            empty_pos2neg = sum(1 for u in self.anchors if self.pool_pos_to_u_neg[u].numel() == 0)
+            empty_neg2pos = sum(1 for u in self.anchors if self.pool_neg_to_u_pos[u].numel() == 0)
+            print(
+                "[NegativeInstanceSampler] anchors without pool neighbors (global pools): "
+                f"shared_pos={empty_shpos}/{len(self.anchors)}, "
+                f"shared_neg={empty_shneg}/{len(self.anchors)}, "
+                f"pos->u_neg={empty_pos2neg}/{len(self.anchors)}, "
+                f"neg->u_pos={empty_neg2pos}/{len(self.anchors)}"
+            )
 
         # Initialize stamp buffers (CPU)
         self._g2l_cpu = torch.empty(self.num_nodes, dtype=torch.long)
         self._stamp_cpu = torch.zeros(self.num_nodes, dtype=torch.int32)
         self._cur_stamp = 0
+        print(f"[NegativeInstanceSampler] prepare_global: done in {time.time() - t0:.2f}s")
 
     def prepare_batch(self, batch: HeteroData, pos_index: Optional[Tensor] = None) -> None:
         # Keep as no-op to preserve your current external behavior.
@@ -253,12 +309,14 @@ class NegativeInstanceSampler:
         device = z.device
         B_rows, D = z.shape
         k = self.k
+        t_start = time.time()
 
         # --------------------------
         # FULL GRAPH MODE (n_id is None)
         # local == global, no in-batch filtering needed
         # --------------------------
         if n_id is None:
+            t_select = time.time()
             if anchor_nodes is None or anchor_nodes.numel() == 0:
                 anchor_globals_cpu = torch.tensor(self.anchors, dtype=torch.long)
             else:
@@ -266,10 +324,12 @@ class NegativeInstanceSampler:
 
             # keep valid range
             anchor_globals_cpu = anchor_globals_cpu[(anchor_globals_cpu >= 0) & (anchor_globals_cpu < self.num_nodes)]
+            t_select = time.time() - t_select
 
             anchors_cpu: List[int] = []
             shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
 
+            t_sample = time.time()
             for u in anchor_globals_cpu.tolist():
                 # skip anchors with no pools at all
                 if (
@@ -289,17 +349,29 @@ class NegativeInstanceSampler:
                                                              fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
                 shpos_cpu.append(self._sample_k_locals_cpu(self.pool_shared_pos[u], stamp=0,
                                                           fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
+            t_sample = time.time() - t_sample
 
             if not anchors_cpu:
                 empty = torch.empty(0, D, device=device)
                 empty_k = torch.empty(0, k, D, device=device)
                 return empty, empty_k, empty_k, empty_k, empty_k
 
+            t_concat = time.time()
             anchors = torch.tensor(anchors_cpu, dtype=torch.long, device=device)
             shneg = torch.cat(shneg_cpu, dim=0).to(device)
             pos2neg = torch.cat(pos2neg_cpu, dim=0).to(device)
             neg2pos = torch.cat(neg2pos_cpu, dim=0).to(device)
             shpos = torch.cat(shpos_cpu, dim=0).to(device)
+            t_concat = time.time() - t_concat
+
+            self._dbg_ctr += 1
+            if self._dbg_ctr % self._dbg_every == 0:
+                total = time.time() - t_start
+                print(
+                    "[NegativeInstanceSampler] get_contrastive_samples (full): "
+                    f"select={t_select:.3f}s sample={t_sample:.3f}s concat={t_concat:.3f}s total={total:.3f}s "
+                    f"anchors_in={len(anchor_globals_cpu)} anchors_out={len(anchors_cpu)}"
+                )
 
             return z[anchors], z[shneg], z[pos2neg], z[neg2pos], z[shpos]
 
@@ -309,6 +381,7 @@ class NegativeInstanceSampler:
         # --------------------------
         assert self._stamp_cpu is not None and self._g2l_cpu is not None
 
+        t_select = time.time()
         n_id_cpu = n_id.detach().long().cpu()
         stamp = self._bump_stamp()
 
@@ -329,10 +402,12 @@ class NegativeInstanceSampler:
             # safety filter
             anchor_locals_cpu = anchor_locals_cpu[(anchor_locals_cpu >= 0) & (anchor_locals_cpu < n_id_cpu.numel())]
             anchor_globals_cpu = n_id_cpu[anchor_locals_cpu]
+        t_select = time.time() - t_select
 
         anchors_local_cpu: List[int] = []
         shneg_cpu, pos2neg_cpu, neg2pos_cpu, shpos_cpu = [], [], [], []
 
+        t_sample = time.time()
         for u_g, u_l in zip(anchor_globals_cpu.tolist(), anchor_locals_cpu.tolist()):
             if u_l < 0:
                 continue
@@ -353,17 +428,29 @@ class NegativeInstanceSampler:
                                                          fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
             shpos_cpu.append(self._sample_k_locals_cpu(self.pool_shared_pos[u_g], stamp=stamp,
                                                       fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+        t_sample = time.time() - t_sample
 
         if not anchors_local_cpu:
             empty = torch.empty(0, D, device=device)
             empty_k = torch.empty(0, k, D, device=device)
             return empty, empty_k, empty_k, empty_k, empty_k
 
+        t_concat = time.time()
         anchors_local = torch.tensor(anchors_local_cpu, dtype=torch.long, device=device)
         shneg = torch.cat(shneg_cpu, dim=0).to(device)
         pos2neg = torch.cat(pos2neg_cpu, dim=0).to(device)
         neg2pos = torch.cat(neg2pos_cpu, dim=0).to(device)
         shpos = torch.cat(shpos_cpu, dim=0).to(device)
+        t_concat = time.time() - t_concat
+
+        self._dbg_ctr += 1
+        if self._dbg_ctr % self._dbg_every == 0:
+            total = time.time() - t_start
+            print(
+                "[NegativeInstanceSampler] get_contrastive_samples (neighbor): "
+                f"select={t_select:.3f}s sample={t_sample:.3f}s concat={t_concat:.3f}s total={total:.3f}s "
+                f"anchors_in={len(anchor_globals_cpu)} anchors_out={len(anchors_local_cpu)} n_id={len(n_id_cpu)}"
+            )
         return z[anchors_local], z[shneg], z[pos2neg], z[neg2pos], z[shpos]
 
 

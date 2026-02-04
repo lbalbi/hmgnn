@@ -7,6 +7,8 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.utils import dropout_edge, add_self_loops
 from typing import Dict, List, Optional, Tuple
 
+CLS_REL = "cls_link"
+
 class MLP(nn.Module):
     def __init__(self, in_channels: int, hidden_channels: int,
         out_channels: int, num_layers: int = 2, dropout: float = 0.2,
@@ -185,7 +187,7 @@ class GCN_GAE(nn.Module):
 
     def _get_message_edge_index(self, data: HeteroData) -> Tensor:
         # Prefer PPI edges if present
-        if self.ppi_etype in data.edge_types and "edge_index" in data[self.ppi_etype]:
+        if self.ppi_etype in data.edge_types and self.ppi_etype[1] != CLS_REL and "edge_index" in data[self.ppi_etype]:
             eidx = data[self.ppi_etype].edge_index
             if eidx is not None and eidx.numel() > 0:
                 return eidx
@@ -195,6 +197,8 @@ class GCN_GAE(nn.Module):
         for et, store in data.edge_items():
             # data.edge_items() yields ((src, rel, dst), edge_store)
             if isinstance(et, tuple) and len(et) == 3:
+                if et[1] == CLS_REL:
+                    continue
                 if "edge_index" in store and store.edge_index is not None and store.edge_index.numel() > 0:
                     parts.append(store.edge_index)
         if not parts:

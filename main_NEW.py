@@ -26,6 +26,20 @@ from samplers import (
 NEG_PREFIX = "NOT_"
 CLS_EDGE_TYPE = ("node", "cls_link", "node")
 
+def _with_cls_edges(
+    base_graph: HeteroData,
+    heads: torch.Tensor,
+    tails: torch.Tensor,
+) -> HeteroData:
+    g = base_graph.clone()
+    device = heads.device
+    if heads.numel() == 0:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+    else:
+        edge_index = torch.stack([heads, tails], dim=0)
+    g[CLS_EDGE_TYPE].edge_index = edge_index
+    return g
+
 def print_encoder_and_cls_totals(
     *,
     encoder_graph: HeteroData,
@@ -1329,16 +1343,22 @@ def main():
             val_edge_label_index = torch.stack([cls_heads[val_idx], cls_tails[val_idx]], dim=0)
             val_edge_label = cls_labels[val_idx].to(torch.float)
 
+            fold_encoder_graph = _with_cls_edges(
+                encoder_graph,
+                cls_heads[train_idx],
+                cls_tails[train_idx],
+            )
+
             # num_neighbors = {et: [20, 10] for et in encoder_graph.edge_types}
             num_neighbors = {et: [20, 10] for et in MP_EDGE_TYPES}
             num_neighbors[CLS_EDGE_TYPE] = [0, 0]   # <-- IMPORTANT: don't sample along cls_link
 
-            train_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
+            train_loader = LinkNeighborLoader(fold_encoder_graph, num_neighbors=num_neighbors,
                 edge_label_index=(CLS_EDGE_TYPE, train_edge_label_index), edge_label=train_edge_label,
                 batch_size=args.batch_size, shuffle=True, num_workers=2, persistent_workers=True,
                 pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0)
 
-            val_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
+            val_loader = LinkNeighborLoader(fold_encoder_graph, num_neighbors=num_neighbors,
                 edge_label_index=(CLS_EDGE_TYPE, val_edge_label_index), edge_label=val_edge_label,
                 batch_size=args.batch_size, shuffle=False, num_workers=2, persistent_workers=True,
                 pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0,)
@@ -1360,7 +1380,7 @@ def main():
             else:
                 model_fold = ModelCls(**base_model_kwargs).to(device)
 
-            sampler_graph = struct_graph
+            sampler_graph = fold_encoder_graph
             if not args.no_contrastive:
                 if use_random_sampler:
                     neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
@@ -1377,6 +1397,8 @@ def main():
                         subclass_rel=subclass_rel,
                         neg_prefix=NEG_PREFIX,
                         instance_rel=instance_rel,
+                        cache_dir="data/cache",
+                        cache_key=f"{args.path}|{args.output_dir}|fold{fold}",
                     )
                     neg_stmt_sampler.prepare_global(sampler_graph)
             else:
@@ -1385,7 +1407,7 @@ def main():
             log_fold = Logger(f"train_cv_split{fold}", dir=args.output_dir)
             trainer_fold = Train(
                 model=model_fold,
-                graph=encoder_graph,
+                graph=fold_encoder_graph,
                 heads=cls_heads,
                 rel_ids=cls_rels,
                 tails=cls_tails,
@@ -1465,13 +1487,15 @@ def main():
     # Final training on TRAIN split
     # -----------------------------------------------------------------
     if not args.test_only:
+        train_encoder_graph = _with_cls_edges(encoder_graph, cls_heads, cls_tails)
+
         final_edge_label_index = torch.stack([cls_heads, cls_tails], dim=0)
         final_edge_label = cls_labels.to(torch.float)
         # num_neighbors = {et: neighbor_sizes for et in encoder_graph.edge_types}
         num_neighbors = {et: neighbor_sizes for et in MP_EDGE_TYPES}
         num_neighbors[CLS_EDGE_TYPE] = [0, 0]
         
-        final_loader = LinkNeighborLoader(encoder_graph, num_neighbors=num_neighbors,
+        final_loader = LinkNeighborLoader(train_encoder_graph, num_neighbors=num_neighbors,
             edge_label_index=(CLS_EDGE_TYPE, final_edge_label_index),neg_sampling_ratio=0.0,
             edge_label=final_edge_label, batch_size=args.batch_size, shuffle=True,
             num_workers=2, persistent_workers=True, pin_memory=(device.type == "cuda"))
@@ -1505,18 +1529,19 @@ def main():
         if not args.no_contrastive:
             if use_random_sampler:
                 final_contrastive_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                final_contrastive_sampler.prepare_global(struct_graph)
+                final_contrastive_sampler.prepare_global(train_encoder_graph)
             elif use_partial_sampler:
                 edges_are_negative = nflag
                 final_contrastive_sampler = PartialInstanceSampler(
                     k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
                 )
-                final_contrastive_sampler.prepare_global(struct_graph)
+                final_contrastive_sampler.prepare_global(train_encoder_graph)
             else:
                 final_contrastive_sampler = NegativeInstanceSampler_NEW(
-                    k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel
+                    k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel,
+                    cache_dir="data/cache", cache_key=f"{args.path}|{args.output_dir}|final"
                 )
-                final_contrastive_sampler.prepare_global(struct_graph)
+                final_contrastive_sampler.prepare_global(train_encoder_graph)
         else:
             final_contrastive_sampler = None
 
@@ -1526,7 +1551,7 @@ def main():
 
         final_trainer = Train_BestModel(
             final_model,
-            graph=encoder_graph,
+            graph=train_encoder_graph,
             heads=cls_heads,
             rel_ids=cls_rels,
             tails=cls_tails,
@@ -1544,6 +1569,8 @@ def main():
         final_loss = final_trainer.run()
         print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}")
     test_log = Logger("test_global", dir=args.output_dir)
+
+    train_encoder_graph = _with_cls_edges(encoder_graph, cls_heads, cls_tails)
 
     import gc
     gc.collect()
@@ -1585,7 +1612,7 @@ def main():
 
     tester = Test_BestModel(
         model=final_model,
-        graph=encoder_graph,
+        graph=train_encoder_graph,
         test_heads=test_heads,
         test_rels=test_rels,
         test_tails=test_tails,

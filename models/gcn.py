@@ -5,6 +5,8 @@ from torch_geometric.nn import GCNConv
 from typing import List, Tuple, Dict, Optional, Union
 from torch_geometric.data import HeteroData, Data
 
+CLS_REL = "cls_link"
+
 
 class GCN(nn.Module):
     """
@@ -78,6 +80,8 @@ class GCN(nn.Module):
         edges = []
         for (s, r, d), eidx in data.edge_index_dict.items():
             if s == self.n_type and d == self.n_type:
+                if r == CLS_REL:
+                    continue
                 edges.append(eidx)
 
         if len(edges) == 0:

@@ -8,6 +8,7 @@ from samplers import (NegativeInstanceSampler,
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 
 import subprocess
+import time
 
 CLS_EDGE_TYPE = ("node", "cls_link", "node")
 
@@ -133,6 +134,7 @@ class Train:
         total_bce = 0.0
         total_contr = 0.0
         total_examples = 0
+        total_batches = 0
         all_probs = []
         all_labels = []
         total_loss_tensor = None
@@ -274,12 +276,18 @@ class Train:
     def _train_one_epoch_with_neighbors(self, optimizer, n_type: str) -> Tuple[float, float]:
         assert self.train_loader is not None, "LinkNeighborLoader not provided."
         self.model.train()
+        t0 = time.time()
+        t_data = 0.0
+        t_step = 0.0
         total_bce = 0.0
         total_contr = 0.0
         total_examples = 0
 
         for batch in self.train_loader:
+            t_batch = time.time()
             batch = batch.to(self.device)
+            t_data += time.time() - t_batch
+            t_step_start = time.time()
 
             edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
             if input_id is None:
@@ -339,9 +347,16 @@ class Train:
             total_bce += float(bce_loss.detach().cpu().item()) * bs
             total_contr += float(contr_loss_val) * bs
             total_examples += bs
+            total_batches += 1
+            t_step += time.time() - t_step_start
 
         avg_bce = total_bce / total_examples if total_examples else 0.0
         avg_contr = total_contr / total_examples if total_examples else 0.0
+        print(
+            f"[Train] epoch time: total={time.time() - t0:.2f}s "
+            f"data={t_data:.2f}s step={t_step:.2f}s batches={total_batches}",
+            flush=True,
+        )
         return avg_bce, avg_contr
 
 
@@ -402,14 +417,21 @@ class Train:
     def _eval_with_neighbors(self, n_type: str):
         assert self.val_loader is not None, "LinkNeighborLoader not provided."
         self.model.eval()
+        t0 = time.time()
+        t_data = 0.0
+        t_step = 0.0
         total_bce = 0.0
         total_examples = 0
+        total_batches = 0
         all_probs = []
         all_labels = []
 
         with torch.no_grad():
             for batch in self.val_loader:
+                t_batch = time.time()
                 batch = batch.to(self.device)
+                t_data += time.time() - t_batch
+                t_step_start = time.time()
 
                 edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
                 if input_id is None:
@@ -441,8 +463,15 @@ class Train:
                 total_examples += bs
                 all_probs.append(probs.detach().cpu())
                 all_labels.append(labels.detach().cpu())
+                total_batches += 1
+                t_step += time.time() - t_step_start
 
         avg_bce = total_bce / total_examples if total_examples else 0.0
+        print(
+            f"[Val] epoch time: total={time.time() - t0:.2f}s "
+            f"data={t_data:.2f}s step={t_step:.2f}s batches={total_batches}",
+            flush=True,
+        )
         if all_probs:
             all_probs = torch.cat(all_probs, dim=0)
             all_labels = torch.cat(all_labels, dim=0)
@@ -483,6 +512,7 @@ class Train:
                 self.labels = self.labels.to(self.device)
             
             for epoch in range(1, self.max_epochs + 1):               
+                t_epoch = time.time()
                 if use_neighbor_mode: train_bce, train_contr = self._train_one_epoch_with_neighbors(
                         optimizer, n_type=n_type)
                 else:
@@ -532,6 +562,11 @@ class Train:
                         msg += " | " + ", ".join(f"{name}={val_metrics[i]:.4f}"
                             for i, name in enumerate(self.metrics.get_allnames()))
                     self.log.log(msg)
+
+                print(
+                    f"[Train] Epoch {epoch:03d} total_time={time.time() - t_epoch:.2f}s",
+                    flush=True,
+                )
 
                 if val_bce < best_val_loss_lr:
                     best_val_loss_lr = val_bce

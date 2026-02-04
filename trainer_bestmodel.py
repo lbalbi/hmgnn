@@ -7,6 +7,7 @@ from samplers import (NegativeSampler, NegativeStatementSampler, NegativeInstanc
     PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 import os
+import time
 
 CLS_EDGE_TYPE = ("node", "cls_link", "node")
 
@@ -275,12 +276,21 @@ class Train_BestModel:
     def _epoch_step_neighbors(self, n_type: str):
         assert self.loader is not None, "LinkNeighborLoader not provided for Train_BestModel."
         self.model.train()
+        if self.contrastive_sampler is not None and hasattr(self.contrastive_sampler, "prepare_epoch"):
+            self.contrastive_sampler.prepare_epoch()
+        t0 = time.time()
+        t_data = 0.0
+        t_step = 0.0
         total_bce = 0.0
         total_contr = 0.0
         total_examples = 0
+        total_batches = 0
 
         for batch in self.loader:
+            t_batch = time.time()
             batch = batch.to(self.device)
+            t_data += time.time() - t_batch
+            t_step_start = time.time()
 
             edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
             if input_id is None:
@@ -333,9 +343,16 @@ class Train_BestModel:
             total_bce += float(bce_loss.detach().cpu().item()) * bs
             total_contr += float(contr_loss_val) * bs
             total_examples += bs
+            total_batches += 1
+            t_step += time.time() - t_step_start
 
         avg_bce = total_bce / total_examples if total_examples else 0.0
         avg_contr = total_contr / total_examples if total_examples else 0.0
+        print(
+            f"[Final Train] epoch time: total={time.time() - t0:.2f}s "
+            f"data={t_data:.2f}s step={t_step:.2f}s batches={total_batches}",
+            flush=True,
+        )
         return avg_bce, avg_contr
 
 
@@ -354,6 +371,7 @@ class Train_BestModel:
             self.labels = self.labels.to(self.device)
 
         for epoch in range(1, self.epochs + 1):
+            t_epoch = time.time()
             if use_neighbor_mode: bce_loss, contr_loss = self._epoch_step_neighbors(n_type)
             else:
                 self.model.train()
@@ -368,6 +386,7 @@ class Train_BestModel:
                 total_loss.backward()
                 self.optimizer.step()
 
+            print(f"[Final Train] Epoch {epoch:03d} total_time={time.time() - t_epoch:.2f}s", flush=True)
                 self.model.eval()
                 if use_neighbor_mode:
                     val_bce, _, val_probs, val_labels = self._eval_with_neighbors(n_type=n_type)

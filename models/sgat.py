@@ -9,6 +9,8 @@ from torch_geometric.data import HeteroData
 from torch_geometric.utils import add_self_loops, dropout_edge
 from torch_geometric.nn import GATv2Conv
 
+CLS_REL = "cls_link"
+
 
 class SignedGATConv(nn.Module):
     """
@@ -185,6 +187,8 @@ class SGAT(nn.Module):
 
         for (src, rel, dst) in data.edge_types:
             if src != self.n_type or dst != self.n_type:
+                continue
+            if rel == CLS_REL:
                 continue
             store = data[(src, rel, dst)]
             if "edge_index" not in store or store.edge_index is None or store.edge_index.numel() == 0:

@@ -800,6 +800,12 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         self._batch_global_for_row: Optional[torch.Tensor] = None   # CPU [B_rows]
         self._batch_pos_map: Optional[Dict[int, torch.Tensor]] = None  # key(int) -> local inst ids (CPU)
         self._batch_neg_map: Optional[Dict[int, torch.Tensor]] = None  # key(int) -> local inst ids (CPU)
+        self._batch_pos_key_u: Optional[torch.Tensor] = None
+        self._batch_pos_ptr: Optional[torch.Tensor] = None
+        self._batch_pos_flat: Optional[torch.Tensor] = None
+        self._batch_neg_key_u: Optional[torch.Tensor] = None
+        self._batch_neg_ptr: Optional[torch.Tensor] = None
+        self._batch_neg_flat: Optional[torch.Tensor] = None
 
         print("Using RandomInstanceSampler")
 
@@ -997,8 +1003,10 @@ class RandomInstanceSampler(NegativeInstanceSampler):
 
         self._batch_global_for_row = global_for_row
 
-        pos_acc: Dict[int, List[int]] = {}
-        neg_acc: Dict[int, List[int]] = {}
+        pos_keys: List[int] = []
+        pos_inst: List[int] = []
+        neg_keys: List[int] = []
+        neg_inst: List[int] = []
 
         # iterate batch edges
         for key, eidx in batch.edge_index_dict.items():
@@ -1042,10 +1050,14 @@ class RandomInstanceSampler(NegativeInstanceSampler):
                 inst_l = src_l
                 cls_g = dst_g
 
-            acc = neg_acc if is_neg else pos_acc
             for c, il in zip(cls_g.tolist(), inst_l.tolist()):
                 k_int = self._mk_key(rid, int(c))
-                acc.setdefault(int(k_int), []).append(int(il))
+                if is_neg:
+                    neg_keys.append(int(k_int))
+                    neg_inst.append(int(il))
+                else:
+                    pos_keys.append(int(k_int))
+                    pos_inst.append(int(il))
 
         # add external neg statements for instances in batch (cheap)
         if self._ext_neg_by_inst:
@@ -1057,11 +1069,32 @@ class RandomInstanceSampler(NegativeInstanceSampler):
                 if il is None:
                     continue
                 for k_int in keys:
-                    neg_acc.setdefault(int(k_int), []).append(int(il))
+                    neg_keys.append(int(k_int))
+                    neg_inst.append(int(il))
 
-        # unique tensors
-        self._batch_pos_map = {k: torch.unique(torch.tensor(v, dtype=torch.long)) for k, v in pos_acc.items()}
-        self._batch_neg_map = {k: torch.unique(torch.tensor(v, dtype=torch.long)) for k, v in neg_acc.items()}
+        # Build CSR for pos/neg maps (key -> inst_local list)
+        def _build_csr(keys: List[int], insts: List[int]):
+            if not keys:
+                key_u = torch.empty(0, dtype=torch.int64)
+                ptr = torch.zeros(1, dtype=torch.int64)
+                flat = torch.empty(0, dtype=torch.int64)
+                return key_u, ptr, flat
+            k = torch.tensor(keys, dtype=torch.int64)
+            v = torch.tensor(insts, dtype=torch.int64)
+            perm = torch.argsort(k)
+            k = k[perm]
+            v = v[perm]
+            key_u, counts = torch.unique_consecutive(k, return_counts=True)
+            ptr = torch.zeros(int(key_u.numel()) + 1, dtype=torch.int64)
+            ptr[1:] = torch.cumsum(counts.to(torch.int64), dim=0)
+            return key_u, ptr, v
+
+        self._batch_pos_key_u, self._batch_pos_ptr, self._batch_pos_flat = _build_csr(pos_keys, pos_inst)
+        self._batch_neg_key_u, self._batch_neg_ptr, self._batch_neg_flat = _build_csr(neg_keys, neg_inst)
+
+        # keep dicts for fallback/debug; but avoid per-key unique in hot path
+        self._batch_pos_map = None
+        self._batch_neg_map = None
 
     # -----------------------
     # sampling (fast, type-aware)
@@ -1088,8 +1121,21 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         return out.to(device)
 
     @staticmethod
-    def _union_from_map(keys: List[int], m: Dict[int, torch.Tensor]) -> torch.Tensor:
-        parts = [m[k] for k in keys if k in m and m[k].numel() > 0]
+    def _union_from_csr(keys: List[int], key_u: torch.Tensor, ptr: torch.Tensor, flat: torch.Tensor) -> torch.Tensor:
+        if key_u is None or ptr is None or flat is None:
+            return torch.empty(0, dtype=torch.long)
+        if key_u.numel() == 0 or not keys:
+            return torch.empty(0, dtype=torch.long)
+        parts: List[torch.Tensor] = []
+        key_u_cpu = key_u
+        for k in keys:
+            k_int = int(k)
+            idx = int(torch.searchsorted(key_u_cpu, torch.tensor(k_int, dtype=key_u_cpu.dtype)).item())
+            if idx < int(key_u_cpu.numel()) and int(key_u_cpu[idx].item()) == k_int:
+                start = int(ptr[idx].item())
+                end = int(ptr[idx + 1].item())
+                if end > start:
+                    parts.append(flat[start:end])
         if not parts:
             return torch.empty(0, dtype=torch.long)
         if len(parts) == 1:
@@ -1103,13 +1149,17 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         B_rows, D = z.shape
         k = self.k
 
-        if self._batch_global_for_row is None or self._batch_pos_map is None or self._batch_neg_map is None:
+        if self._batch_global_for_row is None or self._batch_pos_key_u is None or self._batch_neg_key_u is None:
             # If user forgot to call prepare_batch, fall back to base (slower, and not type-aware)
             return super().get_contrastive_samples(z, anchor_nodes=anchor_nodes, n_id=n_id)
 
         global_for_row = self._batch_global_for_row
-        pos_map = self._batch_pos_map
-        neg_map = self._batch_neg_map
+        pos_key_u = self._batch_pos_key_u
+        pos_ptr = self._batch_pos_ptr
+        pos_flat = self._batch_pos_flat
+        neg_key_u = self._batch_neg_key_u
+        neg_ptr = self._batch_neg_ptr
+        neg_flat = self._batch_neg_flat
 
         if anchor_nodes is None or anchor_nodes.numel() == 0:
             anchor_locals = torch.arange(B_rows, dtype=torch.long)
@@ -1127,10 +1177,10 @@ class RandomInstanceSampler(NegativeInstanceSampler):
             if not pos_keys and not neg_keys:
                 continue
 
-            cand_shpos = self._union_from_map(pos_keys, pos_map)
-            cand_shneg = self._union_from_map(neg_keys, neg_map)
-            cand_pos2neg = self._union_from_map(neg_keys, pos_map)
-            cand_neg2pos = self._union_from_map(pos_keys, neg_map)
+            cand_shpos = self._union_from_csr(pos_keys, pos_key_u, pos_ptr, pos_flat)
+            cand_shneg = self._union_from_csr(neg_keys, neg_key_u, neg_ptr, neg_flat)
+            cand_pos2neg = self._union_from_csr(neg_keys, pos_key_u, pos_ptr, pos_flat)
+            cand_neg2pos = self._union_from_csr(pos_keys, neg_key_u, neg_ptr, neg_flat)
 
             # exclude anchor
             if cand_shpos.numel() > 0:
