@@ -41,6 +41,39 @@ def _with_cls_edges(
     g[CLS_EDGE_TYPE].edge_index = edge_index
     return g
 
+def print_final_train_encoder_statement_counts(
+    *,
+    encoder_graph: HeteroData,
+    subclass_rel: str,
+    neg_prefix: str,
+) -> None:
+    """Print counts for the full/final train encoder graph (excluding subclass_of)."""
+    pos_cnt = 0
+    neg_cnt = 0
+
+    for et in encoder_graph.edge_types:
+        if et == CLS_EDGE_TYPE:
+            continue
+
+        s, rel, d = et
+        if s != "node" or d != "node":
+            continue
+
+        ei = encoder_graph[et].edge_index
+        n = int(ei.size(1)) if (ei is not None and ei.numel() > 0) else 0
+        rel_s = str(rel)
+
+        if rel_s == str(subclass_rel):
+            continue
+        if rel_s.startswith(str(neg_prefix)) or rel_s == "neg_statement":
+            neg_cnt += n
+        else:
+            pos_cnt += n
+
+    print("\n=== Final train encoder graph statement counts ===")
+    print(f"Positive statements (excluding subclass_of): {pos_cnt}")
+    print(f"Negative statements:                         {neg_cnt}")
+
 def report_unseen_test_nodes(
     *,
     test_heads: torch.Tensor,
@@ -1340,6 +1373,11 @@ def main():
     # -----------------------------------------------------------------
     if not args.test_only:
         train_encoder_graph = _with_cls_edges(encoder_graph, cls_heads, cls_tails)
+        print_final_train_encoder_statement_counts(
+            encoder_graph=train_encoder_graph,
+            subclass_rel=subclass_rel,
+            neg_prefix=NEG_PREFIX,
+        )
 
         final_edge_label_index = torch.stack([cls_heads, cls_tails], dim=0)
         final_edge_label = cls_labels.to(torch.float)
