@@ -61,6 +61,90 @@ class NegativeInstanceSampler_NEW:
         self._dbg_ctr = 0
         self._dbg_every = 20
 
+    def print_pool_stats(self, prefix: str = "[NegativeInstanceSampler_NEW]") -> None:
+        if not self.anchors:
+            print(f"{prefix} No anchors; skipping pool stats.")
+            return
+
+        def _safe_lens_list(lst: List[List[int]]) -> Optional[List[int]]:
+            if not lst:
+                return None
+            max_u = max(self.anchors) if self.anchors else -1
+            if max_u >= len(lst):
+                return None
+            return [len(lst[u]) for u in self.anchors]
+
+        def _safe_lens_tensor(lst: List[Tensor]) -> Optional[List[int]]:
+            if not lst:
+                return None
+            max_u = max(self.anchors) if self.anchors else -1
+            if max_u >= len(lst):
+                return None
+            return [int(lst[u].numel()) for u in self.anchors]
+
+        def _pool_size_from_pred_dict(dd_list) -> Optional[List[int]]:
+            if dd_list is None or len(dd_list) == 0:
+                return None
+            max_u = max(self.anchors) if self.anchors else -1
+            if max_u >= len(dd_list):
+                return None
+            sizes: List[int] = []
+            for u in self.anchors:
+                dd = dd_list[u]
+                parts = [t for t in dd.values() if t is not None and t.numel() > 0]
+                if not parts:
+                    sizes.append(0)
+                    continue
+                sizes.append(int(torch.unique(torch.cat(parts, dim=0)).numel()))
+            return sizes
+
+        def _summ(name: str, vals: List[int]) -> None:
+            if not vals:
+                print(f"{prefix} {name}: empty")
+                return
+            v = sorted(vals)
+            n = len(v)
+            mean = float(sum(v)) / float(n)
+            median = float(v[n // 2])
+            p90 = float(v[int(0.9 * (n - 1))])
+            vmax = float(v[-1])
+            print(f"{prefix} {name}: mean={mean:.2f} median={median:.2f} p90={p90:.2f} max={vmax:.0f}")
+
+        vals = _safe_lens_list(self.pos_classes)
+        if vals is not None:
+            _summ("pos_classes_per_anchor", vals)
+        vals = _safe_lens_list(self.neg_classes_direct)
+        if vals is not None:
+            _summ("neg_classes_direct_per_anchor", vals)
+        vals = _safe_lens_list(self.neg_classes_expanded)
+        if vals is not None:
+            _summ("neg_classes_expanded_per_anchor", vals)
+
+        # Prefer typed pools if present
+        vals = _pool_size_from_pred_dict(getattr(self, "pool_shared_pos_by_pred", None))
+        if vals is None:
+            vals = _safe_lens_tensor(getattr(self, "pool_shared_pos", []))
+        if vals is not None:
+            _summ("pool_shared_pos_size", vals)
+
+        vals = _pool_size_from_pred_dict(getattr(self, "pool_shared_neg_by_pred", None))
+        if vals is None:
+            vals = _safe_lens_tensor(getattr(self, "pool_shared_neg", []))
+        if vals is not None:
+            _summ("pool_shared_neg_size", vals)
+
+        vals = _pool_size_from_pred_dict(getattr(self, "pool_pos_to_u_neg_by_pred", None))
+        if vals is None:
+            vals = _safe_lens_tensor(getattr(self, "pool_pos_to_u_neg", []))
+        if vals is not None:
+            _summ("pool_pos_to_u_neg_size", vals)
+
+        vals = _pool_size_from_pred_dict(getattr(self, "pool_neg_to_u_pos_by_pred", None))
+        if vals is None:
+            vals = _safe_lens_tensor(getattr(self, "pool_neg_to_u_pos", []))
+        if vals is not None:
+            _summ("pool_neg_to_u_pos_size", vals)
+
     def _cache_path(self) -> Optional[str]:
         if not self.cache_dir or not self.cache_key:
             return None
@@ -477,12 +561,19 @@ class NegativeInstanceSampler_NEW:
         return
 
     def _pred_priority(self, u_g: int) -> list[str]:
-        # Deterministic ordering (set -> sorted list)
+        # Deterministic ordering (set -> sorted list), prefer instance_of-like preds first.
         preds = sorted(self.preds_seen[u_g]) if self.preds_seen is not None else []
+        preferred: List[str] = []
+        # Primary pred (instance_rel) first if present
         if self.primary_pred in preds:
+            preferred.append(self.primary_pred)
             preds.remove(self.primary_pred)
-            return [self.primary_pred] + preds
-        return preds
+        # Also prioritize common instance_of aliases if present
+        for alias in ("instance_of", "P31"):
+            if alias in preds and alias not in preferred:
+                preferred.append(alias)
+                preds.remove(alias)
+        return preferred + preds
     # def _pred_priority(self, u_g: int) -> list[str]:
     #     preds = list(self.preds_seen[u_g]) if self.preds_seen is not None else []
     #     if self.primary_pred in preds:
@@ -592,6 +683,25 @@ class NegativeInstanceSampler_NEW:
                 return True
         return False
 
+    def _needs_fallback2_neg(self, u: int) -> bool:
+        """Return True if neg pools would fall back to self (no negatives anywhere)."""
+        if (
+            self.pool_pos_to_u_neg_by_pred is None
+            or self.pool_neg_to_u_pos_by_pred is None
+            or u >= len(self.pool_pos_to_u_neg_by_pred)
+            or u >= len(self.pool_neg_to_u_pos_by_pred)
+        ):
+            return True
+        shared_any = False
+        if self.pool_shared_neg_any is not None and u < len(self.pool_shared_neg_any):
+            shared_any = self.pool_shared_neg_any[u].numel() > 0
+
+        pos2neg_pool = self.pool_pos_to_u_neg_by_pred[u]
+        neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u]
+        needs_pos2neg = (not self._has_any_pool_map(pos2neg_pool)) and (not shared_any)
+        needs_neg2pos = (not self._has_any_pool_map(neg2pos_pool)) and (not shared_any)
+        return needs_pos2neg or needs_neg2pos
+
     def get_contrastive_samples(self, z: Tensor, anchor_nodes: Optional[Tensor] = None,
         n_id: Optional[Tensor] = None):
         """   Returns: (z_anchor, z_shared_neg, z_pos_to_u_neg, z_neg_to_u_pos, z_shared_pos)
@@ -623,6 +733,8 @@ class NegativeInstanceSampler_NEW:
             still_empty_neg2pos = 0
             for u in anchor_globals_cpu.tolist():
                 if not self._has_any_pool(u):
+                    continue
+                if self._needs_fallback2_neg(u):
                     continue
                 pred_order = self.pred_order_cache[u] if self.pred_order_cache is not None else self._pred_priority(u)
 
@@ -715,6 +827,8 @@ class NegativeInstanceSampler_NEW:
             if u_l < 0:
                 continue
             if not self._has_any_pool(u_g):
+                continue
+            if self._needs_fallback2_neg(u_g):
                 continue
             anchor_globals_list.append(u_g)
             anchor_locals_list.append(u_l)

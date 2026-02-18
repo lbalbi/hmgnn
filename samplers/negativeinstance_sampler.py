@@ -40,6 +40,36 @@ class NegativeInstanceSampler:
         self._dbg_ctr = 0
         self._dbg_every = 20
 
+    def print_pool_stats(self, prefix: str = "[NegativeInstanceSampler]") -> None:
+        if not self.anchors:
+            print(f"{prefix} No anchors; skipping pool stats.")
+            return
+
+        def _lens_list(lst: List[List[int]]) -> List[int]:
+            return [len(lst[u]) for u in self.anchors]
+
+        def _lens_tensor(lst: List[Tensor]) -> List[int]:
+            return [int(lst[u].numel()) for u in self.anchors]
+
+        def _summ(name: str, vals: List[int]) -> None:
+            if not vals:
+                print(f"{prefix} {name}: empty")
+                return
+            v = sorted(vals)
+            n = len(v)
+            mean = float(sum(v)) / float(n)
+            median = float(v[n // 2])
+            p90 = float(v[int(0.9 * (n - 1))])
+            vmax = float(v[-1])
+            print(f"{prefix} {name}: mean={mean:.2f} median={median:.2f} p90={p90:.2f} max={vmax:.0f}")
+
+        _summ("pos_classes_per_anchor", _lens_list(self.pos_classes))
+        _summ("neg_classes_direct_per_anchor", _lens_list(self.neg_classes_direct))
+        _summ("neg_classes_expanded_per_anchor", _lens_list(self.neg_classes_expanded))
+        _summ("pool_shared_pos_size", _lens_tensor(self.pool_shared_pos))
+        _summ("pool_shared_neg_size", _lens_tensor(self.pool_shared_neg))
+        _summ("pool_pos_to_u_neg_size", _lens_tensor(self.pool_pos_to_u_neg))
+        _summ("pool_neg_to_u_pos_size", _lens_tensor(self.pool_neg_to_u_pos))
 
     @staticmethod
     def _find_edge_key(g: HeteroData, rel: str) -> Optional[Tuple[str, str, str]]:
@@ -339,6 +369,9 @@ class NegativeInstanceSampler:
                     and self.pool_neg_to_u_pos[u].numel() == 0
                 ):
                     continue
+                # Skip anchors with missing negative pools to avoid self-padding
+                if (self.pool_pos_to_u_neg[u].numel() == 0) or (self.pool_neg_to_u_pos[u].numel() == 0):
+                    continue
 
                 anchors_cpu.append(u)
                 shneg_cpu.append(self._sample_k_locals_cpu(self.pool_shared_neg[u], stamp=0,
@@ -417,6 +450,8 @@ class NegativeInstanceSampler:
                 and self.pool_pos_to_u_neg[u_g].numel() == 0
                 and self.pool_neg_to_u_pos[u_g].numel() == 0
             ):
+                continue
+            if (self.pool_pos_to_u_neg[u_g].numel() == 0) or (self.pool_neg_to_u_pos[u_g].numel() == 0):
                 continue
 
             anchors_local_cpu.append(u_l)

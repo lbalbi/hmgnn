@@ -3,12 +3,14 @@ import os
 import hashlib
 import re
 import statistics
+from pathlib import Path
 from collections import defaultdict
 from typing import Dict, Tuple, List, Optional, Set
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 from sklearn.model_selection import StratifiedShuffleSplit
 from torch_geometric.data import HeteroData
@@ -18,7 +20,7 @@ from data_loader import DataLoader
 from models import *
 from trainer import Train
 from trainer_bestmodel import Train_BestModel, Test_BestModel
-from utils import Logger, load_config
+from utils import Logger, load_config, ensure_dir
 from samplers import (
     PartialStatementSampler, NegativeStatementSampler, RandomStatementSampler,
     NegativeInstanceSampler, RandomInstanceSampler, PartialInstanceSampler
@@ -73,6 +75,264 @@ def print_final_train_encoder_statement_counts(
     print("\n=== Final train encoder graph statement counts ===")
     print(f"Positive statements (excluding subclass_of): {pos_cnt}")
     print(f"Negative statements:                         {neg_cnt}")
+
+def compute_neg_neighbor_similarity_chart(
+    *,
+    model: torch.nn.Module,
+    encoder_graph: HeteroData,
+    cls_heads: torch.Tensor,
+    cls_tails: torch.Tensor,
+    subclass_rel: str,
+    neg_prefix: str,
+    instance_rel: str,
+    output_dir: str,
+    max_pool_size: int = 100,
+    chart_bins: int = 40,
+) -> None:
+    cls_nodes = torch.unique(torch.cat([cls_heads, cls_tails], dim=0)).detach().cpu().long()
+    if cls_nodes.numel() == 0:
+        print("[NegNeighborSim] No classification nodes found; skipping.")
+        return
+
+    sampler = NegativeInstanceSampler(
+        k=1,
+        subclass_rel=subclass_rel,
+        neg_prefix=neg_prefix,
+        instance_rel=instance_rel,
+        max_pool_size=max_pool_size,
+    )
+    graph_cpu = encoder_graph.cpu()
+    sampler.prepare_global(graph_cpu)
+
+    n_type = getattr(model, "n_type", "node")
+    try:
+        orig_device = next(model.parameters()).device
+    except StopIteration:
+        orig_device = torch.device("cpu")
+
+    model_cpu = model.cpu()
+    model_cpu.eval()
+    with torch.inference_mode():
+        h_dict = model_cpu.encode(graph_cpu)
+        z = h_dict[n_type].detach().cpu()
+    if orig_device.type != "cpu":
+        model.to(orig_device)
+
+    z_norm = F.normalize(z, dim=1)
+
+    def _collect_neighbors(u: int) -> Tuple[torch.Tensor, int, int]:
+        empty = torch.empty(0, dtype=torch.long)
+        pos_pool = empty
+        neg_pool = empty
+        if getattr(sampler, "pool_pos_to_u_neg_by_pred", None) is not None:
+            pos_maps = sampler.pool_pos_to_u_neg_by_pred[u]
+            neg_maps = sampler.pool_neg_to_u_pos_by_pred[u]
+            pos_parts = [t for t in pos_maps.values() if t is not None and t.numel() > 0]
+            neg_parts = [t for t in neg_maps.values() if t is not None and t.numel() > 0]
+            if pos_parts:
+                pos_pool = torch.unique(torch.cat(pos_parts, dim=0))
+            if neg_parts:
+                neg_pool = torch.unique(torch.cat(neg_parts, dim=0))
+        else:
+            if sampler.pool_pos_to_u_neg and u < len(sampler.pool_pos_to_u_neg):
+                pos_pool = sampler.pool_pos_to_u_neg[u]
+            if sampler.pool_neg_to_u_pos and u < len(sampler.pool_neg_to_u_pos):
+                neg_pool = sampler.pool_neg_to_u_pos[u]
+
+        if pos_pool.numel() == 0 and neg_pool.numel() == 0:
+            return empty, 0, 0
+        if pos_pool.numel() == 0:
+            return neg_pool, 0, int(neg_pool.numel())
+        if neg_pool.numel() == 0:
+            return pos_pool, int(pos_pool.numel()), 0
+        neighbors = torch.unique(torch.cat([pos_pool, neg_pool], dim=0))
+        return neighbors, int(pos_pool.numel()), int(neg_pool.numel())
+
+    def _collect_same_sign_neighbors(u: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        empty = torch.empty(0, dtype=torch.long)
+        pos_pool = empty
+        if getattr(sampler, "pool_shared_pos_by_pred", None) is not None:
+            pos_maps = sampler.pool_shared_pos_by_pred[u]
+            pos_parts = [t for t in pos_maps.values() if t is not None and t.numel() > 0]
+            if pos_parts:
+                pos_pool = torch.unique(torch.cat(pos_parts, dim=0))
+        else:
+            if sampler.pool_shared_pos and u < len(sampler.pool_shared_pos):
+                pos_pool = sampler.pool_shared_pos[u]
+        return pos_pool, empty
+
+    # Negative neighbors defined by ANY negative edge connected to the node (1-hop)
+    cls_set = set(int(x) for x in cls_nodes.tolist())
+    neg_edge_neighbors: Dict[int, set[int]] = {u: set() for u in cls_set}
+    for (s, rel, d), eidx in encoder_graph.edge_index_dict.items():
+        if s != "node" or d != "node":
+            continue
+        rel_s = str(rel)
+        if rel_s == str(subclass_rel):
+            continue
+        if not (rel_s.startswith(str(neg_prefix)) or rel_s == "neg_statement"):
+            continue
+        if eidx is None or eidx.numel() == 0:
+            continue
+        src = eidx[0].detach().cpu().long().tolist()
+        dst = eidx[1].detach().cpu().long().tolist()
+        for a, b in zip(src, dst):
+            if a in cls_set:
+                neg_edge_neighbors[a].add(b)
+            if b in cls_set:
+                neg_edge_neighbors[b].add(a)
+
+    rows = []
+    skipped_no_neighbors = 0
+    skipped_oob = 0
+    for u in cls_nodes.tolist():
+        if u < 0 or u >= sampler.num_nodes:
+            skipped_oob += 1
+            continue
+        neighbors, n_pos2neg, n_neg2pos = _collect_neighbors(u)
+        if neighbors.numel() == 0:
+            skipped_no_neighbors += 1
+            continue
+        sim = (z_norm[u].unsqueeze(0) * z_norm[neighbors]).sum(dim=1)
+        rows.append(
+            {
+                "node_id": int(u),
+                "avg_similarity": float(sim.mean().item()),
+                "num_neighbors": int(neighbors.numel()),
+                "num_pos2neg": int(n_pos2neg),
+                "num_neg2pos": int(n_neg2pos),
+            }
+        )
+
+    if not rows:
+        print("[NegNeighborSim] No nodes with neg-neighbor pools; skipping chart.")
+        return
+
+    df = pd.DataFrame(rows)
+    out_dir = os.path.join("output", output_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    tsv_path = os.path.join(out_dir, "neg_neighbor_similarity.tsv")
+    df.to_csv(tsv_path, sep="\t", index=False)
+
+    import matplotlib.pyplot as plt
+    vals = df["avg_similarity"].to_numpy(dtype=float)
+    fig, ax = plt.subplots(figsize=(7.5, 4.5), constrained_layout=True)
+    ax.hist(vals, bins=int(chart_bins), color="#2a6f9a", alpha=0.85, edgecolor="white")
+    ax.set_xlabel("Avg cosine similarity to neg neighbors")
+    ax.set_ylabel("Classification node count")
+    ax.set_title("Neg-neighbor similarity (pos->u_neg, neg->u_pos)")
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    chart_path = os.path.join(out_dir, "neg_neighbor_similarity_hist.png")
+    fig.savefig(chart_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+    print(
+        "[NegNeighborSim] "
+        f"nodes_with_neighbors={len(rows)} "
+        f"skipped_no_neighbors={skipped_no_neighbors} "
+        f"skipped_oob={skipped_oob} "
+        f"mean={float(vals.mean()):.4f} median={float(np.median(vals)):.4f}"
+    )
+    print(f"[NegNeighborSim] Wrote: {tsv_path}")
+    print(f"[NegNeighborSim] Chart: {chart_path}")
+
+    # Same-sign neighbors: positive and negative separately
+    pos_rows = []
+    neg_rows = []
+    skipped_no_pos = 0
+    skipped_no_neg = 0
+    skipped_oob = 0
+    for u in cls_nodes.tolist():
+        if u < 0 or u >= sampler.num_nodes:
+            skipped_oob += 1
+            continue
+        pos_pool, _ = _collect_same_sign_neighbors(u)
+        if pos_pool.numel() > 0:
+            sim_pos = (z_norm[u].unsqueeze(0) * z_norm[pos_pool]).sum(dim=1)
+            pos_rows.append(
+                {
+                    "node_id": int(u),
+                    "avg_similarity": float(sim_pos.mean().item()),
+                    "num_neighbors": int(pos_pool.numel()),
+                }
+            )
+        else:
+            skipped_no_pos += 1
+
+        neg_list = neg_edge_neighbors.get(int(u), set())
+        if neg_list:
+            neg_pool = torch.tensor(sorted(neg_list), dtype=torch.long)
+            sim_neg = (z_norm[u].unsqueeze(0) * z_norm[neg_pool]).sum(dim=1)
+            neg_rows.append(
+                {
+                    "node_id": int(u),
+                    "avg_similarity": float(sim_neg.mean().item()),
+                    "num_neighbors": int(neg_pool.numel()),
+                }
+            )
+        else:
+            skipped_no_neg += 1
+
+    out_dir = os.path.join("output", output_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    if pos_rows:
+        df_pos = pd.DataFrame(pos_rows)
+        tsv_pos = os.path.join(out_dir, "pos_neighbor_similarity.tsv")
+        df_pos.to_csv(tsv_pos, sep="\t", index=False)
+        vals = df_pos["avg_similarity"].to_numpy(dtype=float)
+        fig, ax = plt.subplots(figsize=(7.5, 4.5), constrained_layout=True)
+        ax.hist(vals, bins=int(chart_bins), color="#2a9d8f", alpha=0.85, edgecolor="white")
+        ax.set_xlabel("Avg cosine similarity to pos neighbors")
+        ax.set_ylabel("Classification node count")
+        ax.set_title("Pos-neighbor similarity (shared positive statements)")
+        ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        chart_pos = os.path.join(out_dir, "pos_neighbor_similarity_hist.png")
+        fig.savefig(chart_pos, dpi=250, bbox_inches="tight")
+        plt.close(fig)
+        print(
+            "[PosNeighborSim] "
+            f"nodes_with_neighbors={len(pos_rows)} "
+            f"skipped_no_neighbors={skipped_no_pos} "
+            f"skipped_oob={skipped_oob} "
+            f"mean={float(vals.mean()):.4f} median={float(np.median(vals)):.4f}"
+        )
+        print(f"[PosNeighborSim] Wrote: {tsv_pos}")
+        print(f"[PosNeighborSim] Chart: {chart_pos}")
+    else:
+        print("[PosNeighborSim] No nodes with positive neighbors; skipping chart.")
+
+    if neg_rows:
+        df_neg = pd.DataFrame(neg_rows)
+        tsv_neg = os.path.join(out_dir, "neg_neighbor_similarity_same.tsv")
+        df_neg.to_csv(tsv_neg, sep="\t", index=False)
+        vals = df_neg["avg_similarity"].to_numpy(dtype=float)
+        fig, ax = plt.subplots(figsize=(7.5, 4.5), constrained_layout=True)
+        ax.hist(vals, bins=int(chart_bins), color="#e76f51", alpha=0.85, edgecolor="white")
+        ax.set_xlabel("Avg cosine similarity to neg neighbors")
+        ax.set_ylabel("Classification node count")
+        ax.set_title("Neg-neighbor similarity (1-hop negative edges)")
+        ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        chart_neg = os.path.join(out_dir, "neg_neighbor_similarity_same_hist.png")
+        fig.savefig(chart_neg, dpi=250, bbox_inches="tight")
+        plt.close(fig)
+        print(
+            "[NegNeighborSameSim] "
+            f"nodes_with_neighbors={len(neg_rows)} "
+            f"skipped_no_neighbors={skipped_no_neg} "
+            f"skipped_oob={skipped_oob} "
+            f"mean={float(vals.mean()):.4f} median={float(np.median(vals)):.4f}"
+        )
+        print(f"[NegNeighborSameSim] Wrote: {tsv_neg}")
+        print(f"[NegNeighborSameSim] Chart: {chart_neg}")
+    else:
+        print("[NegNeighborSameSim] No nodes with negative neighbors; skipping chart.")
 
 def report_unseen_test_nodes(
     *,
@@ -202,6 +462,8 @@ def _make_split_cache_path(
     subclass_rel: str,
     instance_rel: str,
     min_pos_per_rel: int,
+    min_neg_per_rel: int,
+    cls_keep_frac: float,
 ) -> str:
     cache_dir = os.path.join(data_dir, "split_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -212,6 +474,8 @@ def _make_split_cache_path(
         f"_sub{_sanitize_component(subclass_rel)}"
         f"_inst{_sanitize_component(instance_rel)}"
         f"_minpos{int(min_pos_per_rel)}"
+        f"_minneg{int(min_neg_per_rel)}"
+        f"_keep{float(cls_keep_frac):.3f}"
         ".pt"
     )
     return os.path.join(cache_dir, fname)
@@ -224,17 +488,21 @@ def _build_split_cache_meta(
     subclass_rel: str,
     instance_rel: str,
     min_pos_per_rel: int,
+    min_neg_per_rel: int,
+    cls_keep_frac: float,
 ) -> Dict[str, object]:
     train_pos_path = os.path.join(data_dir, "train2id_pos.txt")
     train_neg_path = os.path.join(data_dir, "train2id_neg.txt")
     return {
-        "version": 3,  # bumped because encoder-augmentation semantics changed
+        "version": 5,  # bumped because classification size reduction added
         "task": str(task),
         "test_ratio": float(test_ratio),
         "seed": int(seed),
         "subclass_rel": str(subclass_rel),
         "instance_rel": str(instance_rel),
         "min_pos_per_rel": int(min_pos_per_rel),
+        "min_neg_per_rel": int(min_neg_per_rel),
+        "cls_keep_frac": float(cls_keep_frac),
         "files": {
             "train2id_pos": _file_fingerprint(train_pos_path),
             "train2id_neg": _file_fingerprint(train_neg_path),
@@ -242,7 +510,7 @@ def _build_split_cache_meta(
     }
 
 def _meta_matches(cached: Dict[str, object], current: Dict[str, object]) -> bool:
-    keys = ["version", "task", "test_ratio", "seed", "subclass_rel", "instance_rel", "min_pos_per_rel"]
+    keys = ["version", "task", "test_ratio", "seed", "subclass_rel", "instance_rel", "min_pos_per_rel", "min_neg_per_rel", "cls_keep_frac"]
     for k in keys:
         if cached.get(k) != current.get(k):
             return False
@@ -318,6 +586,449 @@ def _append_edges(struct_graph: HeteroData, rel: str, src: torch.Tensor, tgt: to
     else:
         struct_graph[key].edge_index = edge_index
 
+def _extract_qid(val: str) -> Optional[str]:
+    m = re.search(r"(Q[1-9][0-9]*)", str(val))
+    return m.group(1) if m else None
+
+def _load_qid_maps(data_dir: str, entity_file: str, class_file: str) -> Tuple[Dict[str, int], Set[str]]:
+    ent_path = os.path.join(data_dir, entity_file)
+    cls_path = os.path.join(data_dir, class_file)
+
+    ent_df = pd.read_csv(ent_path)
+    cls_df = pd.read_csv(cls_path)
+
+    ent_cols = list(ent_df.columns)
+    cls_cols = list(cls_df.columns)
+    ent_id_col = "entity_id" if "entity_id" in ent_cols else ("protein_id" if "protein_id" in ent_cols else ent_cols[0])
+    ent_idx_col = "node_idx" if "node_idx" in ent_cols else ent_cols[1]
+    cls_id_col = "entity_id" if "entity_id" in cls_cols else cls_cols[0]
+    cls_idx_col = "node_idx" if "node_idx" in cls_cols else cls_cols[1]
+
+    qid_to_idx: Dict[str, int] = {}
+    class_qids: Set[str] = set()
+
+    for _, row in ent_df.iterrows():
+        qid = _extract_qid(row.get(ent_id_col, ""))
+        if qid is None:
+            continue
+        try:
+            idx = int(row.get(ent_idx_col, -1))
+        except Exception:
+            continue
+        if qid not in qid_to_idx:
+            qid_to_idx[qid] = idx
+
+    for _, row in cls_df.iterrows():
+        qid = _extract_qid(row.get(cls_id_col, ""))
+        if qid is None:
+            continue
+        class_qids.add(qid)
+        try:
+            idx = int(row.get(cls_idx_col, -1))
+        except Exception:
+            continue
+        if qid not in qid_to_idx:
+            qid_to_idx[qid] = idx
+
+    return qid_to_idx, class_qids
+
+def _load_rel_map(data_dir: str, rel_file: str = "relation2id.txt") -> Dict[str, str]:
+    rel_path = os.path.join(data_dir, rel_file)
+    df = pd.read_csv(rel_path)
+    out: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        rel_id = str(row.get("relation_id", ""))
+        edge_idx = str(row.get("edge_idx", "")).strip()
+        prop = rel_id.rsplit("/", 1)[-1]
+        if prop.startswith("P") and edge_idx != "":
+            out[prop] = edge_idx
+    return out
+
+def _edge_set_from_graph(g: HeteroData, rel: str) -> Set[Tuple[int, int]]:
+    key = ("node", str(rel), "node")
+    if key not in g.edge_types:
+        return set()
+    ei = g[key].edge_index
+    if ei is None or ei.numel() == 0:
+        return set()
+    src = ei[0].detach().cpu().tolist()
+    tgt = ei[1].detach().cpu().tolist()
+    return set(zip(src, tgt))
+
+def _summarize_counts(vals: List[int]) -> Dict[str, float]:
+    if not vals:
+        return {"mean": 0.0, "median": 0.0, "p90": 0.0, "max": 0.0}
+    v = sorted(vals)
+    n = len(v)
+    mean = float(sum(v)) / float(n)
+    median = float(v[n // 2]) if n else 0.0
+    p90 = float(v[int(0.9 * (n - 1))]) if n else 0.0
+    return {"mean": mean, "median": median, "p90": p90, "max": float(v[-1])}
+
+def _graph_stats(g: HeteroData, *, subclass_rel: str, instance_rel: str, neg_prefix: str) -> Dict[str, int]:
+    num_nodes = int(g["node"].num_nodes) if "node" in g.node_types else 0
+    total_edges = 0
+    inst_edges = 0
+    sub_edges = 0
+    neg_edges = 0
+
+    for (s, rel, d) in g.edge_types:
+        if s != "node" or d != "node":
+            continue
+        ei = g[(s, rel, d)].edge_index
+        n = int(ei.size(1)) if (ei is not None and ei.numel() > 0) else 0
+        total_edges += n
+        if str(rel) == str(instance_rel):
+            inst_edges += n
+        if str(rel) == str(subclass_rel):
+            sub_edges += n
+        if str(rel).startswith(str(neg_prefix)):
+            neg_edges += n
+
+    return {
+        "num_nodes": num_nodes,
+        "total_edges": total_edges,
+        "instance_edges": inst_edges,
+        "subclass_edges": sub_edges,
+        "neg_edges": neg_edges,
+    }
+
+def _augment_with_retrieved(
+    *,
+    struct_graph: HeteroData,
+    base_x: torch.Tensor,
+    num_nodes: int,
+    data_dir: str,
+    retrieved_dir: str,
+    subclass_rel: str,
+    instance_rel: str,
+    neg_prefix: str,
+    entity_file: str = "entity2id.txt",
+    class_file: str = "class2id.txt",
+    map_out_name: str = "qid2idx_retrieved.tsv",
+) -> Tuple[HeteroData, torch.Tensor, int, Dict[str, int]]:
+    rdir = Path(retrieved_dir)
+    if not rdir.exists():
+        print(f"[WARN] Retrieved dir not found: {retrieved_dir} (skipping)")
+        return struct_graph, base_x, num_nodes, {}
+
+    qid_to_idx, class_qids = _load_qid_maps(data_dir, entity_file, class_file)
+    rel_map = _load_rel_map(data_dir)
+    p31_edge = rel_map.get("P31", str(instance_rel))
+
+    inst_path = rdir / "instance_of_new.tsv"
+    neg_path = rdir / "negative_instance_of.tsv"
+    sub_path = rdir / "negative_class_subclasses.tsv"
+    label_path = rdir / "unique_names.tsv"
+
+    label_map: Dict[str, str] = {}
+    if label_path.exists():
+        df_lab = pd.read_csv(label_path, sep="\t", usecols=["qid", "label"], dtype=str)
+        for _, row in df_lab.iterrows():
+            qid = _extract_qid(row.get("qid", ""))
+            if qid and qid not in label_map:
+                label = str(row.get("label", "") or "").strip()
+                if label:
+                    label_map[qid] = label
+
+    inst_edges_qid: List[Tuple[str, str]] = []
+    if inst_path.exists():
+        df_inst = pd.read_csv(inst_path, sep="\t", usecols=["item_qid", "item_label", "class_qid", "class_label"], dtype=str)
+        for _, row in df_inst.iterrows():
+            s = _extract_qid(row.get("item_qid", ""))
+            t = _extract_qid(row.get("class_qid", ""))
+            if s and t:
+                inst_edges_qid.append((s, t))
+            if s and s not in label_map:
+                lab = str(row.get("item_label", "") or "").strip()
+                if lab:
+                    label_map[s] = lab
+            if t and t not in label_map:
+                lab = str(row.get("class_label", "") or "").strip()
+                if lab:
+                    label_map[t] = lab
+    else:
+        print(f"[WARN] Missing {inst_path} (skipping instance_of_new)")
+
+    neg_edges_qid: List[Tuple[str, str, str]] = []
+    neg_pred_counts: Dict[str, int] = defaultdict(int)
+    if neg_path.exists():
+        df_neg = pd.read_csv(
+            neg_path,
+            sep="\t",
+            usecols=[
+                "subject_qid",
+                "subject_label",
+                "predicate_id",
+                "predicate_label",
+                "object_qid",
+                "object_label",
+            ],
+            dtype=str,
+        )
+        for _, row in df_neg.iterrows():
+            s = _extract_qid(row.get("subject_qid", ""))
+            t = _extract_qid(row.get("object_qid", ""))
+            pred = str(row.get("predicate_id", "") or "").strip()
+            if not s or not t or not pred:
+                continue
+            neg_edges_qid.append((s, pred, t))
+            neg_pred_counts[pred] += 1
+
+            if s and s not in label_map:
+                lab = str(row.get("subject_label", "") or "").strip()
+                if lab:
+                    label_map[s] = lab
+            if t and t not in label_map:
+                lab = str(row.get("object_label", "") or "").strip()
+                if lab:
+                    label_map[t] = lab
+    else:
+        print(f"[WARN] Missing {neg_path} (skipping negative statements)")
+
+    sub_edges_qid: List[Tuple[str, str]] = []
+    if sub_path.exists():
+        df_sub = pd.read_csv(
+            sub_path,
+            sep="\t",
+            usecols=["child_qid", "child_label", "parent_qid", "parent_label"],
+            dtype=str,
+        )
+        for _, row in df_sub.iterrows():
+            c = _extract_qid(row.get("child_qid", ""))
+            p = _extract_qid(row.get("parent_qid", ""))
+            if c and p:
+                sub_edges_qid.append((c, p))
+            if c and c not in label_map:
+                lab = str(row.get("child_label", "") or "").strip()
+                if lab:
+                    label_map[c] = lab
+            if p and p not in label_map:
+                lab = str(row.get("parent_label", "") or "").strip()
+                if lab:
+                    label_map[p] = lab
+    else:
+        print(f"[WARN] Missing {sub_path} (skipping subclass edges)")
+
+    all_qids: Set[str] = set()
+    for s, t in inst_edges_qid:
+        all_qids.add(s)
+        all_qids.add(t)
+    for s, pred, t in neg_edges_qid:
+        all_qids.add(s)
+        all_qids.add(t)
+    for c, p in sub_edges_qid:
+        all_qids.add(c)
+        all_qids.add(p)
+
+    if not all_qids:
+        print("[INFO] No retrieved QIDs found to add.")
+        return struct_graph, base_x, num_nodes, {}
+
+    max_idx = max(qid_to_idx.values()) if qid_to_idx else -1
+    new_qids = sorted([q for q in all_qids if q not in qid_to_idx])
+    new_qid_to_idx: Dict[str, int] = {}
+    next_idx = max_idx + 1
+    for qid in new_qids:
+        qid_to_idx[qid] = next_idx
+        new_qid_to_idx[qid] = next_idx
+        next_idx += 1
+
+    new_num_nodes = max(num_nodes, next_idx)
+    if new_num_nodes > num_nodes:
+        feat_dim = int(base_x.size(1)) if base_x is not None and base_x.numel() > 0 else 128
+        extra = torch.randn((new_num_nodes - num_nodes, feat_dim), dtype=base_x.dtype if base_x is not None else torch.float)
+        base_x = torch.cat([base_x, extra], dim=0) if base_x is not None and base_x.numel() > 0 else extra
+        struct_graph["node"].num_nodes = int(new_num_nodes)
+        struct_graph["node"].x = base_x.clone()
+        num_nodes = int(new_num_nodes)
+
+    new_class_qids: Set[str] = set()
+    for _, t in inst_edges_qid:
+        new_class_qids.add(t)
+    for c, p in sub_edges_qid:
+        new_class_qids.add(c)
+        new_class_qids.add(p)
+    for s, pred, t in neg_edges_qid:
+        if pred == "P31":
+            new_class_qids.add(t)
+
+    map_rows = []
+    for qid in sorted(all_qids):
+        idx = qid_to_idx.get(qid)
+        if idx is None:
+            continue
+        is_new = 1 if qid in new_qid_to_idx else 0
+        is_class = 1 if (qid in class_qids or qid in new_class_qids) else 0
+        map_rows.append(
+            {
+                "qid": qid,
+                "node_idx": int(idx),
+                "is_new": is_new,
+                "is_class": is_class,
+                "label": label_map.get(qid, ""),
+            }
+        )
+    map_out = rdir / map_out_name
+    pd.DataFrame(map_rows).to_csv(map_out, sep="\t", index=False)
+    print(f"[INFO] Wrote retrieved QID mapping: {map_out}")
+
+    existing_by_rel: Dict[str, Set[Tuple[int, int]]] = {}
+    def _filter_new_edges(rel: str, pairs: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        if not pairs:
+            return []
+        if rel not in existing_by_rel:
+            existing_by_rel[rel] = _edge_set_from_graph(struct_graph, rel)
+        existing = existing_by_rel[rel]
+        seen: Set[Tuple[int, int]] = set()
+        out: List[Tuple[int, int]] = []
+        for u, v in pairs:
+            key = (int(u), int(v))
+            if key in existing or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+    inst_pairs = [(qid_to_idx[s], qid_to_idx[t]) for s, t in inst_edges_qid if s in qid_to_idx and t in qid_to_idx]
+    inst_pairs = _filter_new_edges(p31_edge, inst_pairs)
+
+    sub_pairs = [(qid_to_idx[c], qid_to_idx[p]) for c, p in sub_edges_qid if c in qid_to_idx and p in qid_to_idx]
+    sub_pairs = _filter_new_edges(subclass_rel, sub_pairs)
+
+    neg_pairs_by_rel: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    missing_pred = 0
+    for s, pred, t in neg_edges_qid:
+        if s not in qid_to_idx or t not in qid_to_idx:
+            continue
+        base_rel = rel_map.get(pred)
+        if base_rel is None:
+            base_rel = pred
+            missing_pred += 1
+        rel = f"{neg_prefix}{base_rel}"
+        neg_pairs_by_rel[rel].append((qid_to_idx[s], qid_to_idx[t]))
+
+    neg_pairs_added: Dict[str, int] = {}
+    for rel, pairs in neg_pairs_by_rel.items():
+        filtered = _filter_new_edges(rel, pairs)
+        neg_pairs_by_rel[rel] = filtered
+        neg_pairs_added[rel] = len(filtered)
+
+    if inst_pairs:
+        src = torch.tensor([u for u, _ in inst_pairs], dtype=torch.long)
+        tgt = torch.tensor([v for _, v in inst_pairs], dtype=torch.long)
+        _append_edges(struct_graph, str(p31_edge), src, tgt)
+
+    if sub_pairs:
+        src = torch.tensor([u for u, _ in sub_pairs], dtype=torch.long)
+        tgt = torch.tensor([v for _, v in sub_pairs], dtype=torch.long)
+        _append_edges(struct_graph, str(subclass_rel), src, tgt)
+
+    for rel, pairs in neg_pairs_by_rel.items():
+        if not pairs:
+            continue
+        src = torch.tensor([u for u, _ in pairs], dtype=torch.long)
+        tgt = torch.tensor([v for _, v in pairs], dtype=torch.long)
+        _append_edges(struct_graph, str(rel), src, tgt)
+
+    stats = {
+        "new_nodes": len(new_qid_to_idx),
+        "new_class_nodes": sum(1 for q in new_qid_to_idx if q in class_qids or q in new_class_qids),
+        "inst_edges_added": len(inst_pairs),
+        "sub_edges_added": len(sub_pairs),
+        "neg_edges_added": sum(neg_pairs_added.values()),
+        "neg_pred_missing": missing_pred,
+    }
+
+    top_preds = sorted(neg_pred_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    if top_preds:
+        print("[INFO] Retrieved negative predicates (top 10):")
+        for p, c in top_preds:
+            print(f"  {p}: {c}")
+
+    return struct_graph, base_x, num_nodes, stats
+
+def _save_embeddings_and_neighbors(
+    *,
+    model: torch.nn.Module,
+    encoder_graph: HeteroData,
+    out_dir: str,
+    sampler: Optional[object],
+) -> None:
+    ensure_dir(out_dir)
+    emb_path = os.path.join(out_dir, "embeddings.pt")
+    nb_path = os.path.join(out_dir, "neighbors.pt")
+
+    try:
+        orig_device = next(model.parameters()).device
+    except StopIteration:
+        orig_device = torch.device("cpu")
+    model_cpu = model.to("cpu")
+    graph_cpu = encoder_graph.cpu()
+    model_cpu.eval()
+    with torch.no_grad():
+        h_dict = model_cpu.encode(graph_cpu)
+    node_emb = h_dict.get("node")
+    if node_emb is None:
+        raise RuntimeError("Model encode did not return embeddings for node type 'node'.")
+    torch.save({"embeddings": node_emb.cpu()}, emb_path)
+    if orig_device.type != "cpu":
+        model.to(orig_device)
+    print(f"[INFO] Saved node embeddings: {emb_path}")
+
+    if sampler is None:
+        print("[WARN] No contrastive sampler available; saving empty neighbors.pt")
+        anchors = []
+    else:
+        anchors = getattr(sampler, "anchors", None)
+        if anchors is None:
+            print("[WARN] Sampler has no anchors; saving empty neighbors.pt")
+            anchors = []
+
+    empty = torch.empty(0, dtype=torch.long)
+
+    def _pool_from_by_pred(by_pred_list, u: int) -> Optional[torch.Tensor]:
+        if by_pred_list is None or u >= len(by_pred_list):
+            return None
+        dd = by_pred_list[u]
+        parts = [t for t in dd.values() if t is not None and t.numel() > 0]
+        if not parts:
+            return empty
+        return torch.unique(torch.cat(parts, dim=0))
+
+    def _pool_from_list(pool_list, u: int) -> Optional[torch.Tensor]:
+        if pool_list is None or u >= len(pool_list):
+            return None
+        t = pool_list[u]
+        if hasattr(t, "detach"):
+            return t.detach().cpu()
+        return torch.tensor(t)
+
+    def _get_pool(name: str, by_pred_name: Optional[str] = None):
+        out = []
+        by_pred = getattr(sampler, by_pred_name, None) if by_pred_name else None
+        pool_list = getattr(sampler, name, None)
+        for u in anchors:
+            t = None
+            if by_pred is not None:
+                t = _pool_from_by_pred(by_pred, u)
+            if t is None:
+                t = _pool_from_list(pool_list, u)
+            if t is None:
+                t = empty
+            out.append(t)
+        return out
+
+    payload = {
+        "anchors": torch.tensor(anchors, dtype=torch.long),
+        "pool_shared_pos": _get_pool("pool_shared_pos", "pool_shared_pos_by_pred"),
+        "pool_shared_neg": _get_pool("pool_shared_neg", "pool_shared_neg_by_pred"),
+        "pool_pos_to_u_neg": _get_pool("pool_pos_to_u_neg", "pool_pos_to_u_neg_by_pred"),
+        "pool_neg_to_u_pos": _get_pool("pool_neg_to_u_pos", "pool_neg_to_u_pos_by_pred"),
+    }
+    torch.save(payload, nb_path)
+    print(f"[INFO] Saved neighbor pools: {nb_path}")
+
 def build_hgcn_encoder_graph(
     struct_graph: HeteroData,
     subclass_rel: str = "subclass_of",
@@ -369,6 +1080,9 @@ def _balanced_downsample_per_relation(
     *,
     seed: int,
     min_pos_per_rel: int = 0,
+    min_neg_per_rel: int = 0,
+    cls_keep_frac: float = 1.0,
+    prefer_col: str = "source_node",
 ) -> Tuple[pd.DataFrame, Dict[str, Tuple[int, int, int]]]:
     """
     Build a per-relation 1:1 balanced dataset by downsampling larger class to smaller class.
@@ -385,6 +1099,8 @@ def _balanced_downsample_per_relation(
 
     dropped_minpos = []
     dropped_empty = []
+    reduced_rels: List[str] = []
+    reduced_keep: List[str] = []
 
     for r in rels:
         pos_rows = df_pos[df_pos["rel_base"] == r]
@@ -393,6 +1109,9 @@ def _balanced_downsample_per_relation(
         nneg = int(len(neg_rows))
 
         if min_pos_per_rel and npos < int(min_pos_per_rel):
+            dropped_minpos.append(r)
+            continue
+        if min_neg_per_rel and nneg < int(min_neg_per_rel):
             dropped_minpos.append(r)
             continue
 
@@ -404,11 +1123,48 @@ def _balanced_downsample_per_relation(
         rng = np.random.RandomState(int(seed) + _stable_hash_int(r, 1_000_000))
         pos_idx = pos_rows.index.to_numpy(dtype=np.int64).copy()
         neg_idx = neg_rows.index.to_numpy(dtype=np.int64).copy()
-        rng.shuffle(pos_idx)
-        rng.shuffle(neg_idx)
 
-        pos_sel = pos_idx[:m]
-        neg_sel = neg_idx[:m]
+        # Prefer examples whose anchor node appears in BOTH pos and neg for this relation
+        shared_heads = set(pos_rows[prefer_col]) & set(neg_rows[prefer_col])
+        prefer_pos = pos_rows[prefer_col].isin(shared_heads).to_numpy()
+        prefer_neg = neg_rows[prefer_col].isin(shared_heads).to_numpy()
+
+        pos_pref = pos_idx[prefer_pos]
+        pos_rest = pos_idx[~prefer_pos]
+        neg_pref = neg_idx[prefer_neg]
+        neg_rest = neg_idx[~prefer_neg]
+
+        # If we can fill m *entirely* from shared heads while respecting min counts,
+        # reduce m to maximize overlap (more nodes with both pos/neg statements).
+        m_pref = min(len(pos_pref), len(neg_pref))
+        m_min = max(int(min_pos_per_rel), int(min_neg_per_rel))
+        if m_pref >= max(1, m_min) and m_pref < m:
+            reduced_rels.append(r)
+            m = m_pref
+
+        # Optional global shrink while preserving minimum per-relation counts
+        if cls_keep_frac is not None and float(cls_keep_frac) < 1.0:
+            keep_frac = max(0.0, float(cls_keep_frac))
+            m_keep = int(round(float(m) * keep_frac))
+            m_keep = max(m_keep, m_min)
+            if m_keep < m:
+                reduced_keep.append(r)
+                m = m_keep
+
+        rng.shuffle(pos_pref)
+        rng.shuffle(pos_rest)
+        rng.shuffle(neg_pref)
+        rng.shuffle(neg_rest)
+
+        if len(pos_pref) >= m:
+            pos_sel = pos_pref[:m]
+        else:
+            pos_sel = np.concatenate([pos_pref, pos_rest[: max(0, m - len(pos_pref))]])
+
+        if len(neg_pref) >= m:
+            neg_sel = neg_pref[:m]
+        else:
+            neg_sel = np.concatenate([neg_pref, neg_rest[: max(0, m - len(neg_pref))]])
 
         pos_chunk = df_pos.loc[pos_sel].copy()
         neg_chunk = df_neg.loc[neg_sel].copy()
@@ -418,8 +1174,17 @@ def _balanced_downsample_per_relation(
         stats[r] = (npos, nneg, int(m))
 
     if dropped_minpos:
-        print(f"\n[WARN] Dropped {len(dropped_minpos)} relations due to min_pos_per_rel={min_pos_per_rel}. (first 50)")
+        print(
+            f"\n[WARN] Dropped {len(dropped_minpos)} relations due to "
+            f"min_pos_per_rel={min_pos_per_rel} or min_neg_per_rel={min_neg_per_rel}. (first 50)"
+        )
         print(dropped_minpos[:50])
+    if reduced_rels:
+        print(f"\n[INFO] Reduced classification size to maximize shared heads: {len(reduced_rels)} relations (first 50)")
+        print(reduced_rels[:50])
+    if reduced_keep:
+        print(f"\n[INFO] Reduced classification size by cls_keep_frac={cls_keep_frac:.3f}: {len(reduced_keep)} relations (first 50)")
+        print(reduced_keep[:50])
     if dropped_empty:
         print(f"\n[WARN] Dropped {len(dropped_empty)} relations with empty pos or neg after filtering. (first 50)")
         print(dropped_empty[:50])
@@ -546,6 +1311,8 @@ def build_classification_splits_from_train_files(
     test_ratio: float,
     seed: int,
     min_pos_per_rel: int = 0,
+    min_neg_per_rel: int = 0,
+    cls_keep_frac: float = 1.0,
 ) -> Dict[str, object]:
     """
     - Uses ONLY train2id_pos + train2id_neg.
@@ -554,6 +1321,11 @@ def build_classification_splits_from_train_files(
     - Splits 80/20 per relation AND per label -> keeps balance per relation.
     - Returns balance_stats so we can later add LEFTOVERS into encoder graph.
     """
+    cls_keep_frac = float(cls_keep_frac)
+    if cls_keep_frac <= 0.0 or cls_keep_frac > 1.0:
+        print(f"[WARN] cls_keep_frac={cls_keep_frac} is out of (0,1]; clamping to 1.0")
+        cls_keep_frac = 1.0
+
     train_pos_path = os.path.join(data_dir, "train2id_pos.txt")
     train_neg_path = os.path.join(data_dir, "train2id_neg.txt")
 
@@ -571,17 +1343,29 @@ def build_classification_splits_from_train_files(
     df_pos_cls = df_pos_all[~df_pos_all["rel_base"].isin(excluded)].copy()
     df_neg_cls = df_neg_all[~df_neg_all["rel_base"].isin(excluded)].copy()
 
-    if min_pos_per_rel and int(min_pos_per_rel) > 0:
+    if (min_pos_per_rel and int(min_pos_per_rel) > 0) or (min_neg_per_rel and int(min_neg_per_rel) > 0):
         pos_counts = df_pos_cls["rel_base"].value_counts().to_dict()
-        keep_rels = {r for r, c in pos_counts.items() if int(c) >= int(min_pos_per_rel)}
+        neg_counts = df_neg_cls["rel_base"].value_counts().to_dict()
+        keep_rels = {
+            r for r, c in pos_counts.items()
+            if int(c) >= int(min_pos_per_rel)
+            and int(neg_counts.get(r, 0)) >= int(min_neg_per_rel)
+        }
         before = len(df_pos_cls)
         df_pos_cls = df_pos_cls[df_pos_cls["rel_base"].isin(keep_rels)].copy()
         df_neg_cls = df_neg_cls[df_neg_cls["rel_base"].isin(keep_rels)].copy()
-        print(f"\n[INFO] min_pos_per_rel={min_pos_per_rel}: kept {len(keep_rels)} relations. "
-              f"pos rows: {before} -> {len(df_pos_cls)}")
+        print(
+            f"\n[INFO] min_pos_per_rel={min_pos_per_rel}, min_neg_per_rel={min_neg_per_rel}: "
+            f"kept {len(keep_rels)} relations. pos rows: {before} -> {len(df_pos_cls)}"
+        )
 
     df_balanced, balance_stats = _balanced_downsample_per_relation(
-        df_pos_cls, df_neg_cls, seed=int(seed), min_pos_per_rel=int(min_pos_per_rel) if min_pos_per_rel else 0
+        df_pos_cls,
+        df_neg_cls,
+        seed=int(seed),
+        min_pos_per_rel=int(min_pos_per_rel) if min_pos_per_rel else 0,
+        min_neg_per_rel=int(min_neg_per_rel) if min_neg_per_rel else 0,
+        cls_keep_frac=float(cls_keep_frac),
     )
     if len(df_balanced) == 0:
         raise RuntimeError("After filtering/balancing, classification dataset is empty.")
@@ -603,6 +1387,7 @@ def build_classification_splits_from_train_files(
     print("\n=== Classification dataset (from TRAIN files only) ===")
     print(f"Excluded from classification (encoder-only): {sorted(list(excluded))}")
     print(f"Relations in classification: {len(rel2id)}")
+    print(f"cls_keep_frac: {cls_keep_frac:.3f}")
     print(f"Balanced dataset total examples: {len(df_balanced)} "
           f"(pos={int((df_balanced['label']>0.5).sum())}, neg={int((df_balanced['label']<=0.5).sum())})")
     print(f"Train examples: {len(df_train)} | Test examples: {len(df_test)}")
@@ -916,18 +1701,32 @@ def main():
     parser.add_argument("--no_contrastive", action="store_true")
     parser.add_argument("--finaltrain_only", action="store_true")
     parser.add_argument("--test_only", action="store_true")
+    parser.add_argument("--finaltest_only", action="store_true")
     parser.add_argument("--final_lr", type=float, default=None)
     parser.add_argument("--final_epochs", type=int, default=None)
+    parser.add_argument("--use_retrieved", action="store_true",
+                        help="Include retrieved edges from output/retrieve_wiki into encoder graph.")
+    parser.add_argument("--retrieved_dir", type=str, default="output/retrieve_wiki")
+    parser.add_argument("--retrieved_map_out", type=str, default="qid2idx_retrieved.tsv")
+    parser.add_argument("--print_sampler_stats", action="store_true",
+                        help="Print pool-size stats from the negative sampler.")
 
     parser.add_argument("--balanced_test_ratio", type=float, default=0.20)
     parser.add_argument("--balanced_seed", type=int, default=42)
-    parser.add_argument("--min_pos_per_rel", type=int, default=0)
+    parser.add_argument("--min_pos_per_rel", type=int, default=20)
+    parser.add_argument("--min_neg_per_rel", type=int, default=20)
+    parser.add_argument("--cls_keep_frac", type=float, default=1.0,
+                        help="Keep fraction of balanced classification triples per relation (<=1.0).")
 
     parser.add_argument("--cv_val_ratio", type=float, default=0.15)
     parser.add_argument("--split_cache_path", type=str, default=None)
     parser.add_argument("--force_resplit", action="store_true")
 
     args = parser.parse_args()
+    if args.finaltest_only:
+        args.test_only = True
+    if args.finaltrain_only and args.test_only:
+        raise ValueError("Cannot use --finaltrain_only together with --test_only/--finaltest_only.")
     print("output_dir:", args.output_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1002,6 +1801,8 @@ def main():
         subclass_rel=subclass_rel,
         instance_rel=instance_rel,
         min_pos_per_rel=int(args.min_pos_per_rel),
+        min_neg_per_rel=int(args.min_neg_per_rel),
+        cls_keep_frac=float(args.cls_keep_frac),
     )
     expected_meta = _build_split_cache_meta(
         data_dir=args.path,
@@ -1011,6 +1812,8 @@ def main():
         subclass_rel=subclass_rel,
         instance_rel=instance_rel,
         min_pos_per_rel=int(args.min_pos_per_rel),
+        min_neg_per_rel=int(args.min_neg_per_rel),
+        cls_keep_frac=float(args.cls_keep_frac),
     )
 
     split_out = None
@@ -1025,6 +1828,8 @@ def main():
             test_ratio=float(args.balanced_test_ratio),
             seed=int(args.balanced_seed),
             min_pos_per_rel=int(args.min_pos_per_rel),
+            min_neg_per_rel=int(args.min_neg_per_rel),
+            cls_keep_frac=float(args.cls_keep_frac),
         )
         _save_split_cache(cache_path, expected_meta, split_out)
 
@@ -1125,6 +1930,37 @@ def main():
     else:
         print("\n[INFO] No leftover classification examples to add to encoder.")
 
+    if args.use_retrieved:
+        before_stats = _graph_stats(struct_graph, subclass_rel=subclass_rel, instance_rel=instance_rel, neg_prefix=NEG_PREFIX)
+        struct_graph, base_x, num_nodes, aug_stats = _augment_with_retrieved(
+            struct_graph=struct_graph,
+            base_x=base_x,
+            num_nodes=num_nodes,
+            data_dir=args.path,
+            retrieved_dir=args.retrieved_dir,
+            subclass_rel=subclass_rel,
+            instance_rel=instance_rel,
+            neg_prefix=NEG_PREFIX,
+            map_out_name=args.retrieved_map_out,
+        )
+        after_stats = _graph_stats(struct_graph, subclass_rel=subclass_rel, instance_rel=instance_rel, neg_prefix=NEG_PREFIX)
+
+        print("\n=== Retrieved augmentation summary ===")
+        print(f"New nodes added:             {aug_stats.get('new_nodes', 0)}")
+        print(f"New class nodes added:       {aug_stats.get('new_class_nodes', 0)}")
+        print(f"Instance_of edges added:     {aug_stats.get('inst_edges_added', 0)}")
+        print(f"Subclass_of edges added:     {aug_stats.get('sub_edges_added', 0)}")
+        print(f"Negative edges added:        {aug_stats.get('neg_edges_added', 0)}")
+        if aug_stats.get("neg_pred_missing", 0) > 0:
+            print(f"Negative predicates missing in relation2id: {aug_stats.get('neg_pred_missing', 0)}")
+
+        print("\n=== Encoder graph size (before vs after) ===")
+        print(f"Nodes:       {before_stats['num_nodes']} -> {after_stats['num_nodes']}")
+        print(f"Edges total: {before_stats['total_edges']} -> {after_stats['total_edges']}")
+        print(f"Instance_of: {before_stats['instance_edges']} -> {after_stats['instance_edges']}")
+        print(f"Subclass_of: {before_stats['subclass_edges']} -> {after_stats['subclass_edges']}")
+        print(f"Neg edges:   {before_stats['neg_edges']} -> {after_stats['neg_edges']}")
+
     # e_etypes_struct = list(struct_graph.edge_types)
     # if args.model == "hgcn":
     #     encoder_graph = build_hgcn_encoder_graph(struct_graph, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX)
@@ -1143,7 +1979,7 @@ def main():
     else:
         ei = encoder_graph[CLS_EDGE_TYPE].edge_index
         if ei is None: encoder_graph[CLS_EDGE_TYPE].edge_index = torch.empty((2, 0), dtype=torch.long)
-    MP_EDGE_TYPES = [et for et in encoder_graph.edge_types if et != CLS_EDGE_TYPE]
+    MP_EDGE_TYPES = [et for et in encoder_graph.edge_types if et != CLS_EDGE_TYPE and et[1] != subclass_rel]
     encoder_e_etypes = MP_EDGE_TYPES
 
 
@@ -1178,7 +2014,10 @@ def main():
     best_epochs: List[int] = []
     best_lrs: List[float] = []
     cv_metrics: List[torch.Tensor] = []
+    sampler_stats_printed = False
 
+    final_model = None
+    final_contrastive_sampler = None
     if args.finaltrain_only:
         if args.final_lr is None or args.final_epochs is None:
             raise ValueError("When using --finaltrain_only you must provide BOTH --final_lr and --final_epochs")
@@ -1279,6 +2118,9 @@ def main():
             # num_neighbors = {et: [20, 10] for et in encoder_graph.edge_types}
             num_neighbors = {et: [20, 10] for et in MP_EDGE_TYPES}
             num_neighbors[CLS_EDGE_TYPE] = [0, 0]   # <-- IMPORTANT: don't sample along cls_link
+            sub_edge_type = ("node", subclass_rel, "node")
+            if sub_edge_type in fold_encoder_graph.edge_types:
+                num_neighbors[sub_edge_type] = [0, 0]  # keep in graph for sampler, but no MP sampling
 
             train_loader = LinkNeighborLoader(fold_encoder_graph, num_neighbors=num_neighbors,
                 edge_label_index=(CLS_EDGE_TYPE, train_edge_label_index), edge_label=train_edge_label,
@@ -1326,6 +2168,10 @@ def main():
                         instance_rel=instance_rel,
                     )
                     neg_stmt_sampler.prepare_global(sampler_graph)
+                if (args.print_sampler_stats or args.use_retrieved) and not sampler_stats_printed:
+                    if hasattr(neg_stmt_sampler, "print_pool_stats"):
+                        neg_stmt_sampler.print_pool_stats(prefix="[NegSamplerStats]")
+                        sampler_stats_printed = True
             else:
                 neg_stmt_sampler = None
 
@@ -1384,6 +2230,9 @@ def main():
         # num_neighbors = {et: neighbor_sizes for et in encoder_graph.edge_types}
         num_neighbors = {et: neighbor_sizes for et in MP_EDGE_TYPES}
         num_neighbors[CLS_EDGE_TYPE] = [0, 0]
+        sub_edge_type = ("node", subclass_rel, "node")
+        if sub_edge_type in train_encoder_graph.edge_types:
+            num_neighbors[sub_edge_type] = [0, 0]
         
         final_loader = LinkNeighborLoader(train_encoder_graph, num_neighbors=num_neighbors,
             edge_label_index=(CLS_EDGE_TYPE, final_edge_label_index),neg_sampling_ratio=0.0,
@@ -1431,6 +2280,10 @@ def main():
                     k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel
                 )
                 final_contrastive_sampler.prepare_global(train_encoder_graph)
+            if (args.print_sampler_stats or args.use_retrieved) and not sampler_stats_printed:
+                if hasattr(final_contrastive_sampler, "print_pool_stats"):
+                    final_contrastive_sampler.print_pool_stats(prefix="[NegSamplerStats]")
+                    sampler_stats_printed = True
         else:
             final_contrastive_sampler = None
 
@@ -1466,9 +2319,20 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    if final_model is None:
+        raise RuntimeError("final_model was not initialized. Use --test_only to load a model or run training.")
+
     model_path = os.path.join("output/" + args.output_dir, f"final_model_{args.model}.pt")
     if not args.test_only:
         torch.save(final_model.state_dict(), model_path)
+
+    out_dir = os.path.join("output", args.output_dir)
+    _save_embeddings_and_neighbors(
+        model=final_model,
+        encoder_graph=encoder_graph,
+        out_dir=out_dir,
+        sampler=final_contrastive_sampler,
+    )
 
     test_pos_mask = (test_labels_all > 0.5)
     test_heads = test_heads_all[test_pos_mask]

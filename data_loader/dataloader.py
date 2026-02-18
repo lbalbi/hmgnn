@@ -41,7 +41,7 @@ class DataLoader:
         """Return list of data files to load as GRAPH edges.
         We explicitly skip test2id_pos.txt so the encoder graph stays "fixed".
         """
-        skip_files = {"test2id_pos.txt"}
+        skip_files = {"test2id_pos.txt", "neg_statistical_inference.tsv"}
         files: List[str] = []
         for f in os.listdir(path):
             full = os.path.join(path, f)
