@@ -428,7 +428,8 @@ class Test_BestModel:
         test_rels: torch.Tensor, test_tails: torch.Tensor, id2rel: Dict[int, str],
         neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int, 
         device: torch.device, log, batch_size: int = 1024,
-        neg_cache_path: Optional[str] = None, force_regen_negs: bool = True):
+        neg_cache_path: Optional[str] = None, force_regen_negs: bool = True,
+        save_embeddings_path: Optional[str] = None):
         self.model = model.to(device)
         self.graph = graph
         self.test_heads = test_heads
@@ -439,6 +440,7 @@ class Test_BestModel:
         self.num_neg_per_pos = int(num_neg_per_pos)
         self.neg_cache_path = neg_cache_path
         self.force_regen_negs = force_regen_negs
+        self.save_embeddings_path = save_embeddings_path
         self.device = device
         self.log = log
         self.batch_size = int(batch_size)
@@ -654,6 +656,12 @@ class Test_BestModel:
             h_dict = self.model.encode(graph_cpu)
             z = h_dict[getattr(self.model, "n_type", "node")]
             del h_dict
+            if self.save_embeddings_path:
+                try:
+                    torch.save({"embeddings": z.detach().cpu()}, self.save_embeddings_path)
+                    print(f"[INFO] Saved test-time embeddings: {self.save_embeddings_path}")
+                except Exception as e:
+                    print(f"[WARN] Failed to save test-time embeddings: {e}")
 
             pos_probs = self._score_triples_in_batches(
                 z, self.test_heads, self.test_rels, self.test_tails

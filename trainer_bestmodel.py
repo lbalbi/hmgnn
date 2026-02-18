@@ -387,42 +387,42 @@ class Train_BestModel:
                 self.optimizer.step()
 
             print(f"[Final Train] Epoch {epoch:03d} total_time={time.time() - t_epoch:.2f}s", flush=True)
-                self.model.eval()
-                if use_neighbor_mode:
-                    val_bce, _, val_probs, val_labels = self._eval_with_neighbors(n_type=n_type)
-                else:
-                    with torch.no_grad():
-                        h_dict_val = self.model.encode(self.graph)
-                        z_val = h_dict_val[n_type]
-                        val_bce, _, val_probs, val_labels, _ = self._iterate_batches(
-                            self.val_idx, z_val, train=False)
+            self.model.eval()
+            if use_neighbor_mode:
+                val_bce, _, val_probs, val_labels = self._eval_with_neighbors(n_type=n_type)
+            else:
+                with torch.no_grad():
+                    h_dict_val = self.model.encode(self.graph)
+                    z_val = h_dict_val[n_type]
+                    val_bce, _, val_probs, val_labels, _ = self._iterate_batches(
+                        self.val_idx, z_val, train=False)
 
-                if val_probs is not None and val_labels is not None:
-                    val_metrics = self.metrics.update(val_probs, val_labels)
-                else: val_metrics = None
+            if val_probs is not None and val_labels is not None:
+                val_metrics = self.metrics.update(val_probs, val_labels)
+            else: val_metrics = None
+            if not getattr(self.log, "non_verbose", False):
+                msg = (f"[lr={lr:.3g}] Epoch {epoch:03d} | "
+                    f"TrainLoss(BCE)={bce_loss:.4f} | "
+                    f"TrainLoss(Contr)={contr_loss:.4f} | "
+                    f"ValLoss(BCE)={val_bce:.4f}")
+                if val_metrics is not None:
+                    msg += " | " + ", ".join(f"{name}={val_metrics[i]:.4f}"
+                        for i, name in enumerate(self.metrics.get_names()))
+                self.log.log(msg)
+
+            if val_bce < best_val_loss_lr:
+                best_val_loss_lr = val_bce
+                best_epoch_lr = epoch
+                best_metrics_lr = val_metrics
+                best_state_lr = {k:v.detach().clone() for k,v in self.model.state_dict().items()}
+
+            if lr_early_stopping.step(val_bce, self.model):
                 if not getattr(self.log, "non_verbose", False):
-                    msg = (f"[lr={lr:.3g}] Epoch {epoch:03d} | "
-                        f"TrainLoss(BCE)={bce_loss:.4f} | "
-                        f"TrainLoss(Contr)={contr_loss:.4f} | "
-                        f"ValLoss(BCE)={val_bce:.4f}")
-                    if val_metrics is not None:
-                        msg += " | " + ", ".join(f"{name}={val_metrics[i]:.4f}"
-                            for i, name in enumerate(self.metrics.get_names()))
-                    self.log.log(msg)
-
-                if val_bce < best_val_loss_lr:
-                    best_val_loss_lr = val_bce
-                    best_epoch_lr = epoch
-                    best_metrics_lr = val_metrics
-                    best_state_lr = {k:v.detach().clone() for k,v in self.model.state_dict().items()}
-
-                if lr_early_stopping.step(val_bce, self.model):
-                    if not getattr(self.log, "non_verbose", False):
-                        self.log.log(f"[lr={lr:.3g}] Early stopping at epoch {epoch} "
-                            f"(best val loss so far: {best_val_loss_lr:.4f}).")
-                else:
-                    print(f"Training Epoch: {epoch} completed.", flush=True)
-                    break
+                    self.log.log(f"[lr={lr:.3g}] Early stopping at epoch {epoch} "
+                        f"(best val loss so far: {best_val_loss_lr:.4f}).")
+            else:
+                print(f"Training Epoch: {epoch} completed.", flush=True)
+                break
 
             last_bce_loss = bce_loss
             last_contr_loss = contr_loss
@@ -447,7 +447,8 @@ class Test_BestModel:
         test_rels: torch.Tensor, test_tails: torch.Tensor, id2rel: Dict[int, str],
         neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int, 
         device: torch.device, log, batch_size: int = 1024,
-        neg_cache_path: Optional[str] = None, force_regen_negs: bool = True):
+        neg_cache_path: Optional[str] = None, force_regen_negs: bool = True,
+        save_embeddings_path: Optional[str] = None):
         self.model = model.to(device)
         self.graph = graph
         self.test_heads = test_heads
@@ -458,6 +459,7 @@ class Test_BestModel:
         self.num_neg_per_pos = int(num_neg_per_pos)
         self.neg_cache_path = neg_cache_path
         self.force_regen_negs = force_regen_negs
+        self.save_embeddings_path = save_embeddings_path
         self.device = device
         self.log = log
         self.batch_size = int(batch_size)
@@ -673,6 +675,12 @@ class Test_BestModel:
             h_dict = self.model.encode(graph_cpu)
             z = h_dict[getattr(self.model, "n_type", "node")]
             del h_dict
+            if self.save_embeddings_path:
+                try:
+                    torch.save({"embeddings": z.detach().cpu()}, self.save_embeddings_path)
+                    print(f"[INFO] Saved test-time embeddings: {self.save_embeddings_path}")
+                except Exception as e:
+                    print(f"[WARN] Failed to save test-time embeddings: {e}")
 
             pos_probs = self._score_triples_in_batches(
                 z, self.test_heads, self.test_rels, self.test_tails

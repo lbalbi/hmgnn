@@ -27,6 +27,7 @@ from samplers import (
 
 NEG_PREFIX = "NOT_"
 CLS_EDGE_TYPE = ("node", "cls_link", "node")
+CLS_EDGE_SUFFIX = "__cls"
 
 def _with_cls_edges(
     base_graph: HeteroData,
@@ -41,6 +42,44 @@ def _with_cls_edges(
         edge_index = torch.stack([heads, tails], dim=0)
     g[CLS_EDGE_TYPE].edge_index = edge_index
     return g
+
+def _add_cls_edges_for_sampler(
+    g: HeteroData,
+    *,
+    heads: torch.Tensor,
+    tails: torch.Tensor,
+    rels: torch.Tensor,
+    labels: torch.Tensor,
+    id2rel: Dict[int, str],
+) -> Tuple[int, int]:
+    """Append train classification triples as sampler-only edges (with __cls suffix)."""
+    n_cls_pos = 0
+    n_cls_neg = 0
+    if heads is None or heads.numel() == 0:
+        return 0, 0
+    h = heads.detach().cpu().numpy()
+    t = tails.detach().cpu().numpy()
+    r = rels.detach().cpu().numpy()
+    y = labels.detach().cpu().numpy()
+    for rid in np.unique(r):
+        rel = str(id2rel[int(rid)])
+        mask_r = (r == rid)
+        mask_pos = mask_r & (y > 0.5)
+        mask_neg = mask_r & (y <= 0.5)
+        if mask_pos.any():
+            src = torch.tensor(h[mask_pos], dtype=torch.long)
+            tgt = torch.tensor(t[mask_pos], dtype=torch.long)
+            et = f"{rel}{CLS_EDGE_SUFFIX}"
+            _append_edges(g, et, src, tgt)
+            n_cls_pos += int(mask_pos.sum())
+        if mask_neg.any():
+            src = torch.tensor(h[mask_neg], dtype=torch.long)
+            tgt = torch.tensor(t[mask_neg], dtype=torch.long)
+            et_base = _ensure_not_prefixed(rel)
+            et = f"{et_base}{CLS_EDGE_SUFFIX}"
+            _append_edges(g, et, src, tgt)
+            n_cls_neg += int(mask_neg.sum())
+    return n_cls_pos, n_cls_neg
 
 def print_encoder_and_cls_totals(
     *,
@@ -1012,6 +1051,8 @@ def _save_embeddings_and_neighbors(
     encoder_graph: HeteroData,
     out_dir: str,
     sampler: Optional[object],
+    subclass_rel: Optional[str] = None,
+    cls_edge_suffix: str = CLS_EDGE_SUFFIX,
 ) -> None:
     ensure_dir(out_dir)
     emb_path = os.path.join(out_dir, "embeddings.pt")
@@ -1023,6 +1064,11 @@ def _save_embeddings_and_neighbors(
         orig_device = torch.device("cpu")
     model_cpu = model.to("cpu")
     graph_cpu = encoder_graph.cpu()
+    # Remove __cls edges so embeddings match message-passing edges used at test time
+    for et in list(graph_cpu.edge_types):
+        rel = str(et[1])
+        if rel.endswith(str(cls_edge_suffix)):
+            graph_cpu[et].edge_index = torch.empty((2, 0), dtype=torch.long)
     model_cpu.eval()
     with torch.no_grad():
         h_dict = model_cpu.encode(graph_cpu)
@@ -1977,6 +2023,9 @@ def main():
     print(f"       leftover positives added: {n_left_pos}")
     print(f"       leftover negatives added: {n_left_neg}")
 
+    # (c) TRAIN classification triples will be added per-CV-fold (and for final training)
+    #     so that each fold only sees its own train triples in the encoder graph.
+
     if args.use_retrieved:
         before_stats = _graph_stats(struct_graph, subclass_rel=subclass_rel, instance_rel=instance_rel, neg_prefix=NEG_PREFIX)
         struct_graph, base_x, num_nodes, aug_stats = _augment_with_retrieved(
@@ -2060,7 +2109,11 @@ def main():
     else:
         ei = encoder_graph[CLS_EDGE_TYPE].edge_index
         if ei is None: encoder_graph[CLS_EDGE_TYPE].edge_index = torch.empty((2, 0), dtype=torch.long)
-    MP_EDGE_TYPES = [et for et in encoder_graph.edge_types if et != CLS_EDGE_TYPE and et[1] != subclass_rel]
+    MP_EDGE_TYPES = [
+        et for et in encoder_graph.edge_types
+        if et != CLS_EDGE_TYPE
+        and not str(et[1]).endswith(CLS_EDGE_SUFFIX)
+    ]
     encoder_e_etypes = MP_EDGE_TYPES
 
     print_encoder_and_cls_totals(
@@ -2100,7 +2153,7 @@ def main():
         topk=25)
 
 
-    neighbor_sizes = [15, 10]
+    neighbor_sizes = [10, 7]
     # best_epochs: List[int] = []
     # best_lrs: List[float] = []
     # cv_metrics: List[torch.Tensor] = []
@@ -2209,13 +2262,24 @@ def main():
                 cls_heads[train_idx],
                 cls_tails[train_idx],
             )
+            n_cls_pos_fold, n_cls_neg_fold = _add_cls_edges_for_sampler(
+                fold_encoder_graph,
+                heads=cls_heads[train_idx],
+                tails=cls_tails[train_idx],
+                rels=cls_rels[train_idx],
+                labels=cls_labels[train_idx],
+                id2rel=id2rel,
+            )
+            if fold == 1:
+                print(f"\n[INFO] Fold {fold} encoder got TRAIN cls edges (sampler-only): "
+                      f"pos={n_cls_pos_fold} neg={n_cls_neg_fold}")
 
             # num_neighbors = {et: [20, 10] for et in encoder_graph.edge_types}
-            num_neighbors = {et: [20, 10] for et in MP_EDGE_TYPES}
+            num_neighbors = {et: [12, 8] for et in MP_EDGE_TYPES}
             num_neighbors[CLS_EDGE_TYPE] = [0, 0]   # <-- IMPORTANT: don't sample along cls_link
-            sub_edge_type = ("node", subclass_rel, "node")
-            if sub_edge_type in fold_encoder_graph.edge_types:
-                num_neighbors[sub_edge_type] = [0, 0]  # keep in graph for sampler, but no MP sampling
+            for et in fold_encoder_graph.edge_types:
+                if str(et[1]).endswith(CLS_EDGE_SUFFIX):
+                    num_neighbors[et] = [0, 0]
 
             train_loader = LinkNeighborLoader(fold_encoder_graph, num_neighbors=num_neighbors,
                 edge_label_index=(CLS_EDGE_TYPE, train_edge_label_index), edge_label=train_edge_label,
@@ -2262,7 +2326,7 @@ def main():
                         neg_prefix=NEG_PREFIX,
                         instance_rel=instance_rel,
                         cache_dir="data/cache",
-                        cache_key=f"{args.path}|{args.output_dir}|fold{fold}",
+                        cache_key=f"{args.path}|{args.output_dir}|fold{fold}|clsedge=1",
                     )
                     neg_stmt_sampler.prepare_global(sampler_graph)
                 if (args.print_sampler_stats or args.use_retrieved) and not sampler_stats_printed:
@@ -2356,6 +2420,16 @@ def main():
     # -----------------------------------------------------------------
     if not args.test_only:
         train_encoder_graph = _with_cls_edges(encoder_graph, cls_heads, cls_tails)
+        n_cls_pos_all, n_cls_neg_all = _add_cls_edges_for_sampler(
+            train_encoder_graph,
+            heads=cls_heads,
+            tails=cls_tails,
+            rels=cls_rels,
+            labels=cls_labels,
+            id2rel=id2rel,
+        )
+        print(f"\n[INFO] Final encoder got ALL TRAIN cls edges (sampler-only): "
+              f"pos={n_cls_pos_all} neg={n_cls_neg_all}")
         print_final_train_encoder_statement_counts(
             encoder_graph=train_encoder_graph,
             subclass_rel=subclass_rel,
@@ -2367,9 +2441,9 @@ def main():
         # num_neighbors = {et: neighbor_sizes for et in encoder_graph.edge_types}
         num_neighbors = {et: neighbor_sizes for et in MP_EDGE_TYPES}
         num_neighbors[CLS_EDGE_TYPE] = [0, 0]
-        sub_edge_type = ("node", subclass_rel, "node")
-        if sub_edge_type in train_encoder_graph.edge_types:
-            num_neighbors[sub_edge_type] = [0, 0]
+        for et in train_encoder_graph.edge_types:
+            if str(et[1]).endswith(CLS_EDGE_SUFFIX):
+                num_neighbors[et] = [0, 0]
         
         final_loader = LinkNeighborLoader(train_encoder_graph, num_neighbors=num_neighbors,
             edge_label_index=(CLS_EDGE_TYPE, final_edge_label_index),neg_sampling_ratio=0.0,
@@ -2415,7 +2489,7 @@ def main():
             else:
                 final_contrastive_sampler = NegativeInstanceSampler_NEW(
                     k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel,
-                    cache_dir="data/cache", cache_key=f"{args.path}|{args.output_dir}|final"
+                    cache_dir="data/cache", cache_key=f"{args.path}|{args.output_dir}|final|clsedge=1"
                 )
                 final_contrastive_sampler.prepare_global(train_encoder_graph)
             if (args.print_sampler_stats or args.use_retrieved) and not sampler_stats_printed:
@@ -2470,6 +2544,8 @@ def main():
         encoder_graph=encoder_graph,
         out_dir=out_dir,
         sampler=final_contrastive_sampler,
+        subclass_rel=subclass_rel,
+        cls_edge_suffix=CLS_EDGE_SUFFIX,
     )
 
     test_pos_mask = (test_labels_all > 0.5)
@@ -2514,6 +2590,7 @@ def main():
         log=test_log,
         batch_size=args.batch_size,
         neg_cache_path=cache_path,
+        save_embeddings_path=os.path.join("output", args.output_dir, "embeddings.pt"),
     )
     tester.run()
 

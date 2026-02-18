@@ -1,26 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=wikidata_rargcn_noNegs_noCL_NS_wn_linkloader
-#SBATCH --array=4-4
+#SBATCH --job-name=wikidata_rargcn_protCL_1802_test2
+#SBATCH --array=1-1
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
-#SBATCH --nodelist=liseda-03
-#SBATCH --partition=tier3
+#SBATCH --nodelist=liseda-05
+#SBATCH --partition=gpu_hi
 
 set -euo pipefail
 
 RUN_TAG="run_${SLURM_ARRAY_TASK_ID}"
-LOG_DIR="output/wikidata_rargcn_noNegs_noCL_NS_wn_linkloader"
-OUTDIR="${LOG_DIR}/output_wikidata_rargcn_noNegs_noCL_NS_wn_linkloader_${RUN_TAG}"
-LOGFILE="${LOG_DIR}/output_wikidata_rargcn_noNegs_noCL_NS_wn_linkloader_${RUN_TAG}.txt"
+LOG_DIR="output/wikidata_rargcn_protCL_1802_test2"
+OUTDIR="${LOG_DIR}/output_wikidata_rargcn_protCL_1802_test2_${RUN_TAG}"
+LOGFILE="${LOG_DIR}/output_wikidata_rargcn_protCL_1802_test2_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
 python -u main_NEW.py \
   --path "data/wikidata_data" \
+  --use_retrieved \
+  --print_sampler_stats \
   --task "wikidata" \
   --model "ra_rgcn" \
   --batch_size 12460 \
-  --use_nstatementsampler \
-  --no_contrastive \
-  --output_dir "wikidata_rargcn_noNegs_noCL_NS_wn_linkloader/output_wikidata_rargcn_noNegs_noCL_NS_wn_linkloader_${RUN_TAG}/" \
+  --output_dir "wikidata_rargcn_protCL_1802_test2/output_wikidata_rargcn_protCL_1802_test2_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1

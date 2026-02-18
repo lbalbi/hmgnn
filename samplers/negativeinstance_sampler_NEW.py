@@ -58,6 +58,9 @@ class NegativeInstanceSampler_NEW:
         self._pre_shpos = None
         self._pre_ready = False
         self.primary_pred = instance_rel  # "instance_of"
+        self.cls_edge_suffix = "__cls"
+        self.prefer_inst_only = None
+        self.inst_pred_key = None
         self._dbg_ctr = 0
         self._dbg_every = 20
 
@@ -97,6 +100,19 @@ class NegativeInstanceSampler_NEW:
                     continue
                 sizes.append(int(torch.unique(torch.cat(parts, dim=0)).numel()))
             return sizes
+
+        def _empty_count(dd_list) -> Optional[int]:
+            if dd_list is None or len(dd_list) == 0:
+                return None
+            max_u = max(self.anchors) if self.anchors else -1
+            if max_u >= len(dd_list):
+                return None
+            def _has_any(dd) -> bool:
+                for t in dd.values():
+                    if t is not None and t.numel() > 0:
+                        return True
+                return False
+            return sum(1 for u in self.anchors if not _has_any(dd_list[u]))
 
         def _summ(name: str, vals: List[int]) -> None:
             if not vals:
@@ -144,6 +160,9 @@ class NegativeInstanceSampler_NEW:
             vals = _safe_lens_tensor(getattr(self, "pool_neg_to_u_pos", []))
         if vals is not None:
             _summ("pool_neg_to_u_pos_size", vals)
+        empty_neg2pos = _empty_count(getattr(self, "pool_neg_to_u_pos_by_pred", None))
+        if empty_neg2pos is not None:
+            print(f"{prefix} pool_neg_to_u_pos_empty_anchors: {empty_neg2pos}")
 
     def _cache_path(self) -> Optional[str]:
         if not self.cache_dir or not self.cache_key:
@@ -199,6 +218,7 @@ class NegativeInstanceSampler_NEW:
         self._g2l_cpu = torch.empty(self.num_nodes, dtype=torch.long)
         self._stamp_cpu = torch.zeros(self.num_nodes, dtype=torch.int32)
         self._cur_stamp = 0
+        self._compute_prefer_inst_only()
         print(f"[NegativeInstanceSampler_NEW] loaded cache: {path}", flush=True)
         return True
 
@@ -368,7 +388,48 @@ class NegativeInstanceSampler_NEW:
 
     def _base_pred(self, rel: str) -> str:
         rel = str(rel)
-        return rel[len(self.neg_prefix):] if rel.startswith(self.neg_prefix) else rel
+        if rel.startswith(self.neg_prefix):
+            rel = rel[len(self.neg_prefix):]
+        if rel.endswith(self.cls_edge_suffix):
+            rel = rel[: -len(self.cls_edge_suffix)]
+        return rel
+
+    def _compute_prefer_inst_only(self) -> None:
+        if not self.anchors:
+            self.prefer_inst_only = []
+            self.inst_pred_key = []
+            return
+        if self.pool_shared_pos_by_pred is None:
+            return
+        N = int(self.num_nodes)
+        self.prefer_inst_only = [False for _ in range(N)]
+        self.inst_pred_key = [None for _ in range(N)]
+
+        def _non_empty(dd, key: str) -> bool:
+            if dd is None:
+                return False
+            t = dd.get(key, None)
+            return t is not None and t.numel() > 0
+
+        cand_keys = [str(self.primary_pred), "instance_of", "P31"]
+        for u in self.anchors:
+            key = None
+            for k in cand_keys:
+                if (
+                    _non_empty(self.pool_shared_pos_by_pred[u], k)
+                    or _non_empty(self.pool_shared_neg_by_pred[u], k)
+                    or _non_empty(self.pool_pos_to_u_neg_by_pred[u], k)
+                    or _non_empty(self.pool_neg_to_u_pos_by_pred[u], k)
+                ):
+                    key = k
+                    break
+            if key is None:
+                continue
+            pos_ok = _non_empty(self.pool_shared_pos_by_pred[u], key) and _non_empty(self.pool_shared_neg_by_pred[u], key)
+            neg_ok = _non_empty(self.pool_pos_to_u_neg_by_pred[u], key) or _non_empty(self.pool_neg_to_u_pos_by_pred[u], key)
+            if pos_ok and neg_ok:
+                self.prefer_inst_only[u] = True
+                self.inst_pred_key[u] = key
 
 
     def prepare_global(self, full_g: HeteroData) -> None:
@@ -494,6 +555,7 @@ class NegativeInstanceSampler_NEW:
         self._cur_stamp = 0
         # print(f"[NegativeInstanceSampler_NEW] prepare_global: done in {time.time() - t0:.2f}s")
         self._save_cache()
+        self._compute_prefer_inst_only()
         self._pre_ready = False
 
     def prepare_epoch(self) -> None:
@@ -511,28 +573,72 @@ class NegativeInstanceSampler_NEW:
 
         for u in self.anchors_valid:
             pred_order = self.pred_order_cache[u] if self.pred_order_cache is not None else self._pred_priority(u)
-            self._pre_shneg[u] = self._sample_k_priority_cpu(
-                self.pool_shared_neg_by_pred[u], pred_order, stamp=0,
-                fallback_global=u, fallback_local=u, k=k, full_graph_mode=True
-            )
+            if self.prefer_inst_only is not None and u < len(self.prefer_inst_only) and self.prefer_inst_only[u]:
+                inst_key = self.inst_pred_key[u] if self.inst_pred_key is not None else None
+                if inst_key:
+                    pred_order = [inst_key]
+            shpos_pool = self.pool_shared_pos_by_pred[u]
+            shneg_pool = self.pool_shared_neg_by_pred[u]
+            if self.prefer_inst_only is not None and u < len(self.prefer_inst_only) and self.prefer_inst_only[u]:
+                inst_key = self.inst_pred_key[u] if self.inst_pred_key is not None else None
+                if inst_key:
+                    shpos_t = shpos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                    shneg_t = shneg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                    shpos_pool = {inst_key: shpos_t}
+                    shneg_pool = {inst_key: shneg_t}
+            has_shpos = self._has_any_pool_map(shpos_pool)
+            has_shneg = self._has_any_pool_map(shneg_pool)
+            # Old behavior: sample shared_neg/shared_pos independently
+            # self._pre_shneg[u] = self._sample_k_priority_cpu(
+            #     self.pool_shared_neg_by_pred[u], pred_order, stamp=0,
+            #     fallback_global=u, fallback_local=u, k=k, full_graph_mode=True
+            # )
+            if not has_shpos and has_shneg:
+                shpos_pool = shneg_pool
+                has_shpos = True
+            if not has_shneg and has_shpos:
+                shneg_pool = shpos_pool
+                has_shneg = True
+            if has_shneg:
+                self._pre_shneg[u] = self._sample_k_priority_cpu(
+                    shneg_pool, pred_order, stamp=0,
+                    fallback_global=u, fallback_local=u, k=k, full_graph_mode=True
+                )
             pos2neg_pool = self.pool_pos_to_u_neg_by_pred[u]
-            if not self._has_any_pool_map(pos2neg_pool):
-                pos2neg_pool = {"__any__": self.pool_shared_neg_any[u]}
+            neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u]
+            has_pos2neg = self._has_any_pool_map(pos2neg_pool)
+            has_neg2pos = self._has_any_pool_map(neg2pos_pool)
+            if self.prefer_inst_only is not None and u < len(self.prefer_inst_only) and self.prefer_inst_only[u]:
+                inst_key = self.inst_pred_key[u] if self.inst_pred_key is not None else None
+                if inst_key:
+                    pos2neg_t = pos2neg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                    neg2pos_t = neg2pos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                    pos2neg_pool = {inst_key: pos2neg_t}
+                    neg2pos_pool = {inst_key: neg2pos_t}
+                    has_pos2neg = pos2neg_t.numel() > 0
+                    has_neg2pos = neg2pos_t.numel() > 0
+            # Old fallback (shared_neg_any) disabled: use only available neg pool
+            # if not self._has_any_pool_map(pos2neg_pool):
+            #     pos2neg_pool = {"__any__": self.pool_shared_neg_any[u]}
+            # if not self._has_any_pool_map(neg2pos_pool):
+            #     neg2pos_pool = {"__any__": self.pool_shared_neg_any[u]}
+            if not has_pos2neg and has_neg2pos:
+                pos2neg_pool = neg2pos_pool
+            if not has_neg2pos and has_pos2neg:
+                neg2pos_pool = pos2neg_pool
             self._pre_pos2neg[u] = self._sample_k_priority_cpu(
                 pos2neg_pool, pred_order, stamp=0,
                 fallback_global=u, fallback_local=u, k=k, full_graph_mode=True
             )
-            neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u]
-            if not self._has_any_pool_map(neg2pos_pool):
-                neg2pos_pool = {"__any__": self.pool_shared_neg_any[u]}
             self._pre_neg2pos[u] = self._sample_k_priority_cpu(
                 neg2pos_pool, pred_order, stamp=0,
                 fallback_global=u, fallback_local=u, k=k, full_graph_mode=True
             )
-            self._pre_shpos[u] = self._sample_k_priority_cpu(
-                self.pool_shared_pos_by_pred[u], pred_order, stamp=0,
-                fallback_global=u, fallback_local=u, k=k, full_graph_mode=True
-            )
+            if has_shpos:
+                self._pre_shpos[u] = self._sample_k_priority_cpu(
+                    shpos_pool, pred_order, stamp=0,
+                    fallback_global=u, fallback_local=u, k=k, full_graph_mode=True
+                )
 
         self._pre_ready = True
         # print(f"[NegativeInstanceSampler_NEW] prepare_epoch: pre-sampled in {time.time() - t0:.2f}s", flush=True)
@@ -734,31 +840,78 @@ class NegativeInstanceSampler_NEW:
             for u in anchor_globals_cpu.tolist():
                 if not self._has_any_pool(u):
                     continue
-                if self._needs_fallback2_neg(u):
-                    continue
+                # Old skip when neg pools empty (fallback2) disabled
+                # if self._needs_fallback2_neg(u):
+                #     continue
                 pred_order = self.pred_order_cache[u] if self.pred_order_cache is not None else self._pred_priority(u)
+                if self.prefer_inst_only is not None and u < len(self.prefer_inst_only) and self.prefer_inst_only[u]:
+                    inst_key = self.inst_pred_key[u] if self.inst_pred_key is not None else None
+                    if inst_key:
+                        pred_order = [inst_key]
 
-                anchors_cpu.append(u)
-                shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u], pred_order, stamp=0,
-                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
                 pos2neg_pool = self.pool_pos_to_u_neg_by_pred[u]
-                if not self._has_any_pool_map(pos2neg_pool):
-                    pos2neg_pool = {"__any__": self.pool_shared_neg_any[u]}
-                    fallback_pos2neg += 1
-                    if self.pool_shared_neg_any[u].numel() == 0:
-                        still_empty_pos2neg += 1
+                neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u]
+                has_pos2neg = self._has_any_pool_map(pos2neg_pool)
+                has_neg2pos = self._has_any_pool_map(neg2pos_pool)
+                if self.prefer_inst_only is not None and u < len(self.prefer_inst_only) and self.prefer_inst_only[u]:
+                    inst_key = self.inst_pred_key[u] if self.inst_pred_key is not None else None
+                    if inst_key:
+                        pos2neg_t = pos2neg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                        neg2pos_t = neg2pos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                        pos2neg_pool = {inst_key: pos2neg_t}
+                        neg2pos_pool = {inst_key: neg2pos_t}
+                        has_pos2neg = pos2neg_t.numel() > 0
+                        has_neg2pos = neg2pos_t.numel() > 0
+                if not has_pos2neg and not has_neg2pos:
+                    continue
+                # Old fallback (shared_neg_any) disabled: use only available neg pool
+                # if not self._has_any_pool_map(pos2neg_pool):
+                #     pos2neg_pool = {"__any__": self.pool_shared_neg_any[u]}
+                #     fallback_pos2neg += 1
+                #     if self.pool_shared_neg_any[u].numel() == 0:
+                #         still_empty_pos2neg += 1
+                # if not self._has_any_pool_map(neg2pos_pool):
+                #     neg2pos_pool = {"__any__": self.pool_shared_neg_any[u]}
+                #     fallback_neg2pos += 1
+                #     if self.pool_shared_neg_any[u].numel() == 0:
+                #         still_empty_neg2pos += 1
+                if not has_pos2neg and has_neg2pos:
+                    pos2neg_pool = neg2pos_pool
+                if not has_neg2pos and has_pos2neg:
+                    neg2pos_pool = pos2neg_pool
+                shpos_pool = self.pool_shared_pos_by_pred[u]
+                shneg_pool = self.pool_shared_neg_by_pred[u]
+                if self.prefer_inst_only is not None and u < len(self.prefer_inst_only) and self.prefer_inst_only[u]:
+                    inst_key = self.inst_pred_key[u] if self.inst_pred_key is not None else None
+                    if inst_key:
+                        shpos_t = shpos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                        shneg_t = shneg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                        shpos_pool = {inst_key: shpos_t}
+                        shneg_pool = {inst_key: shneg_t}
+                has_shpos = self._has_any_pool_map(shpos_pool)
+                has_shneg = self._has_any_pool_map(shneg_pool)
+                # Old behavior: sample shared_neg/shared_pos independently
+                # shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u], pred_order, stamp=0,
+                #                             fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
+                if not has_shpos and not has_shneg:
+                    continue
+                if not has_shpos and has_shneg:
+                    shpos_pool = shneg_pool
+                    has_shpos = True
+                if not has_shneg and has_shpos:
+                    shneg_pool = shpos_pool
+                    has_shneg = True
+                anchors_cpu.append(u)
+                if has_shneg:
+                    shneg_cpu.append(self._sample_k_priority_cpu(shneg_pool, pred_order, stamp=0,
+                                                fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
                 pos2neg_cpu.append(self._sample_k_priority_cpu(pos2neg_pool, pred_order, stamp=0,
                                             fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u]
-                if not self._has_any_pool_map(neg2pos_pool):
-                    neg2pos_pool = {"__any__": self.pool_shared_neg_any[u]}
-                    fallback_neg2pos += 1
-                    if self.pool_shared_neg_any[u].numel() == 0:
-                        still_empty_neg2pos += 1
                 neg2pos_cpu.append(self._sample_k_priority_cpu(neg2pos_pool, pred_order, stamp=0,
                                             fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
-                shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u], pred_order, stamp=0,
-                                            fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
+                if has_shpos:
+                    shpos_cpu.append(self._sample_k_priority_cpu(shpos_pool, pred_order, stamp=0,
+                                                fallback_global=u, fallback_local=u, k=k, full_graph_mode=True).unsqueeze(0))
             t_sample = time.time() - t_sample
 
             if not anchors_cpu:
@@ -828,7 +981,36 @@ class NegativeInstanceSampler_NEW:
                 continue
             if not self._has_any_pool(u_g):
                 continue
-            if self._needs_fallback2_neg(u_g):
+            # Old skip when neg pools empty (fallback2) disabled
+            # if self._needs_fallback2_neg(u_g):
+            #     continue
+            pos2neg_pool = self.pool_pos_to_u_neg_by_pred[u_g]
+            neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u_g]
+            has_pos2neg = self._has_any_pool_map(pos2neg_pool)
+            has_neg2pos = self._has_any_pool_map(neg2pos_pool)
+            if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
+                inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
+                if inst_key:
+                    pos2neg_t = pos2neg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                    neg2pos_t = neg2pos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                    pos2neg_pool = {inst_key: pos2neg_t}
+                    neg2pos_pool = {inst_key: neg2pos_t}
+                    has_pos2neg = pos2neg_t.numel() > 0
+                    has_neg2pos = neg2pos_t.numel() > 0
+            if not has_pos2neg and not has_neg2pos:
+                continue
+            shpos_pool = self.pool_shared_pos_by_pred[u_g]
+            shneg_pool = self.pool_shared_neg_by_pred[u_g]
+            if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
+                inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
+                if inst_key:
+                    shpos_t = shpos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                    shneg_t = shneg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                    shpos_pool = {inst_key: shpos_t}
+                    shneg_pool = {inst_key: shneg_t}
+            has_shpos = self._has_any_pool_map(shpos_pool)
+            has_shneg = self._has_any_pool_map(shneg_pool)
+            if not has_shpos and not has_shneg:
                 continue
             anchor_globals_list.append(u_g)
             anchor_locals_list.append(u_l)
@@ -859,26 +1041,72 @@ class NegativeInstanceSampler_NEW:
             else:
                 for u_g, u_l in zip(anchor_globals_list, anchor_locals_list):
                     pred_order = self.pred_order_cache[u_g] if self.pred_order_cache is not None else self._pred_priority(u_g)
-                    shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u_g], pred_order, stamp=stamp,
-                                                fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+                    if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
+                        inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
+                        if inst_key:
+                            pred_order = [inst_key]
                     pos2neg_pool = self.pool_pos_to_u_neg_by_pred[u_g]
-                    if not self._has_any_pool_map(pos2neg_pool):
-                        pos2neg_pool = {"__any__": self.pool_shared_neg_any[u_g]}
-                        fallback_pos2neg += 1
-                        if self.pool_shared_neg_any[u_g].numel() == 0:
-                            still_empty_pos2neg += 1
+                    neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u_g]
+                    has_pos2neg = self._has_any_pool_map(pos2neg_pool)
+                    has_neg2pos = self._has_any_pool_map(neg2pos_pool)
+                    if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
+                        inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
+                        if inst_key:
+                            pos2neg_t = pos2neg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                            neg2pos_t = neg2pos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                            pos2neg_pool = {inst_key: pos2neg_t}
+                            neg2pos_pool = {inst_key: neg2pos_t}
+                            has_pos2neg = pos2neg_t.numel() > 0
+                            has_neg2pos = neg2pos_t.numel() > 0
+                    if not has_pos2neg and not has_neg2pos:
+                        continue
+                    shpos_pool = self.pool_shared_pos_by_pred[u_g]
+                    shneg_pool = self.pool_shared_neg_by_pred[u_g]
+                    if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
+                        inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
+                        if inst_key:
+                            shpos_t = shpos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                            shneg_t = shneg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                            shpos_pool = {inst_key: shpos_t}
+                            shneg_pool = {inst_key: shneg_t}
+                    has_shpos = self._has_any_pool_map(shpos_pool)
+                    has_shneg = self._has_any_pool_map(shneg_pool)
+                    if not has_shpos and not has_shneg:
+                        continue
+                    # Old fallback (shared_neg_any) disabled: use only available neg pool
+                    # if not self._has_any_pool_map(pos2neg_pool):
+                    #     pos2neg_pool = {"__any__": self.pool_shared_neg_any[u_g]}
+                    #     fallback_pos2neg += 1
+                    #     if self.pool_shared_neg_any[u_g].numel() == 0:
+                    #         still_empty_pos2neg += 1
+                    # if not self._has_any_pool_map(neg2pos_pool):
+                    #     neg2pos_pool = {"__any__": self.pool_shared_neg_any[u_g]}
+                    #     fallback_neg2pos += 1
+                    #     if self.pool_shared_neg_any[u_g].numel() == 0:
+                    #         still_empty_neg2pos += 1
+                    if not has_pos2neg and has_neg2pos:
+                        pos2neg_pool = neg2pos_pool
+                    if not has_neg2pos and has_pos2neg:
+                        neg2pos_pool = pos2neg_pool
+                    # Old behavior: sample shared_neg/shared_pos independently
+                    # shneg_cpu.append(self._sample_k_priority_cpu(self.pool_shared_neg_by_pred[u_g], pred_order, stamp=stamp,
+                    #                             fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+                    if not has_shpos and has_shneg:
+                        shpos_pool = shneg_pool
+                        has_shpos = True
+                    if not has_shneg and has_shpos:
+                        shneg_pool = shpos_pool
+                        has_shneg = True
+                    if has_shneg:
+                        shneg_cpu.append(self._sample_k_priority_cpu(shneg_pool, pred_order, stamp=stamp,
+                                                    fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
                     pos2neg_cpu.append(self._sample_k_priority_cpu(pos2neg_pool, pred_order, stamp=stamp,
                                                 fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-                    neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u_g]
-                    if not self._has_any_pool_map(neg2pos_pool):
-                        neg2pos_pool = {"__any__": self.pool_shared_neg_any[u_g]}
-                        fallback_neg2pos += 1
-                        if self.pool_shared_neg_any[u_g].numel() == 0:
-                            still_empty_neg2pos += 1
                     neg2pos_cpu.append(self._sample_k_priority_cpu(neg2pos_pool, pred_order, stamp=stamp,
                                                 fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
-                    shpos_cpu.append(self._sample_k_priority_cpu(self.pool_shared_pos_by_pred[u_g], pred_order, stamp=stamp,
-                                                fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
+                    if has_shpos:
+                        shpos_cpu.append(self._sample_k_priority_cpu(shpos_pool, pred_order, stamp=stamp,
+                                                    fallback_global=u_g, fallback_local=u_l, k=k, full_graph_mode=False).unsqueeze(0))
         t_sample = time.time() - t_sample
 
         if not anchors_local_cpu:

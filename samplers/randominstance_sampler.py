@@ -818,9 +818,11 @@ class RandomInstanceSampler(NegativeInstanceSampler):
     def _base_rel(self, rel: str) -> str:
         r = str(rel)
         if r.startswith(self.neg_prefix):
-            return r[len(self.neg_prefix) :]
-        if self.neg_prefix in r:
-            return r.replace(self.neg_prefix, "", 1)
+            r = r[len(self.neg_prefix) :]
+        elif self.neg_prefix in r:
+            r = r.replace(self.neg_prefix, "", 1)
+        if r.endswith("__cls"):
+            r = r[: -len("__cls")]
         return r
 
     def _rel_id(self, base_rel: str) -> int:
