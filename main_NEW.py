@@ -22,7 +22,7 @@ from trainer_NEW import Train
 from trainer_bestmodel_NEW import Train_BestModel, Test_BestModel
 from utils import Logger, load_config, ensure_dir
 from samplers import (
-    NegativeInstanceSampler_NEW, RandomInstanceSampler, PartialInstanceSampler
+    NegativeInstanceSampler_V2, RandomInstanceSampler, PartialInstanceSampler
 )
 
 NEG_PREFIX = "NOT_"
@@ -198,7 +198,7 @@ def compute_neg_neighbor_similarity_chart(
         print("[NegNeighborSim] No classification nodes found; skipping.")
         return
 
-    sampler = NegativeInstanceSampler_NEW(
+    sampler = NegativeInstanceSampler_V2(
         k=1,
         subclass_rel=subclass_rel,
         neg_prefix=neg_prefix,
@@ -2320,7 +2320,7 @@ def main():
                     )
                     neg_stmt_sampler.prepare_global(sampler_graph)
                 else:
-                    neg_stmt_sampler = NegativeInstanceSampler_NEW(
+                    neg_stmt_sampler = NegativeInstanceSampler_V2(
                         k=contrastive_k,
                         subclass_rel=subclass_rel,
                         neg_prefix=NEG_PREFIX,
@@ -2487,7 +2487,7 @@ def main():
                 )
                 final_contrastive_sampler.prepare_global(train_encoder_graph)
             else:
-                final_contrastive_sampler = NegativeInstanceSampler_NEW(
+                final_contrastive_sampler = NegativeInstanceSampler_V2(
                     k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel,
                     cache_dir="data/cache", cache_key=f"{args.path}|{args.output_dir}|final|clsedge=1"
                 )

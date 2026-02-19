@@ -6,3 +6,4 @@ from .negativeinstance_sampler import NegativeInstanceSampler
 from .randominstance_sampler import RandomInstanceSampler
 from .partialinstance_sampler import PartialInstanceSampler
 from .negativeinstance_sampler_NEW import NegativeInstanceSampler_NEW
+from .negativeinstance_sampler_v2 import NegativeInstanceSampler_V2

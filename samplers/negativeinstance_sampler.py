@@ -45,13 +45,23 @@ class NegativeInstanceSampler:
             print(f"{prefix} No anchors; skipping pool stats.")
             return
 
-        def _lens_list(lst: List[List[int]]) -> List[int]:
+        def _lens_list(lst: List[List[int]]) -> Optional[List[int]]:
+            if not lst:
+                return None
+            max_u = max(self.anchors) if self.anchors else -1
+            if max_u >= len(lst):
+                return None
             return [len(lst[u]) for u in self.anchors]
 
-        def _lens_tensor(lst: List[Tensor]) -> List[int]:
+        def _lens_tensor(lst: List[Tensor]) -> Optional[List[int]]:
+            if not lst:
+                return None
+            max_u = max(self.anchors) if self.anchors else -1
+            if max_u >= len(lst):
+                return None
             return [int(lst[u].numel()) for u in self.anchors]
 
-        def _summ(name: str, vals: List[int]) -> None:
+        def _summ(name: str, vals: Optional[List[int]]) -> None:
             if not vals:
                 print(f"{prefix} {name}: empty")
                 return

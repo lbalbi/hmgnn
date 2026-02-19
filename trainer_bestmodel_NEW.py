@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Dict, Optional, Tuple, List
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
-from samplers import (NegativeSampler, NegativeInstanceSampler_NEW, 
+from samplers import (NegativeSampler, NegativeInstanceSampler_V2, 
     PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 import os
@@ -26,24 +26,19 @@ def maybe_load_neg_cache(path: str, map_location: str = "cpu"):
 
 
 class Train_BestModel:
-    """Final training on the full training set for a fixed number of epochs
-    (e.g., the median epoch found during cross-validation).
+    """Final training on the full training set.
     Two modes:
       1) Full-graph mode (default, if loader is None):
          - Encode graph once per epoch.
          - Run triple mini-batches over all triples.
-      2) NeighborLoader mode (if loader is provided):
-         - For each subgraph:
-             • find all triples fully contained in the subgraph;
-             • run message passing on that subgraph only;
-             • train on those triples with BCE (+ contrastive).
+      2) NeighborLoader mode (if loader is provided).
     BCE and contrastive losses are merged into a single loss per epoch so that
     gradients flow through both encoder and classifier jointly.
     """
     def __init__(self, model: nn.Module, graph: HeteroData, heads: torch.Tensor,
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr: float,
         epochs: int, device: torch.device, log, batch_size: int = 1024,
-        contrastive_sampler: Optional[NegativeInstanceSampler_NEW] = None,
+        contrastive_sampler: Optional[NegativeInstanceSampler_V2] = None,
         contrastive_weight: Optional[float] = 0.1, loader=None, no_contrastive: bool = False,
         early_stopping_patience: int = 15):
         self.model = model.to(device)
@@ -272,6 +267,7 @@ class Train_BestModel:
     #     avg_bce = total_bce / total_examples if total_examples > 0 else 0.0
     #     avg_contr = total_contr / total_examples if total_examples > 0 else 0.0
     #     return avg_bce, avg_contr
+
     def _epoch_step_neighbors(self, n_type: str):
         assert self.loader is not None, "LinkNeighborLoader not provided for Train_BestModel."
         self.model.train()
@@ -285,15 +281,12 @@ class Train_BestModel:
             edge_label_index, edge_label, input_id = self._get_link_supervision(batch)
             if input_id is None:
                 raise RuntimeError("Batch is missing input_id; ensure you're using LinkNeighborLoader.")
-
             input_id_cpu = input_id.detach().to("cpu").long()
 
             labels = (edge_label if edge_label is not None else self.labels[input_id_cpu])
             labels = labels.to(self.device).float()
             rel_ids = self.rels[input_id_cpu].to(self.device).long()
-
-            if labels.numel() == 0:
-                continue
+            if labels.numel() == 0: continue
 
             if (not self.no_contrastive and self.contrastive_sampler is not None
                 and hasattr(self.contrastive_sampler, "prepare_batch")):
@@ -419,9 +412,6 @@ class Test_BestModel:
     """Test-time evaluation on a global triple-level test set.
        Positives: provided explicitly as (heads, rel_ids, tails).
        Negatives: sampled per relation using existing NegativeSampler.
-       - Negative sampling at test time now ALSO excludes *test positives*,
-       in addition to whatever training positives `NegativeSampler` already
-       avoids. This is done via an extra filtering step per relation.
     """
 
     def __init__(self, model: nn.Module, graph: HeteroData, test_heads: torch.Tensor,
@@ -466,21 +456,18 @@ class Test_BestModel:
         """
         probs = probs.detach().view(-1).cpu()
         labels = labels.detach().view(-1).cpu().to(torch.long)
-
         preds = (probs >= threshold).to(torch.long)
-
         tn = ((preds == 0) & (labels == 0)).sum()
         fp = ((preds == 1) & (labels == 0)).sum()
         fn = ((preds == 0) & (labels == 1)).sum()
         tp = ((preds == 1) & (labels == 1)).sum()
-
         return torch.stack([torch.stack([tn, fp]), torch.stack([fn, tp])])
 
 
     def _score_triples_in_batches(self, z: torch.Tensor, heads: torch.Tensor,
         rels: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
         """
-        Compute probabilities for triples in mini-batches to save memory.
+        Computes probabilities for triples in mini-batches to save memory.
         Returns a tensor of shape [N] with probabilities.
         """
         
@@ -505,10 +492,9 @@ class Test_BestModel:
     def _sample_negatives_excluding_test(self, sampler: NegativeSampler, rel_name: str,
         num_to_sample: int) -> torch.Tensor:
         """
-        Use NegativeSampler to sample candidate negatives, then filter out any
-        edges that coincide with test positives for `rel_name`. Resamples a few
-        times if needed to reach the desired count (best effort).
-        Returns edge_index on the *sampler's* device.
+        Uses NegativeSampler to sample candidate negatives, then filter out any
+        edges that coincide with test positives for "rel_name".
+        Returns edge_index on the sampler's device.
         """
         invalid_ids = self.test_pos_ids_per_rel.get(rel_name, set())
         if not invalid_ids: return sampler.sample_edge_index(num_to_sample)
@@ -660,23 +646,17 @@ class Test_BestModel:
                 try:
                     torch.save({"embeddings": z.detach().cpu()}, self.save_embeddings_path)
                     print(f"[INFO] Saved test-time embeddings: {self.save_embeddings_path}")
-                except Exception as e:
-                    print(f"[WARN] Failed to save test-time embeddings: {e}")
+                except Exception as e: print(f"[WARN] Failed to save test-time embeddings: {e}")
 
             pos_probs = self._score_triples_in_batches(
-                z, self.test_heads, self.test_rels, self.test_tails
-            )
+                z, self.test_heads, self.test_rels, self.test_tails)
             pos_labels = torch.ones_like(pos_probs)
-
-            # --- if cache ok, use it ---
             if cached is not None:
                 neg_heads = cached["neg_heads"].to(self.device)
                 neg_rels  = cached["neg_rels"].to(self.device)
                 neg_tails = cached["neg_tails"].to(self.device)
             else:
-                # --- generate negatives per (rel, head) ---
                 neg_heads_list, neg_rels_list, neg_tails_list = [], [], []
-
                 unique_rels = torch.unique(self.test_rels)
                 for rel_id in unique_rels.tolist():
                     rel_name = self.id2rel[rel_id]
@@ -724,7 +704,7 @@ class Test_BestModel:
                     neg_tails = torch.empty(0, dtype=torch.long, device=self.device)
                     neg_rels  = torch.empty(0, dtype=torch.long, device=self.device)
 
-                # --- save cache (CPU tensors) ---
+                # --- save cache
                 if self.neg_cache_path is not None:
                     payload = {
                         "neg_heads": neg_heads.detach().cpu(),
@@ -741,27 +721,19 @@ class Test_BestModel:
                 neg_labels = torch.zeros_like(neg_probs)
                 all_probs  = torch.cat([pos_probs, neg_probs], dim=0)
                 all_labels = torch.cat([pos_labels, neg_labels], dim=0)
-            else:
-                all_probs, all_labels = pos_probs, pos_labels
-                print("  -----   HERE   -------- ")
-
-            print("labels mean:", all_labels.float().mean().item())   # in Train_BestModel
-            print("unique labels:", torch.unique(all_labels).tolist())
+            else: all_probs, all_labels = pos_probs, pos_labels
 
             p = all_probs.detach().cpu().view(-1)
             y = all_labels.detach().cpu().view(-1)
 
-            print("mean prob on positives:", p[y==1].mean().item())
-            print("mean prob on negatives:", p[y==0].mean().item())
-
-            # --- Confusion matrix (global) ---
-            cm = self.confusion_matrix_binary(all_probs, all_labels, threshold=0.5)
-            tn, fp = cm[0].tolist()
-            fn, tp = cm[1].tolist()
-            self.log.log("=== Confusion Matrix @thr=0.5 ===")
-            self.log.log(f"TN={tn}  FP={fp}")
-            self.log.log(f"FN={fn}  TP={tp}")
-            self.log.log(f"Matrix:\n{cm}")
+            # # --- Confusion matrix (global) ---
+            # cm = self.confusion_matrix_binary(all_probs, all_labels, threshold=0.5)
+            # tn, fp = cm[0].tolist()
+            # fn, tp = cm[1].tolist()
+            # self.log.log("=== Confusion Matrix @thr=0.5 ===")
+            # self.log.log(f"TN={tn}  FP={fp}")
+            # self.log.log(f"FN={fn}  TP={tp}")
+            # self.log.log(f"Matrix:\n{cm}")
 
             metrics = self.metrics.update_all(all_probs, all_labels)
             names = self.metrics.get_allnames()

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=wikidata_rargcn_protCL_1802
+#SBATCH --job-name=wikidata_rargcn_protCL_1802_hard
 #SBATCH --array=1-1
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
@@ -10,9 +10,9 @@
 set -euo pipefail
 
 RUN_TAG="run_${SLURM_ARRAY_TASK_ID}"
-LOG_DIR="output/wikidata_rargcn_protCL_1802"
-OUTDIR="${LOG_DIR}/output_wikidata_rargcn_protCL_1802_${RUN_TAG}"
-LOGFILE="${LOG_DIR}/output_wikidata_rargcn_protCL_1802_${RUN_TAG}.txt"
+LOG_DIR="output/wikidata_rargcn_protCL_1802_hard"
+OUTDIR="${LOG_DIR}/output_wikidata_rargcn_protCL_1802_hard_${RUN_TAG}"
+LOGFILE="${LOG_DIR}/output_wikidata_rargcn_protCL_1802_hard_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
 python -u main_NEW.py \
@@ -22,5 +22,5 @@ python -u main_NEW.py \
   --task "wikidata" \
   --model "ra_rgcn" \
   --batch_size 12460 \
-  --output_dir "wikidata_rargcn_protCL_1802/output_wikidata_rargcn_protCL_1802_${RUN_TAG}/" \
+  --output_dir "wikidata_rargcn_protCL_1802_hard/output_wikidata_rargcn_protCL_1802_hard_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1

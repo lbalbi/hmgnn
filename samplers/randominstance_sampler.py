@@ -880,10 +880,6 @@ class RandomInstanceSampler(NegativeInstanceSampler):
     # global prep
     # -----------------------
     def prepare_global(self, full_g: HeteroData) -> None:
-        if self.seed is not None:
-            random.seed(self.seed)
-            torch.manual_seed(self.seed)
-
         if len(full_g.node_types) != 1:
             raise ValueError("RandomInstanceSampler assumes a single node type.")
         self.node_type = full_g.node_types[0]
@@ -997,6 +993,9 @@ class RandomInstanceSampler(NegativeInstanceSampler):
     # batch-local map build (fast)
     # -----------------------
     def prepare_batch(self, batch: HeteroData) -> None:
+        # Intentionally re-seed each batch to avoid deterministic sampling.
+        random.seed()
+        torch.seed()
         ntype = self.node_type or "node"
         if ntype not in batch.node_types:
             ntype = batch.node_types[0]

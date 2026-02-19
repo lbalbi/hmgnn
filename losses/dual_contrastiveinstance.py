@@ -56,6 +56,7 @@ class DualContrastiveInstanceLoss(nn.Module):
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         return F.cross_entropy(logits, labels)
 
+
     @staticmethod
     def _split_pos_neg(z: Tensor) -> Tuple[Tensor, Tensor]:
         if z.dim() == 1: z = z.unsqueeze(0)
