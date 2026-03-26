@@ -1733,7 +1733,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["hgcn", "ra_hgcn", "ra_rgcn", "ra_hgat", "sra_hgcn", "gcn", "gae", "gat", "sgnn", "sgat"],
+        choices=["hgcn", "ra_hgcn", "ra_rgcn", "ra_hgat", "sra_hgcn", "gcn", "gae", "gat", "sgnn", "sgat", "nbfnet"],
         default="hgcn",
     )
     parser.add_argument("--epochs", type=int, default=250)
@@ -2092,7 +2092,7 @@ def main():
             e_etypes=encoder_e_etypes,
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
         )
-        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
+        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat", "nbfnet"):
             final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
         else:
             final_model = ModelCls(**final_base_kwargs).to(device)
@@ -2208,7 +2208,7 @@ def main():
                 e_etypes=encoder_e_etypes,
                 n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
             )
-            if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
+            if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat", "nbfnet"):
                 model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
             else:
                 model_fold = ModelCls(**base_model_kwargs).to(device)
@@ -2332,7 +2332,7 @@ def main():
             e_etypes=encoder_e_etypes,
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
         )
-        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gat", "gae"):
+        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gat", "gae", "nbfnet"):
             final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
         else:
             final_model = ModelCls(**final_base_kwargs).to(device)

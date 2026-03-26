@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, List, Dict
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
-from samplers import (NegativeInstanceSampler_V2, PartialInstanceSampler, RandomInstanceSampler)
+from samplers import (NegativeInstanceSampler_NEW, PartialInstanceSampler, RandomInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 
 import subprocess
@@ -16,7 +16,7 @@ class Train:
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr_candidates: List[float],
         epochs: int, device: torch.device, log, batch_size: int = 1024, val_ratio: float = 0.1,
         early_stopping_patience: int = 15, train_idx: Optional[torch.Tensor] = None,
-        val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeInstanceSampler_V2] = None,
+        val_idx: Optional[torch.Tensor] = None, contrastive_sampler: Optional[NegativeInstanceSampler_NEW] = None,
         contrastive_weight: float = 0.1, train_loader=None, val_loader=None, no_contrastive: bool = False):
 
         self.model = model.to(device)

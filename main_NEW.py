@@ -22,7 +22,7 @@ from trainer_NEW import Train
 from trainer_bestmodel_NEW import Train_BestModel, Test_BestModel
 from utils import Logger, load_config, ensure_dir
 from samplers import (
-    NegativeInstanceSampler_V2, RandomInstanceSampler, PartialInstanceSampler
+    NegativeInstanceSampler_NEWER, NegativeInstanceSampler_NEW, RandomInstanceSampler, PartialInstanceSampler
 )
 
 NEG_PREFIX = "NOT_"
@@ -198,7 +198,7 @@ def compute_neg_neighbor_similarity_chart(
         print("[NegNeighborSim] No classification nodes found; skipping.")
         return
 
-    sampler = NegativeInstanceSampler_V2(
+    sampler = NegativeInstanceSampler_NEW(
         k=1,
         subclass_rel=subclass_rel,
         neg_prefix=neg_prefix,
@@ -692,6 +692,17 @@ def _append_edges(struct_graph: HeteroData, rel: str, src: torch.Tensor, tgt: to
             struct_graph[key].edge_index = torch.cat([old, edge_index], dim=1)
     else:
         struct_graph[key].edge_index = edge_index
+
+
+def _drop_relation_edges(g: HeteroData, rel: str) -> int:
+    """Remove ('node', rel, 'node') from graph, returning removed edge count."""
+    key = ("node", str(rel), "node")
+    if key not in g.edge_types:
+        return 0
+    ei = g[key].edge_index
+    removed = int(ei.size(1)) if (ei is not None and ei.numel() > 0) else 0
+    del g[key]
+    return removed
 
 def _extract_qid(val: str) -> Optional[str]:
     m = re.search(r"(Q[1-9][0-9]*)", str(val))
@@ -1791,7 +1802,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["hgcn", "ra_hgcn", "ra_rgcn", "ra_hgat", "sra_hgcn", "gcn", "gae", "gat", "sgnn", "sgat"],
+        choices=["hgcn", "ra_hgcn", "ra_rgcn", "ra_hgat", "sra_hgcn", "gcn", "gae", "gat", "sgnn", "sgat", "nbfnet"],
         default="hgcn",
     )
     parser.add_argument("--epochs", type=int, default=250)
@@ -1802,6 +1813,8 @@ def main():
     parser.add_argument("--use_nstatementsampler", action="store_true")
     parser.add_argument("--use_pstatementsampler", action="store_true")
     parser.add_argument("--use_rstatement_sampler", action="store_true")
+    parser.add_argument("--alt_contrastive_sampler", action="store_true",
+                        help="Use NegativeInstanceSampler_NEWER instead of NEW (default).")
     parser.add_argument("--no_contrastive", action="store_true")
     parser.add_argument("--finaltrain_only", action="store_true")
     parser.add_argument("--test_only", action="store_true")
@@ -2114,6 +2127,8 @@ def main():
         if et != CLS_EDGE_TYPE
         and not str(et[1]).endswith(CLS_EDGE_SUFFIX)
     ]
+    if args.no_contrastive:
+        MP_EDGE_TYPES = [et for et in MP_EDGE_TYPES if str(et[1]) != str(subclass_rel)]
     encoder_e_etypes = MP_EDGE_TYPES
 
     print_encoder_and_cls_totals(
@@ -2187,7 +2202,7 @@ def main():
             e_etypes=encoder_e_etypes,
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
         )
-        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
+        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat", "nbfnet"):
             final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
         else:
             final_model = ModelCls(**final_base_kwargs).to(device)
@@ -2277,6 +2292,8 @@ def main():
             # num_neighbors = {et: [20, 10] for et in encoder_graph.edge_types}
             num_neighbors = {et: [12, 8] for et in MP_EDGE_TYPES}
             num_neighbors[CLS_EDGE_TYPE] = [0, 0]   # <-- IMPORTANT: don't sample along cls_link
+            if args.no_contrastive:
+                num_neighbors[("node", str(subclass_rel), "node")] = [0, 0]
             for et in fold_encoder_graph.edge_types:
                 if str(et[1]).endswith(CLS_EDGE_SUFFIX):
                     num_neighbors[et] = [0, 0]
@@ -2303,7 +2320,7 @@ def main():
                 e_etypes=encoder_e_etypes,
                 n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
             )
-            if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat"):
+            if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat", "nbfnet"):
                 model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
             else:
                 model_fold = ModelCls(**base_model_kwargs).to(device)
@@ -2320,7 +2337,8 @@ def main():
                     )
                     neg_stmt_sampler.prepare_global(sampler_graph)
                 else:
-                    neg_stmt_sampler = NegativeInstanceSampler_V2(
+                    SamplerCls = NegativeInstanceSampler_NEWER if args.alt_contrastive_sampler else NegativeInstanceSampler_NEW
+                    neg_stmt_sampler = SamplerCls(
                         k=contrastive_k,
                         subclass_rel=subclass_rel,
                         neg_prefix=NEG_PREFIX,
@@ -2441,6 +2459,8 @@ def main():
         # num_neighbors = {et: neighbor_sizes for et in encoder_graph.edge_types}
         num_neighbors = {et: neighbor_sizes for et in MP_EDGE_TYPES}
         num_neighbors[CLS_EDGE_TYPE] = [0, 0]
+        if args.no_contrastive:
+            num_neighbors[("node", str(subclass_rel), "node")] = [0, 0]
         for et in train_encoder_graph.edge_types:
             if str(et[1]).endswith(CLS_EDGE_SUFFIX):
                 num_neighbors[et] = [0, 0]
@@ -2469,7 +2489,7 @@ def main():
             e_etypes=encoder_e_etypes,
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
         )
-        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gat", "gae"):
+        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gat", "gae", "nbfnet"):
             final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
         else:
             final_model = ModelCls(**final_base_kwargs).to(device)
@@ -2487,7 +2507,8 @@ def main():
                 )
                 final_contrastive_sampler.prepare_global(train_encoder_graph)
             else:
-                final_contrastive_sampler = NegativeInstanceSampler_V2(
+                SamplerCls = NegativeInstanceSampler_NEWER if args.alt_contrastive_sampler else NegativeInstanceSampler_NEW
+                final_contrastive_sampler = SamplerCls(
                     k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel,
                     cache_dir="data/cache", cache_key=f"{args.path}|{args.output_dir}|final|clsedge=1"
                 )

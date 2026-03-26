@@ -809,6 +809,8 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         # Simple corruption-based sampling (batch-local)
         self._batch_pos_tails_by_inst: Optional[Dict[int, List[int]]] = None
         self._batch_class_universe: Optional[torch.Tensor] = None
+        # Limit anchors per batch (ablation: fewer anchors)
+        self.max_contrastive_anchors: int = 3072
 
         print("Using RandomInstanceSampler")
 
@@ -1168,10 +1170,12 @@ class RandomInstanceSampler(NegativeInstanceSampler):
         k = self.k
 
         if self._batch_global_for_row is None or self._batch_pos_key_u is None or self._batch_neg_key_u is None:
-            # If user forgot to call prepare_batch, fall back to base (slower, and not type-aware)
-            return super().get_contrastive_samples(z, anchor_nodes=anchor_nodes, n_id=n_id)
+            # If user forgot to call prepare_batch, return empty (no pooling/structure reuse).
+            empty = torch.empty(0, z.size(1), device=z.device)
+            empty_k = torch.empty(0, self.k, z.size(1), device=z.device)
+            return empty, empty_k, empty_k, empty_k, empty_k
 
-        # Prefer simple corruption-based negatives: corrupt positive tail nodes
+        # Use only random corruption-based negatives (no pooling/structure reuse)
         if self._batch_pos_tails_by_inst is not None and self._batch_class_universe is not None:
             universe = self._batch_class_universe
             universe_list = universe.tolist() if universe.numel() > 0 else []
@@ -1179,6 +1183,9 @@ class RandomInstanceSampler(NegativeInstanceSampler):
                 anchor_locals = torch.arange(B_rows, dtype=torch.long)
             else:
                 anchor_locals = anchor_nodes.detach().long().cpu().unique()
+            if self.max_contrastive_anchors and anchor_locals.numel() > self.max_contrastive_anchors:
+                perm = torch.randperm(anchor_locals.numel())[: self.max_contrastive_anchors]
+                anchor_locals = anchor_locals[perm]
 
             anchors_local_list: List[int] = []
             shneg_idx, pos2neg_idx, neg2pos_idx, shpos_idx = [], [], [], []
@@ -1226,60 +1233,10 @@ class RandomInstanceSampler(NegativeInstanceSampler):
             return (z[anchors_local_t], z[shneg_t],
                 z[pos2neg_t], z[neg2pos_t], z[shpos_t])
 
-        global_for_row = self._batch_global_for_row
-        pos_key_u = self._batch_pos_key_u
-        pos_ptr = self._batch_pos_ptr
-        pos_flat = self._batch_pos_flat
-        neg_key_u = self._batch_neg_key_u
-        neg_ptr = self._batch_neg_ptr
-        neg_flat = self._batch_neg_flat
-
-        if anchor_nodes is None or anchor_nodes.numel() == 0:
-            anchor_locals = torch.arange(B_rows, dtype=torch.long)
-        else: anchor_locals = anchor_nodes.detach().long().cpu().unique()
-        anchors_local_list: List[int] = []
-        shneg_idx, pos2neg_idx, neg2pos_idx, shpos_idx = [], [], [], []
-
-        for u_local in anchor_locals.tolist():
-            if u_local < 0 or u_local >= B_rows:
-                continue
-            u_global = int(global_for_row[u_local].item())
-
-            pos_keys = self._pos_keys[u_global] if u_global < len(self._pos_keys) else []
-            neg_keys = self._neg_keys_synth[u_global] if u_global < len(self._neg_keys_synth) else []
-            if not pos_keys and not neg_keys:
-                continue
-
-            cand_shpos = self._union_from_csr(pos_keys, pos_key_u, pos_ptr, pos_flat)
-            cand_shneg = self._union_from_csr(neg_keys, neg_key_u, neg_ptr, neg_flat)
-            cand_pos2neg = self._union_from_csr(neg_keys, pos_key_u, pos_ptr, pos_flat)
-            cand_neg2pos = self._union_from_csr(pos_keys, neg_key_u, neg_ptr, neg_flat)
-
-            # exclude anchor
-            if cand_shpos.numel() > 0:
-                cand_shpos = cand_shpos[cand_shpos != u_local]
-            if cand_shneg.numel() > 0:
-                cand_shneg = cand_shneg[cand_shneg != u_local]
-            if cand_pos2neg.numel() > 0:
-                cand_pos2neg = cand_pos2neg[cand_pos2neg != u_local]
-            if cand_neg2pos.numel() > 0:
-                cand_neg2pos = cand_neg2pos[cand_neg2pos != u_local]
-
-            # skip anchors with no examples in any group
-            if (cand_shpos.numel() == 0 and cand_shneg.numel() == 0 and
-                cand_pos2neg.numel() == 0 and cand_neg2pos.numel() == 0):
-                continue
-
-            anchors_local_list.append(int(u_local))
-            shpos_idx.append(self._sample_k(cand_shpos, u_local, k, device).unsqueeze(0))
-            shneg_idx.append(self._sample_k(cand_shneg, u_local, k, device).unsqueeze(0))
-            pos2neg_idx.append(self._sample_k(cand_pos2neg, u_local, k, device).unsqueeze(0))
-            neg2pos_idx.append(self._sample_k(cand_neg2pos, u_local, k, device).unsqueeze(0))
-
-        if not anchors_local_list:
-            empty = torch.empty(0, D, device=device)
-            empty_k = torch.empty(0, k, D, device=device)
-            return empty, empty_k, empty_k, empty_k, empty_k
+        # No structured pooling fallback
+        empty = torch.empty(0, D, device=device)
+        empty_k = torch.empty(0, k, D, device=device)
+        return empty, empty_k, empty_k, empty_k, empty_k
 
         anchors_local_t = torch.tensor(anchors_local_list, dtype=torch.long, device=device)
         shneg_t = torch.cat(shneg_idx, dim=0)
