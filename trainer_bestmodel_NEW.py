@@ -1,14 +1,17 @@
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Union
 from torch_geometric.data import HeteroData
 from utils import Metrics, EarlyStopping
 from samplers import (NegativeSampler, NegativeInstanceSampler_NEW, 
-    PartialInstanceSampler, RandomInstanceSampler)
+    PartialInstanceSampler, RandomInstanceSampler, TypedInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 import os
 
 CLS_EDGE_TYPE = ("node", "cls_link", "node")
+ContrastiveSamplerT = Union[
+    NegativeInstanceSampler_NEW, PartialInstanceSampler, RandomInstanceSampler, TypedInstanceSampler
+]
 
 def atomic_torch_save(obj, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -38,7 +41,7 @@ class Train_BestModel:
     def __init__(self, model: nn.Module, graph: HeteroData, heads: torch.Tensor,
         rel_ids: torch.Tensor, tails: torch.Tensor, labels: torch.Tensor, lr: float,
         epochs: int, device: torch.device, log, batch_size: int = 1024,
-        contrastive_sampler: Optional[NegativeInstanceSampler_NEW] = None,
+        contrastive_sampler: Optional[ContrastiveSamplerT] = None,
         contrastive_weight: Optional[float] = 0.1, loader=None, no_contrastive: bool = False,
         early_stopping_patience: int = 15):
         self.model = model.to(device)

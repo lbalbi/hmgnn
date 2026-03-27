@@ -22,7 +22,7 @@ from trainer_NEW import Train
 from trainer_bestmodel_NEW import Train_BestModel, Test_BestModel
 from utils import Logger, load_config, ensure_dir
 from samplers import (
-    NegativeInstanceSampler_NEWER, NegativeInstanceSampler_NEW, RandomInstanceSampler, PartialInstanceSampler
+    NegativeInstanceSampler_NEWER, NegativeInstanceSampler_NEW, RandomInstanceSampler, TypedInstanceSampler, PartialInstanceSampler
 )
 
 NEG_PREFIX = "NOT_"
@@ -1813,6 +1813,8 @@ def main():
     parser.add_argument("--use_nstatementsampler", action="store_true")
     parser.add_argument("--use_pstatementsampler", action="store_true")
     parser.add_argument("--use_rstatement_sampler", action="store_true")
+    parser.add_argument("--use_tstatement_sampler", action="store_true",
+                        help="Use type-constrained random instance sampler for corruption.")
     parser.add_argument("--alt_contrastive_sampler", action="store_true",
                         help="Use NegativeInstanceSampler_NEWER instead of NEW (default).")
     parser.add_argument("--no_contrastive", action="store_true")
@@ -1876,7 +1878,7 @@ def main():
         args.path + "/",
         use_pstatement_sampler=args.use_pstatementsampler,
         use_nstatement_sampler=args.use_nstatementsampler,
-        use_rstatement_sampler=args.use_rstatement_sampler,
+        use_rstatement_sampler=(args.use_rstatement_sampler or args.use_tstatement_sampler),
     )
     data_dict = dl.get_data()
     full_graph_all = dl.make_data_graph(data_dict, orthogonal=False)
@@ -1884,9 +1886,18 @@ def main():
     num_nodes = int(full_graph_all["node"].num_nodes)
     base_x = full_graph_all["node"].x
 
-    nflag, pflag, rflag = args.use_nstatementsampler, args.use_pstatementsampler, args.use_rstatement_sampler
+    nflag, pflag, rflag, tflag = (
+        args.use_nstatementsampler,
+        args.use_pstatementsampler,
+        args.use_rstatement_sampler,
+        args.use_tstatement_sampler,
+    )
     use_partial_sampler = nflag or pflag
-    use_random_sampler = rflag
+    use_typed_sampler = tflag
+    use_random_sampler = rflag and (not tflag)
+    if rflag and tflag:
+        print("[WARN] Both --use_rstatement_sampler and --use_tstatement_sampler were set; "
+              "using TypedInstanceSampler.", flush=True)
 
     external_edges = dl.get_state_list()
     if nflag:
@@ -2327,7 +2338,10 @@ def main():
 
             sampler_graph = fold_encoder_graph
             if not args.no_contrastive:
-                if use_random_sampler:
+                if use_typed_sampler:
+                    neg_stmt_sampler = TypedInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                    neg_stmt_sampler.prepare_global(sampler_graph)
+                elif use_random_sampler:
                     neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
                     neg_stmt_sampler.prepare_global(sampler_graph)
                 elif use_partial_sampler:
@@ -2497,7 +2511,10 @@ def main():
         final_log = Logger("final_train_global", dir=args.output_dir, non_verbose=True)
 
         if not args.no_contrastive:
-            if use_random_sampler:
+            if use_typed_sampler:
+                final_contrastive_sampler = TypedInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                final_contrastive_sampler.prepare_global(train_encoder_graph)
+            elif use_random_sampler:
                 final_contrastive_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
                 final_contrastive_sampler.prepare_global(train_encoder_graph)
             elif use_partial_sampler:

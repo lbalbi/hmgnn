@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=NBFNet
-#SBATCH --array=1-1
+#SBATCH --array=2-2
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 #SBATCH --ntasks=1
-#SBATCH --time=15:00:00
+#SBATCH --time=40:00:00
 #SBATCH --nodelist=liseda-01
 #SBATCH --partition=gpu_hi
 
@@ -23,7 +23,7 @@ python3 -u main_NEW.py \
   --print_sampler_stats \
   --task "wikidata" \
   --model "nbfnet" \
-  --batch_size 4624 \
+  --batch_size 4648 \
   --no_contrastive \
   --output_dir "NBFNet/output_NBFNet_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
