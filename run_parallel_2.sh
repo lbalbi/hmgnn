@@ -1,29 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=human_gcn_noNegs_RandomNegs_perProt_NEW
-#SBATCH --array=1-3
+#SBATCH --job-name=human_NBFNet
+#SBATCH --array=1-1
 #SBATCH --output=slurm_log.txt
 #SBATCH --ntasks=1
 #SBATCH --time=30:00:00
-#SBATCH --nodelist=liseda-03
-#SBATCH --partition=tier3
+#SBATCH --nodelist=liseda-05
+#SBATCH --partition=gpu_hi
 
 set -euo pipefail
 
 RUN_TAG="run_${SLURM_ARRAY_TASK_ID}"
-LOG_DIR="output/human_gcn_noNegs_RandomNegs_perProt_NEW"
-OUTDIR="${LOG_DIR}/output_human_gcn_noNegs_RandomNegs_perProt_NEW_${RUN_TAG}"
-LOGFILE="${LOG_DIR}/output_human_gcn_noNegs_RandomNegs_perProt_NEW_${RUN_TAG}.txt"
+LOG_DIR="output/human_NBFNet"
+OUTDIR="${LOG_DIR}/human_NBFNet_${RUN_TAG}"
+LOGFILE="${LOG_DIR}/human_NBFNet_${RUN_TAG}.txt"
 mkdir -p "${OUTDIR}"
 
 python -u main.py \
   --path "data/human_data_withLC" \
   --task "human" \
-  --model "gcn" \
+  --model "nbfnet" \
   --protein_splits \
-  --use_nstatement_sampler \
-  --use_rstatement_sampler \
-  --patience 15 \
   --batch_size 3024 \
-  --output_dir "human_gcn_noNegs_RandomNegs_perProt_NEW/output_human_gcn_noNegs_RandomNegs_perProt_NEW_${RUN_TAG}/" \
+  --output_dir "human_NBFNet/human_NBFNet_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
   #   --patience 15 \
