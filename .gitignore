@@ -8,3 +8,7 @@ scripts/
 *.csv
 slurm_log.txt
 *.tsv
+main.py
+*.err
+*.out
+results.txt
