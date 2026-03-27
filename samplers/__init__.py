@@ -4,6 +4,7 @@ from .partialstatement_sampler import PartialStatementSampler
 from .randomstatement_sampler import RandomStatementSampler
 from .negativeinstance_sampler import NegativeInstanceSampler
 from .randominstance_sampler import RandomInstanceSampler
+from .typedinstance_sampler import TypedInstanceSampler
 from .partialinstance_sampler import PartialInstanceSampler
 from .negativeinstance_sampler_NEW import NegativeInstanceSampler_NEW
 from .negativeinstance_sampler_NEWER import NegativeInstanceSampler_NEWER
