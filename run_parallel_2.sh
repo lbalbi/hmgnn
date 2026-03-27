@@ -20,6 +20,7 @@ python -u main.py \
   --task "human" \
   --model "nbfnet" \
   --protein_splits \
+  --no_contrastive \
   --batch_size 3024 \
   --output_dir "human_NBFNet/human_NBFNet_${RUN_TAG}/" \
   >> "${LOGFILE}" 2>&1
