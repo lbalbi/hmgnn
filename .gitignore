@@ -9,6 +9,8 @@ scripts/
 *.txt
 *.tsv
 *_old*.py
+*.err
+*.out
 acc_lines_by_group.png
 bootstrapper.py
 chart.py
