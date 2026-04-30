@@ -12,9 +12,9 @@ class GCN(nn.Module):
     """
     Homogeneous GCN encoder that can consume a HeteroData batch by
     collapsing all edges of the main node type into a single edge_index.
-    Decoder is relation-aware in the same style as RA_HGCN:
+    Decoder is relation-aware DistMult:
       - embeds relation IDs
-      - MLP over [h_u, e_r, h_v] -> logit
+      - score (u,r,v) = <h_u, e_r, h_v>
     """
 
     def __init__(
@@ -57,14 +57,6 @@ class GCN(nn.Module):
             self.num_rel = len(rel2id)
 
         self.rel_emb = nn.Embedding(self.num_rel, hidden_dim)
-
-        ## ----- Triple classifier: [h_u, e_r, h_v] -> logit -----
-        self.classify = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim), # nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, 1),
-        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -133,9 +125,7 @@ class GCN(nn.Module):
             raise ValueError(f"rel_ids out of range (num_rel={self.num_rel}). Examples: {bad}")
 
         e_r = self.rel_emb(rel_ids)
-        h_pair = torch.cat([h_u, e_r, h_v], dim=-1)
-        #h_pair = torch.cat([h_u, h_v], dim=-1)
-        logits = self.classify(h_pair).view(-1)
+        logits = (h_u * e_r * h_v).sum(dim=-1)
         probs = torch.sigmoid(logits)
         return logits, probs
 

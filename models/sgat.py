@@ -114,6 +114,7 @@ class SGAT(nn.Module):
         ppi_etype: Tuple[str, str, str] = ("node", "PPI", "node"),
         n_type: str = "node",
         e_etypes: Optional[List[Tuple[str, str, str]]] = None,
+        rel2id: Optional[Dict[str, int]] = None,
         neg_prefix: str = "NOT_",
         pos_rel_name: str = "pos_statement",
         neg_rel_name: str = "neg_statement",
@@ -162,15 +163,13 @@ class SGAT(nn.Module):
             for _ in range(int(n_layers))
         ])
 
-        # Pair classifier on concatenated signed embeddings:
-        # z = [z_pos||z_neg] => 2H; pair => 4H
-        pair_dim = 4 * self.hidden_dim
-        self.classify = nn.Sequential(
-            nn.Linear(pair_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
-        )
+        # DistMult over signed embedding space z=[z_pos||z_neg] (dim=2H).
+        if rel2id is None:
+            rel_names = sorted({str(rel) for (_, rel, _) in (self.e_etypes or [])})
+            self.num_rel = max(1, len(rel_names))
+        else:
+            self.num_rel = max(1, len(rel2id))
+        self.rel_emb = nn.Embedding(self.num_rel, 2 * self.hidden_dim)
 
     def _get_node_features(self, data: HeteroData) -> Tensor:
         nt = data[self.n_type]
@@ -262,11 +261,15 @@ class SGAT(nn.Module):
         src, dst = edge_index[0], edge_index[1]
         zu = z[src]
         zv = z[dst]
-        h_pair = torch.cat([zu, zv], dim=-1)  # (B, 4H)
-
-        logits = self.classify(h_pair)
-        if logits.dim() == 2 and logits.size(1) == 1:
-            logits = logits.squeeze(1)
+        if rel_ids is not None:
+            rel_ids = rel_ids.long()
+            if (rel_ids < 0).any() or (rel_ids >= self.num_rel).any():
+                bad = rel_ids[(rel_ids < 0) | (rel_ids >= self.num_rel)][:10].tolist()
+                raise ValueError(f"rel_ids out of range (num_rel={self.num_rel}). Examples: {bad}")
+            er = self.rel_emb(rel_ids)
+            logits = (zu * er * zv).sum(dim=-1)
+        else:
+            logits = (zu * zv).sum(dim=-1)
         probs = torch.sigmoid(logits)
         return logits, probs
 

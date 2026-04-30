@@ -13,9 +13,9 @@ class SRA_HGCN(nn.Module):
           * negative-view: mean over all *negative* relations (those starting with `neg_prefix`)
     For each layer and each view, applies the same GCNConv weights to each relation
      in that view and average the resulting messages across relations.
-    Decoder (relation-aware triple classifier):
+    Decoder (relation-aware DistMult scorer):
       - Concatenate the two node views: h = [h_pos || h_neg]  (dim = 2*hidden_dim)
-      - For triple (u, r, v), build [h_u || e_r || h_v] and score with an MLP -> logit
+      - For triple (u, r, v), score with DistMult: <h_u, e_r, h_v>
     """
 
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, e_etypes: List[Tuple[str, str, str]],
@@ -53,10 +53,8 @@ class SRA_HGCN(nn.Module):
             in_ch = self.in_dim if layer == 0 else self.hidden_dim
             self.pos_convs.append(GCNConv(in_ch, self.hidden_dim, add_self_loops=True, normalize=True, cached=False))
             self.neg_convs.append(GCNConv(in_ch, self.hidden_dim, add_self_loops=True, normalize=True, cached=False))
-        self.rel_emb = nn.Embedding(self.num_rel, self.hidden_dim)
-        triple_in_dim = (2 * self.hidden_dim) + self.hidden_dim + (2 * self.hidden_dim)
-        self.classify = nn.Sequential(nn.Linear(triple_in_dim, self.hidden_dim),
-            nn.ReLU(), nn.Linear(self.hidden_dim, 1))
+        # DistMult needs relation vectors in the same latent space as node embeddings.
+        self.rel_emb = nn.Embedding(self.num_rel, 2 * self.hidden_dim)
 
     @staticmethod
     def _empty_edge_index(device: torch.device) -> torch.Tensor:
@@ -106,8 +104,7 @@ class SRA_HGCN(nn.Module):
         h_u = z[src]
         h_v = z[dst]
         e_r = self.rel_emb(rel_ids)
-        h_triple = torch.cat([h_u, e_r, h_v], dim=-1)
-        logits = self.classify(h_triple).view(-1)
+        logits = (h_u * e_r * h_v).sum(dim=-1)
         probs = torch.sigmoid(logits)
         return logits, probs
 

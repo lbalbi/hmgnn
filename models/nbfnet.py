@@ -50,13 +50,13 @@ class _NBFMessageLayer(nn.Module):
 
 class NBFNET(nn.Module):
     """
-    NBFNet-inspired baseline for triple classification under the current trainer contract:
+    NBFNet-inspired baseline for link prediction under the current trainer contract:
       - encode(data) -> {n_type: node_embeddings}
       - score_triples(z, edge_index, rel_ids) -> (logits, probs)
 
     It caches message-passing edges in `encode`, then performs relation-conditioned
     Bellman-Ford-style propagation in `score_triples` (once per unique relation id
-    in the batch) before classifying (h, r, t).
+    in the batch) before DistMult scoring on (h, r, t).
     """
 
     def __init__(
@@ -116,13 +116,6 @@ class NBFNET(nn.Module):
 
         self.layers = nn.ModuleList(
             [_NBFMessageLayer(self.hidden_dim, dropout=self.dropout) for _ in range(self.num_layers)]
-        )
-
-        self.classify = nn.Sequential(
-            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_dim, 1),
         )
 
         self._cached_edge_index: Optional[Tensor] = None
@@ -229,8 +222,7 @@ class NBFNET(nn.Module):
             h_src = state[b_src]
             h_dst = state[b_dst]
             q = self.rel_emb.weight[int(rid)].unsqueeze(0).expand_as(h_src)
-            pair = torch.cat([h_src, q, h_dst, h_src * h_dst], dim=-1)
-            logits[idx] = self.classify(pair).view(-1)
+            logits[idx] = (h_src * q * h_dst).sum(dim=-1)
 
         probs = torch.sigmoid(logits)
         return logits, probs

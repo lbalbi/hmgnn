@@ -53,8 +53,10 @@ class GCN_GAE(nn.Module):
       - By default it uses `ppi_etype` if present; otherwise it concatenates all edge_index across edge types.
 
     Decoder:
-      - If rel2id is provided (or inferred) AND rel_ids are supplied, it can use relation embeddings.
-      - If rel2id is not provided, rel_ids are ignored and scoring uses only (u,v).
+      - DistMult scoring when relation embeddings are available:
+            score(u, r, v) = <h_u, e_r, h_v>
+      - If relation embeddings are unavailable, fallback to relation-agnostic dot score:
+            score(u, v) = <h_u, h_v>
 
     Notes:
       - This is a supervised link classifier (BCEWithLogitsLoss) baseline; it's not a full autoencoder.
@@ -118,19 +120,6 @@ class GCN_GAE(nn.Module):
             num_rel_total = len(rel2id) if rel2id is not None else 0
         self.num_rel = int(num_rel_total)
         self.rel_emb = nn.Embedding(self.num_rel, self.hidden_dim) if self.num_rel > 0 else None
-        self.classify_uv = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_dim, 1),
-        )
-        self.classify_urv = None
-        if self.rel_emb is not None:
-            self.classify_urv = nn.Sequential(
-                nn.Linear(self.hidden_dim * 3, self.hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(self.dropout),
-                nn.Linear(self.hidden_dim, 1))
 
         # # --- Decoder relation space is independent of encoder edge types ---
         # self.num_rel = int(num_rel_total or 0)
@@ -169,13 +158,6 @@ class GCN_GAE(nn.Module):
         #         nn.Dropout(self.dropout),
         #         nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
         #     )
-        else:
-            self.classify_urv = nn.Sequential(
-                nn.Linear(self.hidden_dim * 3, self.hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(self.dropout),
-                nn.Linear(self.hidden_dim, 1 if self.out_dim == 1 else self.out_dim),
-            )
 
     def _get_node_features(self, data: HeteroData) -> Tensor:
         nt = data[self.n_type]
@@ -252,14 +234,9 @@ class GCN_GAE(nn.Module):
                     )
                     
             er = self.rel_emb(rel_ids)
-            h_in = torch.cat([hs, er, hd], dim=-1)
-            logits = self.classify_urv(h_in)
+            logits = (hs * er * hd).sum(dim=-1)
         else:
-            h_in = torch.cat([hs, hd], dim=-1)
-            logits = self.classify_uv(h_in)
-
-        if logits.dim() == 2 and logits.size(1) == 1:
-            logits = logits.squeeze(1)
+            logits = (hs * hd).sum(dim=-1)
 
         probs = torch.sigmoid(logits)
         return logits, probs

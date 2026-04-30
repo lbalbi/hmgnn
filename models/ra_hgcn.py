@@ -9,11 +9,7 @@ class RA_HGCN(nn.Module):
     """ Heterogeneous GCN with a relation-aware edge classifier.
     Encoder: Multi-layer message passing over a HeteroData graph using HeteroConv + GCNConv.
     Decoder:
-        - Relation-aware scoring function s(u, r, v).
-        - For each triple (u, r, v):
-              h_u, h_v : node embeddings
-              e_r      : learned relation embedding
-          Concatenates [h_u, e_r, h_v] and feeds to an MLP -> scalar logit.
+        - Relation-aware DistMult scoring function s(u, r, v) = <h_u, e_r, h_v>.
     """
 
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int,
@@ -43,9 +39,6 @@ class RA_HGCN(nn.Module):
         self.convs = nn.ModuleList(convs)
         self.rel_emb = nn.Embedding(self.num_rel, hidden_dim)
 
-        self.classify = nn.Sequential(nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.ReLU(), nn.Linear(hidden_dim, 1))
-
 
     def encode(self, data: HeteroData) -> Dict[str, torch.Tensor]:
         """ Encode nodes of a HeteroData graph into embeddings per node type.
@@ -66,10 +59,10 @@ class RA_HGCN(nn.Module):
             rel_ids: LongTensor[B] with relation IDs in [0, num_rel).
         """
         src, dst = edge_index
-        h_u, h_v = z[src], z[dst]             
+        h_u, h_v = z[src], z[dst]
+        rel_ids = rel_ids.clamp(min=0, max=self.num_rel - 1)
         e_r = self.rel_emb(rel_ids)
-        h_pair = torch.cat([h_u, e_r, h_v], dim=-1)
-        logits = self.classify(h_pair).view(-1)
+        logits = (h_u * e_r * h_v).sum(dim=-1)
         probs = torch.sigmoid(logits)
         return logits, probs
 

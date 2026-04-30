@@ -8,7 +8,7 @@ from torch_geometric.nn import RGCNConv
 class RA_RGCN(nn.Module):
     """
     Encoder: RGCNConv over a *homogenized* edge_index + edge_type built from HeteroData.
-    Decoder: same relation-aware MLP over [h_u, e_r, h_v] as your RA_HGCN.
+    Decoder: relation-aware DistMult scoring over (h_u, e_r, h_v).
     """
 
     def __init__(
@@ -56,10 +56,8 @@ class RA_RGCN(nn.Module):
                     num_relations=self.num_mp_rel, num_bases=num_bases,
                     aggr="mean", root_weight=True, bias=True))
         self.convs = nn.ModuleList(convs)
-        # ----- decoder: relation embeddings + MLP over [h_u, e_r, h_v] -----
+        # ----- decoder: relation embeddings + DistMult scoring -----
         self.rel_emb = nn.Embedding(self.num_dec_rel, self.hidden_dim)
-        self.classify = nn.Sequential(nn.Linear(self.hidden_dim * 3, self.hidden_dim),
-            nn.ReLU(), nn.Dropout(p=self.dropout),nn.Linear(self.hidden_dim, 1))
 
     def _hetero_to_relational(self, data: HeteroData) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """  Convert HeteroData (single node type) into:
@@ -117,7 +115,6 @@ class RA_RGCN(nn.Module):
             bad = rel_ids[(rel_ids < 0) | (rel_ids >= self.num_dec_rel)][:10].tolist()
             raise ValueError(f"rel_ids out of range (num_rel={self.num_dec_rel}). Examples: {bad}")
 
-        h_pair = torch.cat([h_u, e_r, h_v], dim=-1)
-        logits = self.classify(h_pair).view(-1)
+        logits = (h_u * e_r * h_v).sum(dim=-1)
         probs = torch.sigmoid(logits)
         return logits, probs
