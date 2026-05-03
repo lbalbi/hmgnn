@@ -2,11 +2,12 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple, List, Union
 from torch_geometric.data import HeteroData
-from utils import Metrics, EarlyStopping
+from utils import EarlyStopping
 from samplers import (NegativeSampler, NegativeInstanceSampler_NEW, 
     PartialInstanceSampler, RandomInstanceSampler, TypedInstanceSampler)
 from losses import ContrastiveLoss_CE, ContrastiveInstanceLoss, DualContrastiveInstanceLoss
 import os
+import csv
 
 CLS_EDGE_TYPE = ("node", "cls_link", "node")
 ContrastiveSamplerT = Union[
@@ -43,7 +44,7 @@ class Train_BestModel:
         epochs: int, device: torch.device, log, batch_size: int = 1024,
         contrastive_sampler: Optional[ContrastiveSamplerT] = None,
         contrastive_weight: Optional[float] = 0.1, loader=None, no_contrastive: bool = False,
-        early_stopping_patience: int = 15):
+        early_stopping_patience: int = 15, contrastive_temperature: float = 0.5):
         self.model = model.to(device)
         self.graph = graph
         self.heads = heads.clone().long()
@@ -60,11 +61,15 @@ class Train_BestModel:
         self.no_contrastive = no_contrastive
         self.contrastive_sampler = contrastive_sampler
         self.contrastive_weight = (float(contrastive_weight) if contrastive_sampler is not None else 0.0)
+        self.contrastive_temperature = float(contrastive_temperature)
         # self.contrastive_loss_fn = (ContrastiveLoss_CE() if contrastive_sampler is not None else None)
         # self.contrastive_loss_fn = (ContrastiveInstanceLoss() if contrastive_sampler is not None else None)
         self.dual_view = bool(getattr(self.model, "dual_view", False))
         if contrastive_sampler is not None:
-            self.contrastive_loss_fn = DualContrastiveInstanceLoss() if self.dual_view else ContrastiveInstanceLoss()
+            self.contrastive_loss_fn = (
+                DualContrastiveInstanceLoss(temperature=self.contrastive_temperature)
+                if self.dual_view else ContrastiveInstanceLoss(temperature=self.contrastive_temperature)
+            )
         else: self.contrastive_loss_fn = None
         self.es_patience = int(early_stopping_patience)
         lr_early_stopping = EarlyStopping(patience=self.es_patience, mode="min")
@@ -91,11 +96,10 @@ class Train_BestModel:
 
     def _get_link_supervision(self, batch: HeteroData):
         if isinstance(batch, HeteroData):
-            for et in batch.edge_types:
-                store = batch[et]
-                eli = getattr(store, "edge_label_index", None)
-                if eli is not None:
-                    return eli, getattr(store, "edge_label", None), getattr(store, "input_id", None)
+            if CLS_EDGE_TYPE not in batch.edge_types:
+                raise RuntimeError(f"Batch missing cls edge store {CLS_EDGE_TYPE}.")
+            store = batch[CLS_EDGE_TYPE]
+            return store.edge_label_index, getattr(store, "edge_label", None), getattr(store, "input_id", None)
         eli = getattr(batch, "edge_label_index", None)
         if eli is not None:
             return eli, getattr(batch, "edge_label", None), getattr(batch, "input_id", None)
@@ -114,7 +118,7 @@ class Train_BestModel:
             zp = h_dict[pos_k]
             if z.dim() == 2 and zp.dim() == 2 and z.size(1) == 2 * zp.size(1):
                 self.dual_view = True
-                self.contrastive_loss_fn = DualContrastiveInstanceLoss()
+                self.contrastive_loss_fn = DualContrastiveInstanceLoss(temperature=self.contrastive_temperature)
 
     def _epoch_step_fullgraph(self, z: torch.Tensor) -> Tuple[float, float, torch.Tensor]:
         num_triples = self.heads.size(0)
@@ -314,7 +318,8 @@ class Train_BestModel:
             contr_loss_val = 0.0
             if (not self.no_contrastive and self.contrastive_sampler is not None
                 and self.contrastive_weight > 0.0):
-                batch_nodes = torch.unique(edge_label_index.view(-1))
+                # Sampler already deduplicates/filters anchors; avoid redundant unique() here.
+                batch_nodes = edge_label_index.view(-1)
                 samples = self.contrastive_sampler.get_contrastive_samples(
                     z, anchor_nodes=batch_nodes, n_id=batch["node"].n_id
                 )
@@ -364,43 +369,6 @@ class Train_BestModel:
                 total_loss.backward()
                 self.optimizer.step()
 
-                self.model.eval()
-                if use_neighbor_mode:
-                    val_bce, _, val_probs, val_labels = self._eval_with_neighbors(n_type=n_type)
-                else:
-                    with torch.no_grad():
-                        h_dict_val = self.model.encode(self.graph)
-                        z_val = h_dict_val[n_type]
-                        val_bce, _, val_probs, val_labels, _ = self._iterate_batches(
-                            self.val_idx, z_val, train=False)
-
-                if val_probs is not None and val_labels is not None:
-                    val_metrics = self.metrics.update(val_probs, val_labels)
-                else: val_metrics = None
-                if not getattr(self.log, "non_verbose", False):
-                    msg = (f"[lr={lr:.3g}] Epoch {epoch:03d} | "
-                        f"TrainLoss(BCE)={bce_loss:.4f} | "
-                        f"TrainLoss(Contr)={contr_loss:.4f} | "
-                        f"ValLoss(BCE)={val_bce:.4f}")
-                    if val_metrics is not None:
-                        msg += " | " + ", ".join(f"{name}={val_metrics[i]:.4f}"
-                            for i, name in enumerate(self.metrics.get_names()))
-                    self.log.log(msg)
-
-                if val_bce < best_val_loss_lr:
-                    best_val_loss_lr = val_bce
-                    best_epoch_lr = epoch
-                    best_metrics_lr = val_metrics
-                    best_state_lr = {k:v.detach().clone() for k,v in self.model.state_dict().items()}
-
-                if lr_early_stopping.step(val_bce, self.model):
-                    if not getattr(self.log, "non_verbose", False):
-                        self.log.log(f"[lr={lr:.3g}] Early stopping at epoch {epoch} "
-                            f"(best val loss so far: {best_val_loss_lr:.4f}).")
-                else:
-                    print(f"Training Epoch: {epoch} completed.", flush=True)
-                    break
-
             last_bce_loss = bce_loss
             last_contr_loss = contr_loss
             if not getattr(self.log, "non_verbose", False):
@@ -411,70 +379,56 @@ class Train_BestModel:
         return last_bce_loss
 
 
-class Test_BestModel:
-    """Test-time evaluation on a global triple-level test set.
-       Positives: provided explicitly as (heads, rel_ids, tails).
-       Negatives: sampled per relation using existing NegativeSampler.
-    """
+class LinkPredictionEvaluator:
+    """Filtered link-prediction evaluation (MR/MRR/Hits@K) over positive test triples."""
 
-    def __init__(self, model: nn.Module, graph: HeteroData, test_heads: torch.Tensor,
-        test_rels: torch.Tensor, test_tails: torch.Tensor, id2rel: Dict[int, str],
-        neg_samplers: Dict[str, NegativeSampler], num_neg_per_pos: int, 
-        device: torch.device, log, batch_size: int = 1024,
-        neg_cache_path: Optional[str] = None, force_regen_negs: bool = True,
-        save_embeddings_path: Optional[str] = None):
+    def __init__(
+        self,
+        model: nn.Module,
+        graph: HeteroData,
+        test_heads: torch.Tensor,
+        test_rels: torch.Tensor,
+        test_tails: torch.Tensor,
+        known_true_tails: Dict[Tuple[int, int], set],
+        known_true_heads: Dict[Tuple[int, int], set],
+        id2rel: Dict[int, str],
+        device: torch.device,
+        log,
+        batch_size: int = 1024,
+        save_embeddings_path: Optional[str] = None,
+        rankings_save_path: Optional[str] = None,
+        rankings_tsv_path: Optional[str] = None,
+        metrics_save_path: Optional[str] = None,
+        metrics_tsv_path: Optional[str] = None,
+        predictions_save_path: Optional[str] = None,
+    ):
         self.model = model.to(device)
         self.graph = graph
-        self.test_heads = test_heads
-        self.test_rels = test_rels
-        self.test_tails = test_tails
+        self.test_heads = test_heads.clone().long()
+        self.test_rels = test_rels.clone().long()
+        self.test_tails = test_tails.clone().long()
+        self.known_true_tails = known_true_tails
+        self.known_true_heads = known_true_heads
         self.id2rel = id2rel
-        self.neg_samplers = neg_samplers
-        self.num_neg_per_pos = int(num_neg_per_pos)
-        self.neg_cache_path = neg_cache_path
-        self.force_regen_negs = force_regen_negs
-        self.save_embeddings_path = save_embeddings_path
         self.device = device
         self.log = log
         self.batch_size = int(batch_size)
-        self.metrics = Metrics()
+        self.save_embeddings_path = save_embeddings_path
+        self.rankings_save_path = rankings_save_path
+        self.rankings_tsv_path = rankings_tsv_path
+        self.metrics_save_path = metrics_save_path
+        self.metrics_tsv_path = metrics_tsv_path
+        self.predictions_save_path = predictions_save_path
         self.num_nodes = int(graph["node"].num_nodes)
-        self.test_pos_ids_per_rel: Dict[str, set] = {}
-        for rel_id, rel_name in id2rel.items():
-            mask = (test_rels == rel_id)
-            if not mask.any(): continue
-            h = test_heads[mask]
-            t = test_tails[mask]
-            ids = (h.long() * self.num_nodes + t.long()).tolist()
-            self.test_pos_ids_per_rel[rel_name] = set(ids)
 
-
-    def confusion_matrix_binary(self, probs: torch.Tensor,
-                                labels: torch.Tensor,
-                                threshold: float = 0.5) -> torch.Tensor:
-        """
-        Returns confusion matrix:
-            [[TN, FP],
-            [FN, TP]]
-        """
-        probs = probs.detach().view(-1).cpu()
-        labels = labels.detach().view(-1).cpu().to(torch.long)
-        preds = (probs >= threshold).to(torch.long)
-        tn = ((preds == 0) & (labels == 0)).sum()
-        fp = ((preds == 1) & (labels == 0)).sum()
-        fn = ((preds == 0) & (labels == 1)).sum()
-        tp = ((preds == 1) & (labels == 1)).sum()
-        return torch.stack([torch.stack([tn, fp]), torch.stack([fn, tp])])
-
-
-    def _score_triples_in_batches(self, z: torch.Tensor, heads: torch.Tensor,
-        rels: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
-        """
-        Computes probabilities for triples in mini-batches to save memory.
-        Returns a tensor of shape [N] with probabilities.
-        """
-        
-        all_probs = []
+    def _score_logits_in_batches(
+        self,
+        z: torch.Tensor,
+        heads: torch.Tensor,
+        rels: torch.Tensor,
+        tails: torch.Tensor,
+    ) -> torch.Tensor:
+        all_logits: List[torch.Tensor] = []
         self.model.eval()
         with torch.no_grad():
             num = heads.size(0)
@@ -483,264 +437,236 @@ class Test_BestModel:
                 h = heads[start:end]
                 t = tails[start:end]
                 r = rels[start:end]
-                edge_index = torch.stack([h, t], dim=0)
-                device = z.device
-                edge_index = edge_index.to(device)
-                r = r.to(device)
-                _, probs = self.model.score_triples(z, edge_index, r)
+                edge_index = torch.stack([h, t], dim=0).to(z.device)
+                r = r.to(z.device)
+                logits, _ = self.model.score_triples(z, edge_index, r)
+                all_logits.append(logits.detach().cpu())
+        return torch.cat(all_logits, dim=0) if all_logits else torch.empty(0, dtype=torch.float32)
 
-                all_probs.append(probs.detach().cpu())
-        return torch.cat(all_probs, dim=0) if all_probs else torch.empty(0)
+    def _filtered_tail_rank(self, z: torch.Tensor, h: int, r: int, t: int, all_nodes: torch.Tensor) -> int:
+        key = (h, r)
+        filtered = self.known_true_tails.get(key, set())
+        mask = torch.ones(self.num_nodes, dtype=torch.bool, device=all_nodes.device)
+        if filtered:
+            idx = torch.tensor(list(filtered), dtype=torch.long, device=all_nodes.device)
+            mask[idx] = False
+        mask[t] = True
+        cand_tails = all_nodes[mask]
 
-    def _sample_negatives_excluding_test(self, sampler: NegativeSampler, rel_name: str,
-        num_to_sample: int) -> torch.Tensor:
-        """
-        Uses NegativeSampler to sample candidate negatives, then filter out any
-        edges that coincide with test positives for "rel_name".
-        Returns edge_index on the sampler's device.
-        """
-        invalid_ids = self.test_pos_ids_per_rel.get(rel_name, set())
-        if not invalid_ids: return sampler.sample_edge_index(num_to_sample)
+        h_vec = torch.full((cand_tails.numel(),), h, dtype=torch.long, device=all_nodes.device)
+        r_vec = torch.full((cand_tails.numel(),), r, dtype=torch.long, device=all_nodes.device)
+        scores = self._score_logits_in_batches(z, h_vec, r_vec, cand_tails)
+        cand_tails_cpu = cand_tails.detach().cpu()
+        true_idx = torch.where(cand_tails_cpu == int(t))[0]
+        if true_idx.numel() == 0:
+            raise RuntimeError("True tail disappeared after filtering; this should not happen.")
+        true_score = scores[true_idx[0]]
+        return int((scores > true_score).sum().item()) + 1
 
-        device = sampler.device
-        collected = []
-        remaining = num_to_sample
-        max_attempts = 10
-        attempts = 0
+    def _filtered_head_rank(self, z: torch.Tensor, h: int, r: int, t: int, all_nodes: torch.Tensor) -> int:
+        key = (t, r)
+        filtered = self.known_true_heads.get(key, set())
+        mask = torch.ones(self.num_nodes, dtype=torch.bool, device=all_nodes.device)
+        if filtered:
+            idx = torch.tensor(list(filtered), dtype=torch.long, device=all_nodes.device)
+            mask[idx] = False
+        mask[h] = True
+        cand_heads = all_nodes[mask]
 
-        while remaining > 0 and attempts < max_attempts:
-            attempts += 1
-            cand_edge_index = sampler.sample_edge_index(int(remaining * 1.5))
-            if cand_edge_index.numel() == 0: break
-            h = cand_edge_index[0]
-            t = cand_edge_index[1]
-            ids = (h.long() * self.num_nodes + t.long()).tolist()
-            keep_mask_list = [id_ not in invalid_ids for id_ in ids]
+        t_vec = torch.full((cand_heads.numel(),), t, dtype=torch.long, device=all_nodes.device)
+        r_vec = torch.full((cand_heads.numel(),), r, dtype=torch.long, device=all_nodes.device)
+        scores = self._score_logits_in_batches(z, cand_heads, r_vec, t_vec)
+        cand_heads_cpu = cand_heads.detach().cpu()
+        true_idx = torch.where(cand_heads_cpu == int(h))[0]
+        if true_idx.numel() == 0:
+            raise RuntimeError("True head disappeared after filtering; this should not happen.")
+        true_score = scores[true_idx[0]]
+        return int((scores > true_score).sum().item()) + 1
 
-            if not any(keep_mask_list): continue
-            keep_mask = torch.tensor(keep_mask_list, dtype=torch.bool, device=device)
-            kept_edges = cand_edge_index[:, keep_mask]
-            if kept_edges.numel() == 0: continue
-            collected.append(kept_edges)
-            remaining = num_to_sample - sum(c.size(1) for c in collected)
-        if not collected: return torch.empty(2, 0, dtype=torch.long, device=device)
-
-        neg_edge_index = torch.cat(collected, dim=1)
-        if neg_edge_index.size(1) > num_to_sample:neg_edge_index = neg_edge_index[:, :num_to_sample]
-        return neg_edge_index
-
-    # def run(self):
-    #     self.graph = self.graph.to(self.device)
-    #     self.test_heads = self.test_heads.to(self.device)
-    #     self.test_rels = self.test_rels.to(self.device)
-    #     self.test_tails = self.test_tails.to(self.device)
-    #     # passed to cpu because of RA-HGCN
-    #     self.model = self.model.cpu()
-    #     graph_cpu = self.graph.cpu()
-        
-    #     cached = None
-    #     if (self.neg_cache_path is not None) and (not self.force_regen_negs):
-    #         cached = maybe_load_neg_cache(self.neg_cache_path, map_location="cpu")
-
-    #     self.model.eval()
-    #     # with torch.no_grad():
-    #     with torch.inference_mode():
-    #         h_dict = self.model.encode(graph_cpu)
-    #         z = h_dict[getattr(self.model, "n_type", "node")]
-    #         del h_dict
-    #         pos_probs = self._score_triples_in_batches(
-    #             z, self.test_heads, self.test_rels, self.test_tails)
-    #         pos_labels = torch.ones_like(pos_probs)
-
-    #         if cached is not None:
-    #             neg_heads = cached["neg_heads"].to(self.device)
-    #             neg_rels  = cached["neg_rels"].to(self.device)
-    #             neg_tails = cached["neg_tails"].to(self.device)
-    #         else:
-    #             neg_heads_list,neg_rels_list,neg_tails_list = [], [], []
-
-    #         unique_rels = torch.unique(self.test_rels)
-    #         for rel_id in unique_rels.tolist():
-    #             rel_name = self.id2rel[rel_id]
-    #             sampler = self.neg_samplers.get(rel_name, None)
-    #             if sampler is None: continue
-    #             # group by head within this relation
-    #             mask = (self.test_rels == rel_id)
-    #             h_rel = self.test_heads[mask]
-    #             if h_rel.numel() == 0:  continue
-
-    #             uniq_h, pos_counts_per_h = torch.unique(h_rel, return_counts=True)
-    #             neg_counts_per_h = pos_counts_per_h * self.num_neg_per_pos
-    #             extra_invalid = self.test_pos_ids_per_rel.get(rel_name, set())
-    #             neg_src, neg_dst = sampler.sample_for_heads(
-    #                 uniq_h.to(sampler.device),neg_counts_per_h.to(sampler.device),
-    #                 extra_invalid_ids=extra_invalid)
-
-    #             if neg_src.numel() == 0: continue
-    #             neg_src = neg_src.to(self.device)
-    #             neg_dst = neg_dst.to(self.device)
-    #             r_neg = torch.full((neg_src.size(0),), rel_id, dtype=torch.long, device=self.device)
-
-    #             neg_heads_list.append(neg_src)
-    #             neg_tails_list.append(neg_dst)
-    #             neg_rels_list.append(r_neg)
-
-
-    #         # unique_rels, counts = torch.unique(self.test_rels, return_counts=True)
-    #         # for rel_id, count in zip(unique_rels.tolist(), counts.tolist()):
-    #         #     rel_name = self.id2rel[rel_id]
-    #         #     sampler = self.neg_samplers.get(rel_name, None)
-    #         #     if sampler is None: continue
-
-    #         #     num_to_sample = count * self.num_neg_per_pos
-    #         #     neg_edge_index = self._sample_negatives_excluding_test(
-    #         #         sampler, rel_name, num_to_sample)
-
-    #         #     if neg_edge_index.numel() == 0: continue
-    #         #     neg_edge_index = neg_edge_index.to(self.device)
-    #         #     h_neg = neg_edge_index[0]
-    #         #     t_neg = neg_edge_index[1]
-    #         #     r_neg = torch.full((h_neg.size(0),), rel_id,
-    #         #         dtype=torch.long, device=self.device)
-    #         #     neg_heads_list.append(h_neg)
-    #         #     neg_tails_list.append(t_neg)
-    #         #     neg_rels_list.append(r_neg)
-
-    #         if neg_heads_list:
-    #             neg_heads = torch.cat(neg_heads_list, dim=0)
-    #             neg_tails = torch.cat(neg_tails_list, dim=0)
-    #             neg_rels = torch.cat(neg_rels_list, dim=0)
-    #             neg_probs = self._score_triples_in_batches(
-    #                 z, neg_heads, neg_rels, neg_tails)
-    #             neg_labels = torch.zeros_like(neg_probs)
-    #             all_probs = torch.cat([pos_probs, neg_probs], dim=0)
-    #             all_labels = torch.cat([pos_labels, neg_labels], dim=0)
-    #         else:
-    #             all_probs = pos_probs
-    #             all_labels = pos_labels
-
-
-    #         metrics = self.metrics.update_all(all_probs, all_labels)
-    #         names = self.metrics.get_allnames()
-    #         self.log.log("=== Test metrics (global) ===")
-    #         for name, val in zip(names, metrics):
-    #             self.log.log(f"{name}: {val:.4f}")
-    #     return metrics
-
+    @staticmethod
+    def _hits_at(rank: int, k: int) -> float:
+        return 1.0 if rank <= k else 0.0
 
     def run(self):
-        self.graph = self.graph.to(self.device)
-        self.test_heads = self.test_heads.to(self.device)
-        self.test_rels  = self.test_rels.to(self.device)
-        self.test_tails = self.test_tails.to(self.device)
-        # RA-HGCN path: encode on CPU
         self.model = self.model.cpu()
         graph_cpu = self.graph.cpu()
-
-        cached = None
-        if (self.neg_cache_path is not None) and (not self.force_regen_negs):
-            cached = maybe_load_neg_cache(self.neg_cache_path, map_location="cpu")
+        heads = self.test_heads.cpu()
+        rels = self.test_rels.cpu()
+        tails = self.test_tails.cpu()
 
         with torch.inference_mode():
             h_dict = self.model.encode(graph_cpu)
             z = h_dict[getattr(self.model, "n_type", "node")]
             del h_dict
+
             if self.save_embeddings_path:
                 try:
                     torch.save({"embeddings": z.detach().cpu()}, self.save_embeddings_path)
                     print(f"[INFO] Saved test-time embeddings: {self.save_embeddings_path}")
-                except Exception as e: print(f"[WARN] Failed to save test-time embeddings: {e}")
+                except Exception as e:
+                    print(f"[WARN] Failed to save test-time embeddings: {e}")
 
-            pos_probs = self._score_triples_in_batches(
-                z, self.test_heads, self.test_rels, self.test_tails)
-            pos_labels = torch.ones_like(pos_probs)
-            if cached is not None:
-                neg_heads = cached["neg_heads"].to(self.device)
-                neg_rels  = cached["neg_rels"].to(self.device)
-                neg_tails = cached["neg_tails"].to(self.device)
-            else:
-                neg_heads_list, neg_rels_list, neg_tails_list = [], [], []
-                unique_rels = torch.unique(self.test_rels)
-                for rel_id in unique_rels.tolist():
-                    rel_name = self.id2rel[rel_id]
-                    sampler = self.neg_samplers.get(rel_name, None)
-                    if sampler is None:
-                        continue
+            all_nodes = torch.arange(self.num_nodes, dtype=torch.long, device=z.device)
+            n = int(heads.numel())
+            if n == 0:
+                raise RuntimeError("No positive test triples available for link prediction.")
+            true_logits = self._score_logits_in_batches(z, heads, rels, tails)
+            true_probs = torch.sigmoid(true_logits)
 
-                    mask = (self.test_rels == rel_id)
-                    h_rel = self.test_heads[mask]
-                    if h_rel.numel() == 0:
-                        continue
+            head_rank_sum = 0.0
+            head_rr_sum = 0.0
+            head_h1 = 0.0
+            head_h3 = 0.0
+            head_h10 = 0.0
 
-                    uniq_h, pos_counts_per_h = torch.unique(h_rel, return_counts=True)
-                    neg_counts_per_h = pos_counts_per_h * self.num_neg_per_pos
+            tail_rank_sum = 0.0
+            tail_rr_sum = 0.0
+            tail_h1 = 0.0
+            tail_h3 = 0.0
+            tail_h10 = 0.0
+            head_ranks: List[int] = []
+            tail_ranks: List[int] = []
 
-                    extra_invalid = self.test_pos_ids_per_rel.get(rel_name, set())
-                    neg_src, neg_dst = sampler.sample_for_heads(
-                        uniq_h.to(sampler.device),
-                        neg_counts_per_h.to(sampler.device),
-                        extra_invalid_ids=extra_invalid
-                    )
+            for i in range(n):
+                h = int(heads[i].item())
+                r = int(rels[i].item())
+                t = int(tails[i].item())
 
-                    requested = int(neg_counts_per_h.sum().item())
-                    got = int(neg_src.numel())
-                    if got < requested:
-                        print(f"[WARN] rel={rel_name} requested_negs={requested} got={got} "
-                            f"({got/requested:.2%} of target)")
+                rank_t = self._filtered_tail_rank(z, h, r, t, all_nodes)
+                tail_ranks.append(rank_t)
+                tail_rank_sum += rank_t
+                tail_rr_sum += 1.0 / float(rank_t)
+                tail_h1 += self._hits_at(rank_t, 1)
+                tail_h3 += self._hits_at(rank_t, 3)
+                tail_h10 += self._hits_at(rank_t, 10)
 
-                    if neg_src.numel() == 0: continue
-                    neg_src = neg_src.to(self.device)
-                    neg_dst = neg_dst.to(self.device)
-                    r_neg = torch.full((neg_src.size(0),), rel_id,
-                                    dtype=torch.long, device=self.device)
+                rank_h = self._filtered_head_rank(z, h, r, t, all_nodes)
+                head_ranks.append(rank_h)
+                head_rank_sum += rank_h
+                head_rr_sum += 1.0 / float(rank_h)
+                head_h1 += self._hits_at(rank_h, 1)
+                head_h3 += self._hits_at(rank_h, 3)
+                head_h10 += self._hits_at(rank_h, 10)
 
-                    neg_heads_list.append(neg_src)
-                    neg_tails_list.append(neg_dst)
-                    neg_rels_list.append(r_neg)
+                if (i + 1) % 100 == 0:
+                    print(f"[LP Eval] Processed {i + 1}/{n} queries")
 
-                if neg_heads_list:
-                    neg_heads = torch.cat(neg_heads_list, dim=0)
-                    neg_tails = torch.cat(neg_tails_list, dim=0)
-                    neg_rels  = torch.cat(neg_rels_list,  dim=0)
-                else:
-                    neg_heads = torch.empty(0, dtype=torch.long, device=self.device)
-                    neg_tails = torch.empty(0, dtype=torch.long, device=self.device)
-                    neg_rels  = torch.empty(0, dtype=torch.long, device=self.device)
+        n_f = float(n)
+        tail_mr = tail_rank_sum / n_f
+        tail_mrr = tail_rr_sum / n_f
+        tail_hits1 = tail_h1 / n_f
+        tail_hits3 = tail_h3 / n_f
+        tail_hits10 = tail_h10 / n_f
 
-                # --- save cache
-                if self.neg_cache_path is not None:
-                    payload = {
-                        "neg_heads": neg_heads.detach().cpu(),
-                        "neg_rels":  neg_rels.detach().cpu(),
-                        "neg_tails": neg_tails.detach().cpu(),
-                        "meta": {
-                            "num_neg_per_pos": int(self.num_neg_per_pos),
-                            "num_nodes": int(self.num_nodes)}}
-                    atomic_torch_save(payload, self.neg_cache_path)
+        head_mr = head_rank_sum / n_f
+        head_mrr = head_rr_sum / n_f
+        head_hits1 = head_h1 / n_f
+        head_hits3 = head_h3 / n_f
+        head_hits10 = head_h10 / n_f
 
+        mr = 0.5 * (head_mr + tail_mr)
+        mrr = 0.5 * (head_mrr + tail_mrr)
+        hits1 = 0.5 * (head_hits1 + tail_hits1)
+        hits3 = 0.5 * (head_hits3 + tail_hits3)
+        hits10 = 0.5 * (head_hits10 + tail_hits10)
 
-            if neg_heads.numel() > 0:
-                neg_probs = self._score_triples_in_batches(z, neg_heads, neg_rels, neg_tails)
-                neg_labels = torch.zeros_like(neg_probs)
-                all_probs  = torch.cat([pos_probs, neg_probs], dim=0)
-                all_labels = torch.cat([pos_labels, neg_labels], dim=0)
-            else: all_probs, all_labels = pos_probs, pos_labels
+        metrics = {
+            "tail_mr": tail_mr,
+            "tail_mrr": tail_mrr,
+            "tail_hits@1": tail_hits1,
+            "tail_hits@3": tail_hits3,
+            "tail_hits@10": tail_hits10,
+            "head_mr": head_mr,
+            "head_mrr": head_mrr,
+            "head_hits@1": head_hits1,
+            "head_hits@3": head_hits3,
+            "head_hits@10": head_hits10,
+            "mr": mr,
+            "mrr": mrr,
+            "hits@1": hits1,
+            "hits@3": hits3,
+            "hits@10": hits10,
+        }
 
-            p = all_probs.detach().cpu().view(-1)
-            y = all_labels.detach().cpu().view(-1)
+        self.log.log("=== Link Prediction (filtered) ===")
+        for k, v in metrics.items():
+            self.log.log(f"{k}: {v:.6f}")
+        self._save_artifacts(heads, rels, tails, true_logits, true_probs, head_ranks, tail_ranks, metrics)
+        return metrics
 
-            # # --- Confusion matrix (global) ---
-            # cm = self.confusion_matrix_binary(all_probs, all_labels, threshold=0.5)
-            # tn, fp = cm[0].tolist()
-            # fn, tp = cm[1].tolist()
-            # self.log.log("=== Confusion Matrix @thr=0.5 ===")
-            # self.log.log(f"TN={tn}  FP={fp}")
-            # self.log.log(f"FN={fn}  TP={tp}")
-            # self.log.log(f"Matrix:\n{cm}")
-
-            metrics = self.metrics.update_all(all_probs, all_labels)
-            names = self.metrics.get_allnames()
-            self.log.log("=== Test metrics (global) ===")
-            for name, val in zip(names, metrics):
-                self.log.log(f"{name}: {val:.4f}")
-            return metrics
+    def _save_artifacts(
+        self,
+        heads: torch.Tensor,
+        rels: torch.Tensor,
+        tails: torch.Tensor,
+        true_logits: torch.Tensor,
+        true_probs: torch.Tensor,
+        head_ranks: List[int],
+        tail_ranks: List[int],
+        metrics: Dict[str, float],
+    ) -> None:
+        head_rank_t = torch.tensor(head_ranks, dtype=torch.long)
+        tail_rank_t = torch.tensor(tail_ranks, dtype=torch.long)
+        labels = torch.ones_like(true_probs, dtype=torch.float32)
+        payload = {
+            "heads": heads.detach().cpu().long(),
+            "rels": rels.detach().cpu().long(),
+            "tails": tails.detach().cpu().long(),
+            "labels": labels.detach().cpu(),
+            "true_logits": true_logits.detach().cpu(),
+            "true_probs": true_probs.detach().cpu(),
+            "head_ranks": head_rank_t,
+            "tail_ranks": tail_rank_t,
+            "mean_ranks_per_triple": 0.5 * (head_rank_t.float() + tail_rank_t.float()),
+            "reciprocal_ranks_per_triple": 0.5 * (1.0 / head_rank_t.float() + 1.0 / tail_rank_t.float()),
+            "metrics": metrics,
+        }
+        for path in [self.rankings_save_path, self.predictions_save_path]:
+            if path:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                torch.save(payload, path)
+        if self.metrics_save_path:
+            os.makedirs(os.path.dirname(self.metrics_save_path), exist_ok=True)
+            torch.save({"metrics": metrics}, self.metrics_save_path)
+        if self.metrics_tsv_path:
+            os.makedirs(os.path.dirname(self.metrics_tsv_path), exist_ok=True)
+            with open(self.metrics_tsv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter="\t")
+                writer.writerow(["metric", "value"])
+                for key, value in metrics.items():
+                    writer.writerow([key, f"{float(value):.8f}"])
+        if self.rankings_tsv_path:
+            os.makedirs(os.path.dirname(self.rankings_tsv_path), exist_ok=True)
+            with open(self.rankings_tsv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter="\t")
+                writer.writerow([
+                    "query_index",
+                    "head",
+                    "rel_id",
+                    "rel_name",
+                    "tail",
+                    "label",
+                    "true_logit",
+                    "true_prob",
+                    "head_rank",
+                    "tail_rank",
+                    "mean_rank",
+                    "reciprocal_rank",
+                ])
+                for i, (h, r, t) in enumerate(zip(heads.tolist(), rels.tolist(), tails.tolist())):
+                    hr = int(head_ranks[i])
+                    tr = int(tail_ranks[i])
+                    writer.writerow([
+                        i,
+                        int(h),
+                        int(r),
+                        self.id2rel.get(int(r), str(int(r))),
+                        int(t),
+                        1,
+                        f"{float(true_logits[i]):.8f}",
+                        f"{float(true_probs[i]):.8f}",
+                        hr,
+                        tr,
+                        f"{0.5 * (hr + tr):.8f}",
+                        f"{0.5 * ((1.0 / hr) + (1.0 / tr)):.8f}",
+                    ])

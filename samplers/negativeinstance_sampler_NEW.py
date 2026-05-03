@@ -16,7 +16,7 @@ class NegativeInstanceSampler_NEW:
     def __init__(self, k: int = 2, subclass_rel: str = "subclass_of",
         neg_prefix: str = "NOT_", instance_rel: str = "2", neg_expansion_hops: int = 3,
         max_pool_size: int = 100, cache_dir: Optional[str] = None,
-        cache_key: Optional[str] = None):
+        cache_key: Optional[str] = None, max_contrastive_anchors: int = 0):
         self.k = int(k)
         self.subclass_rel = subclass_rel
         self.neg_prefix = neg_prefix
@@ -57,12 +57,14 @@ class NegativeInstanceSampler_NEW:
         self._pre_neg2pos = None
         self._pre_shpos = None
         self._pre_ready = False
+        self._pre_anchor_valid_mask = None
         self.primary_pred = instance_rel  # "instance_of"
         self.cls_edge_suffix = "__cls"
         self.prefer_inst_only = None
         self.inst_pred_key = None
         self._dbg_ctr = 0
         self._dbg_every = 20
+        self.max_contrastive_anchors = int(max(0, int(max_contrastive_anchors)))
 
     def print_pool_stats(self, prefix: str = "[NegativeInstanceSampler_NEW]") -> None:
         if not self.anchors:
@@ -471,8 +473,10 @@ class NegativeInstanceSampler_NEW:
             subclass_predecessors = {p: self._unique_cpu(ch) for p, ch in tmp.items()}
         # print(f"[NegativeInstanceSampler_NEW] prepare_global: subclass_predecessors={len(subclass_predecessors)}")
 
-        pos_by_pred = [defaultdict(list) for _ in range(N)]
-        neg_by_pred_direct = [defaultdict(list) for _ in range(N)]
+        # Sparse anchor->pred->classes maps: avoid allocating Python dicts for every node id.
+        # This preserves sampling behavior while drastically reducing prepare_global overhead.
+        pos_by_pred: Dict[int, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+        neg_by_pred_direct: Dict[int, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
         class2pos_by_pred_tmp = defaultdict(lambda: defaultdict(list))
         class2neg_by_pred_tmp = defaultdict(lambda: defaultdict(list))
         anchor_sources: set[int] = set(instance_nodes)
@@ -500,10 +504,10 @@ class NegativeInstanceSampler_NEW:
         # print(f"[NegativeInstanceSampler_NEW] prepare_global: edge scan took {time.time() - t_scan:.2f}s")
         self.anchors = sorted(anchor_sources) if anchor_sources else list(range(N))
 
-        neg_by_pred_expanded = [defaultdict(list) for _ in range(N)]
+        neg_by_pred_expanded: Dict[int, Dict[str, List[int]]] = defaultdict(dict)
         t_expand = time.time()
         for u in self.anchors:
-            for pred, cls_list in neg_by_pred_direct[u].items():
+            for pred, cls_list in neg_by_pred_direct.get(u, {}).items():
                 neg_by_pred_expanded[u][pred] = self._expand_negs(cls_list, subclass_predecessors)
         # print(f"[NegativeInstanceSampler_NEW] prepare_global: neg expansion took {time.time() - t_expand:.2f}s")
 
@@ -525,13 +529,15 @@ class NegativeInstanceSampler_NEW:
 
         t_pools = time.time()
         for u in self.anchors:
-            preds_u = set(pos_by_pred[u].keys()) | set(neg_by_pred_expanded[u].keys())
+            pos_u = pos_by_pred.get(u, {})
+            neg_u = neg_by_pred_expanded.get(u, {})
+            preds_u = set(pos_u.keys()) | set(neg_u.keys())
             self.preds_seen[u] = preds_u
             self.pred_order_cache[u] = self._pred_priority(u) if preds_u else []
             neg_union_parts: List[Tensor] = []
             for pred in preds_u:
-                pos_cls = pos_by_pred[u].get(pred, [])
-                neg_cls = neg_by_pred_expanded[u].get(pred, [])
+                pos_cls = pos_u.get(pred, [])
+                neg_cls = neg_u.get(pred, [])
 
                 if pos_cls:
                     self.pool_shared_pos_by_pred[u][pred] = self._cap_pool(self._collect_instances_fast(
@@ -570,6 +576,7 @@ class NegativeInstanceSampler_NEW:
         self._pre_pos2neg = base.clone()
         self._pre_neg2pos = base.clone()
         self._pre_shpos = base.clone()
+        self._pre_anchor_valid_mask = torch.zeros(N, dtype=torch.bool)
 
         for u in self.anchors_valid:
             pred_order = self.pred_order_cache[u] if self.pred_order_cache is not None else self._pred_priority(u)
@@ -626,6 +633,9 @@ class NegativeInstanceSampler_NEW:
                 pos2neg_pool = neg2pos_pool
             if not has_neg2pos and has_pos2neg:
                 neg2pos_pool = pos2neg_pool
+            if (not has_pos2neg and not has_neg2pos) or (not has_shpos and not has_shneg):
+                continue
+            self._pre_anchor_valid_mask[u] = True
             self._pre_pos2neg[u] = self._sample_k_priority_cpu(
                 pos2neg_pool, pred_order, stamp=0,
                 fallback_global=u, fallback_local=u, k=k, full_graph_mode=True
@@ -827,6 +837,9 @@ class NegativeInstanceSampler_NEW:
                 anchor_globals_cpu = torch.tensor(self.anchors_valid or self.anchors, dtype=torch.long)
             else: anchor_globals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
             anchor_globals_cpu = anchor_globals_cpu[(anchor_globals_cpu >= 0) & (anchor_globals_cpu < self.num_nodes)]
+            if self.max_contrastive_anchors > 0 and anchor_globals_cpu.numel() > self.max_contrastive_anchors:
+                perm = torch.randperm(anchor_globals_cpu.numel())[: self.max_contrastive_anchors]
+                anchor_globals_cpu = anchor_globals_cpu[perm]
             t_select = time.time() - t_select
 
             anchors_cpu: List[int] = []
@@ -961,6 +974,9 @@ class NegativeInstanceSampler_NEW:
             anchor_locals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
             # safety filter
             anchor_locals_cpu = anchor_locals_cpu[(anchor_locals_cpu >= 0) & (anchor_locals_cpu < n_id_cpu.numel())]
+            if self.max_contrastive_anchors > 0 and anchor_locals_cpu.numel() > self.max_contrastive_anchors:
+                perm = torch.randperm(anchor_locals_cpu.numel())[: self.max_contrastive_anchors]
+                anchor_locals_cpu = anchor_locals_cpu[perm]
             anchor_globals_cpu = n_id_cpu[anchor_locals_cpu]
         t_select = time.time() - t_select
 
@@ -973,47 +989,65 @@ class NegativeInstanceSampler_NEW:
         still_empty_pos2neg = 0
         still_empty_neg2pos = 0
 
-        # Filter anchors with pools
+        # Filter anchors with pools.
+        # Fast path: when epoch pre-sampling is ready, reuse a precomputed per-anchor
+        # validity mask and avoid per-batch dictionary scans.
         anchor_globals_list = []
         anchor_locals_list = []
-        for u_g, u_l in zip(anchor_globals_cpu.tolist(), anchor_locals_cpu.tolist()):
-            if u_l < 0:
-                continue
-            if not self._has_any_pool(u_g):
-                continue
-            # Old skip when neg pools empty (fallback2) disabled
-            # if self._needs_fallback2_neg(u_g):
-            #     continue
-            pos2neg_pool = self.pool_pos_to_u_neg_by_pred[u_g]
-            neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u_g]
-            has_pos2neg = self._has_any_pool_map(pos2neg_pool)
-            has_neg2pos = self._has_any_pool_map(neg2pos_pool)
-            if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
-                inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
-                if inst_key:
-                    pos2neg_t = pos2neg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
-                    neg2pos_t = neg2pos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
-                    pos2neg_pool = {inst_key: pos2neg_t}
-                    neg2pos_pool = {inst_key: neg2pos_t}
-                    has_pos2neg = pos2neg_t.numel() > 0
-                    has_neg2pos = neg2pos_t.numel() > 0
-            if not has_pos2neg and not has_neg2pos:
-                continue
-            shpos_pool = self.pool_shared_pos_by_pred[u_g]
-            shneg_pool = self.pool_shared_neg_by_pred[u_g]
-            if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
-                inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
-                if inst_key:
-                    shpos_t = shpos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
-                    shneg_t = shneg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
-                    shpos_pool = {inst_key: shpos_t}
-                    shneg_pool = {inst_key: shneg_t}
-            has_shpos = self._has_any_pool_map(shpos_pool)
-            has_shneg = self._has_any_pool_map(shneg_pool)
-            if not has_shpos and not has_shneg:
-                continue
-            anchor_globals_list.append(u_g)
-            anchor_locals_list.append(u_l)
+        if self._pre_ready and self._pre_anchor_valid_mask is not None:
+            valid_mask = self._pre_anchor_valid_mask
+            valid_n = int(valid_mask.numel())
+            safe = (
+                (anchor_locals_cpu >= 0)
+                & (anchor_globals_cpu >= 0)
+                & (anchor_globals_cpu < valid_n)
+            )
+            if safe.any():
+                g_ok = anchor_globals_cpu[safe]
+                l_ok = anchor_locals_cpu[safe]
+                keep = valid_mask[g_ok]
+                if keep.any():
+                    anchor_globals_list = g_ok[keep].tolist()
+                    anchor_locals_list = l_ok[keep].tolist()
+        else:
+            for u_g, u_l in zip(anchor_globals_cpu.tolist(), anchor_locals_cpu.tolist()):
+                if u_l < 0:
+                    continue
+                if not self._has_any_pool(u_g):
+                    continue
+                # Old skip when neg pools empty (fallback2) disabled
+                # if self._needs_fallback2_neg(u_g):
+                #     continue
+                pos2neg_pool = self.pool_pos_to_u_neg_by_pred[u_g]
+                neg2pos_pool = self.pool_neg_to_u_pos_by_pred[u_g]
+                has_pos2neg = self._has_any_pool_map(pos2neg_pool)
+                has_neg2pos = self._has_any_pool_map(neg2pos_pool)
+                if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
+                    inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
+                    if inst_key:
+                        pos2neg_t = pos2neg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                        neg2pos_t = neg2pos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                        pos2neg_pool = {inst_key: pos2neg_t}
+                        neg2pos_pool = {inst_key: neg2pos_t}
+                        has_pos2neg = pos2neg_t.numel() > 0
+                        has_neg2pos = neg2pos_t.numel() > 0
+                if not has_pos2neg and not has_neg2pos:
+                    continue
+                shpos_pool = self.pool_shared_pos_by_pred[u_g]
+                shneg_pool = self.pool_shared_neg_by_pred[u_g]
+                if self.prefer_inst_only is not None and u_g < len(self.prefer_inst_only) and self.prefer_inst_only[u_g]:
+                    inst_key = self.inst_pred_key[u_g] if self.inst_pred_key is not None else None
+                    if inst_key:
+                        shpos_t = shpos_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                        shneg_t = shneg_pool.get(inst_key, torch.empty(0, dtype=torch.long))
+                        shpos_pool = {inst_key: shpos_t}
+                        shneg_pool = {inst_key: shneg_t}
+                has_shpos = self._has_any_pool_map(shpos_pool)
+                has_shneg = self._has_any_pool_map(shneg_pool)
+                if not has_shpos and not has_shneg:
+                    continue
+                anchor_globals_list.append(u_g)
+                anchor_locals_list.append(u_l)
 
         if anchor_globals_list:
             anchors_local_cpu = anchor_locals_list

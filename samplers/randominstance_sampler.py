@@ -995,9 +995,6 @@ class RandomInstanceSampler(NegativeInstanceSampler):
     # batch-local map build (fast)
     # -----------------------
     def prepare_batch(self, batch: HeteroData) -> None:
-        # Intentionally re-seed each batch to avoid deterministic sampling.
-        random.seed()
-        torch.seed()
         ntype = self.node_type or "node"
         if ntype not in batch.node_types:
             ntype = batch.node_types[0]

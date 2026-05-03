@@ -19,7 +19,7 @@ from torch_geometric.loader import NeighborLoader, LinkNeighborLoader
 from data_loader import DataLoader
 from models import *
 from trainer_NEW import Train
-from trainer_bestmodel_NEW import Train_BestModel, Test_BestModel
+from trainer_bestmodel_NEW import Train_BestModel, LinkPredictionEvaluator
 from utils import Logger, load_config, ensure_dir
 from samplers import (
     NegativeInstanceSampler_NEWER, NegativeInstanceSampler_NEW, RandomInstanceSampler, TypedInstanceSampler, PartialInstanceSampler
@@ -52,7 +52,7 @@ def _add_cls_edges_for_sampler(
     labels: torch.Tensor,
     id2rel: Dict[int, str],
 ) -> Tuple[int, int]:
-    """Append train classification triples as sampler-only edges (with __cls suffix)."""
+    """Append train classification triples as typed edges using base relation names."""
     n_cls_pos = 0
     n_cls_neg = 0
     if heads is None or heads.numel() == 0:
@@ -69,17 +69,205 @@ def _add_cls_edges_for_sampler(
         if mask_pos.any():
             src = torch.tensor(h[mask_pos], dtype=torch.long)
             tgt = torch.tensor(t[mask_pos], dtype=torch.long)
-            et = f"{rel}{CLS_EDGE_SUFFIX}"
+            et = rel
             _append_edges(g, et, src, tgt)
             n_cls_pos += int(mask_pos.sum())
         if mask_neg.any():
             src = torch.tensor(h[mask_neg], dtype=torch.long)
             tgt = torch.tensor(t[mask_neg], dtype=torch.long)
             et_base = _ensure_not_prefixed(rel)
-            et = f"{et_base}{CLS_EDGE_SUFFIX}"
+            et = et_base
             _append_edges(g, et, src, tgt)
             n_cls_neg += int(mask_neg.sum())
     return n_cls_pos, n_cls_neg
+
+
+def _message_passing_edge_types(
+    graph: HeteroData,
+    *,
+    subclass_rel: str,
+    drop_subclass: bool,
+    cls_edge_suffix: str = CLS_EDGE_SUFFIX,
+) -> List[Tuple[str, str, str]]:
+    etypes = [
+        et for et in graph.edge_types
+        if et != CLS_EDGE_TYPE and not str(et[1]).endswith(cls_edge_suffix)
+    ]
+    if drop_subclass:
+        etypes = [et for et in etypes if str(et[1]) != str(subclass_rel)]
+    return etypes
+
+
+def _build_hr_paired_train_indices(
+    *,
+    heads: torch.Tensor,
+    rels: torch.Tensor,
+    labels: torch.Tensor,
+    candidate_idx: torch.Tensor,
+    seed: int,
+) -> Tuple[torch.Tensor, Dict[str, int]]:
+    """
+    Build a supervision index where each positive triple is paired with one
+    explicit negative triple that has the same (head, relation).
+
+    Returns:
+      paired_idx_global: shape [2 * n_pairs], interleaved as [pos, neg, pos, neg, ...]
+      stats: summary counters for logging
+    """
+    cand = candidate_idx.detach().cpu().long().numpy()
+    if cand.size == 0:
+        return torch.empty((0,), dtype=torch.long), {
+            "raw_total": 0,
+            "raw_pos": 0,
+            "raw_neg": 0,
+            "paired_pos": 0,
+            "paired_neg": 0,
+            "dropped_pos_no_hr_neg": 0,
+        }
+
+    h = heads.detach().cpu().long().numpy()[cand]
+    r = rels.detach().cpu().long().numpy()[cand]
+    y = labels.detach().cpu().numpy()[cand]
+
+    pos_local = np.where(y > 0.5)[0]
+    neg_local = np.where(y <= 0.5)[0]
+
+    hr_to_neg_locals: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for li in neg_local:
+        hr_to_neg_locals[(int(h[li]), int(r[li]))].append(int(li))
+
+    rng = np.random.default_rng(int(seed))
+    paired_pos_local: List[int] = []
+    paired_neg_local: List[int] = []
+    dropped_pos = 0
+    for li in pos_local:
+        key = (int(h[li]), int(r[li]))
+        candidates = hr_to_neg_locals.get(key, None)
+        if not candidates:
+            dropped_pos += 1
+            continue
+        neg_li = int(candidates[int(rng.integers(low=0, high=len(candidates)))])
+        paired_pos_local.append(int(li))
+        paired_neg_local.append(neg_li)
+
+    n_pairs = len(paired_pos_local)
+    if n_pairs == 0:
+        return torch.empty((0,), dtype=torch.long), {
+            "raw_total": int(cand.size),
+            "raw_pos": int(pos_local.size),
+            "raw_neg": int(neg_local.size),
+            "paired_pos": 0,
+            "paired_neg": 0,
+            "dropped_pos_no_hr_neg": int(dropped_pos),
+        }
+
+    paired_local = np.empty((2 * n_pairs,), dtype=np.int64)
+    paired_local[0::2] = np.asarray(paired_pos_local, dtype=np.int64)
+    paired_local[1::2] = np.asarray(paired_neg_local, dtype=np.int64)
+    paired_global = cand[paired_local]
+    paired_idx_global = torch.tensor(paired_global, dtype=torch.long)
+
+    return paired_idx_global, {
+        "raw_total": int(cand.size),
+        "raw_pos": int(pos_local.size),
+        "raw_neg": int(neg_local.size),
+        "paired_pos": int(n_pairs),
+        "paired_neg": int(n_pairs),
+        "dropped_pos_no_hr_neg": int(dropped_pos),
+    }
+
+
+def _drop_val_examples_seen_in_train(
+    *,
+    heads: torch.Tensor,
+    rels: torch.Tensor,
+    tails: torch.Tensor,
+    labels: torch.Tensor,
+    train_idx: torch.Tensor,
+    val_idx: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, int]]:
+    """
+    Leak guard for CV: remove validation examples that exactly match any
+    (h, r, t, y) example present in that fold's train split.
+    """
+    tr = train_idx.detach().cpu().long().numpy()
+    va = val_idx.detach().cpu().long().numpy()
+    if va.size == 0 or tr.size == 0:
+        return val_idx, {
+            "val_before": int(va.size),
+            "val_removed_seen_in_train": 0,
+            "val_after": int(va.size),
+        }
+
+    h = heads.detach().cpu().long().numpy()
+    r = rels.detach().cpu().long().numpy()
+    t = tails.detach().cpu().long().numpy()
+    y = (labels.detach().cpu().numpy() > 0.5).astype(np.int8)
+
+    train_keys = set(
+        zip(h[tr].tolist(), r[tr].tolist(), t[tr].tolist(), y[tr].tolist())
+    )
+    keep_mask = np.array(
+        [
+            (int(h[i]), int(r[i]), int(t[i]), int(y[i])) not in train_keys
+            for i in va.tolist()
+        ],
+        dtype=bool,
+    )
+    va_new = va[keep_mask]
+    removed = int(va.size - va_new.size)
+    return torch.tensor(va_new, dtype=torch.long), {
+        "val_before": int(va.size),
+        "val_removed_seen_in_train": removed,
+        "val_after": int(va_new.size),
+    }
+
+def _assert_shared_id_alignment(
+    *,
+    base_graph: HeteroData,
+    contrastive_graph: HeteroData,
+) -> None:
+    """
+    Ensure nodes/edges that already existed in base_graph keep the same ids in
+    contrastive_graph. Contrastive graph may append nodes/edges, but existing
+    ids must be stable.
+    """
+    if "node" not in base_graph.node_types or "node" not in contrastive_graph.node_types:
+        raise RuntimeError("Alignment check requires node type 'node' in both graphs.")
+
+    n_base = int(base_graph["node"].num_nodes)
+    n_con = int(contrastive_graph["node"].num_nodes)
+    if n_con < n_base:
+        raise RuntimeError(
+            f"Contrastive graph shrank node space ({n_con}) below base graph ({n_base})."
+        )
+
+    bx = base_graph["node"].x
+    cx = contrastive_graph["node"].x
+    if bx is not None and cx is not None and bx.numel() > 0 and cx.numel() > 0:
+        if cx.size(0) < bx.size(0) or cx.size(1) != bx.size(1):
+            raise RuntimeError("Node feature shape mismatch between base and contrastive graphs.")
+        if not torch.equal(cx[:n_base], bx):
+            raise RuntimeError(
+                "Shared node features differ between base and contrastive graphs; id alignment broken."
+            )
+
+    # Existing edges must be preserved (same ids/order as prefix) for every base edge type.
+    for et in base_graph.edge_types:
+        be = base_graph[et].edge_index
+        if be is None:
+            continue
+        if et not in contrastive_graph.edge_types:
+            raise RuntimeError(f"Contrastive graph missing base edge type: {et}")
+        ce = contrastive_graph[et].edge_index
+        if ce is None:
+            raise RuntimeError(f"Contrastive graph edge_index is None for edge type: {et}")
+        if ce.size(1) < be.size(1):
+            raise RuntimeError(f"Contrastive graph has fewer edges for edge type {et}.")
+        if be.numel() > 0 and not torch.equal(ce[:, : be.size(1)], be):
+            raise RuntimeError(
+                f"Base edge ids/order not preserved for edge type {et}; alignment broken."
+            )
 
 def print_encoder_and_cls_totals(
     *,
@@ -503,7 +691,7 @@ def report_cls_nodes_not_in_encoder(
     encoder_graph: HeteroData,
     num_nodes: int,
     topk: int = 25,
-) -> None:
+) -> Dict[str, torch.Tensor]:
     # Unique nodes in classification triples
     train_nodes = torch.unique(torch.cat([train_heads, train_tails], dim=0)).detach().cpu().long()
     test_nodes  = torch.unique(torch.cat([test_heads,  test_tails],  dim=0)).detach().cpu().long()
@@ -545,6 +733,185 @@ def report_cls_nodes_not_in_encoder(
         ex = missing_all[:topk].tolist()
         print(f"Example missing node ids (first {min(topk, len(ex))}): {ex}")
 
+    return {
+        "missing_all": missing_all,
+        "missing_train": missing_tr,
+        "missing_test": missing_te,
+        "train_nodes": train_nodes,
+        "test_nodes": test_nodes,
+        "all_cls_nodes": all_cls_nodes,
+        "enc_nodes": enc_nodes,
+    }
+
+
+def _load_retrieved_node_idx_set(
+    *,
+    retrieved_dir: str,
+    map_out_name: str = "qid2idx_retrieved.tsv",
+) -> Set[int]:
+    map_path = os.path.join(retrieved_dir, map_out_name)
+    if not os.path.exists(map_path):
+        return set()
+    try:
+        df = pd.read_csv(map_path, sep="\t")
+        if "node_idx" not in df.columns:
+            return set()
+        vals = pd.to_numeric(df["node_idx"], errors="coerce").dropna().astype(np.int64).tolist()
+        return set(int(v) for v in vals)
+    except Exception as e:
+        print(f"[WARN] Could not parse retrieved node map at {map_path}: {e}")
+        return set()
+
+
+def write_missing_cls_nodes_with_sources(
+    *,
+    missing_nodes: torch.Tensor,
+    train_nodes: torch.Tensor,
+    test_nodes: torch.Tensor,
+    retrieved_node_ids: Optional[Set[int]],
+    out_path: str,
+) -> None:
+    missing_set = set(int(x) for x in missing_nodes.detach().cpu().long().tolist())
+    train_set = set(int(x) for x in train_nodes.detach().cpu().long().tolist())
+    test_set = set(int(x) for x in test_nodes.detach().cpu().long().tolist())
+    retrieved_set = set(retrieved_node_ids or set())
+
+    rows: List[Dict[str, object]] = []
+    for nid in sorted(missing_set):
+        in_train = int(nid in train_set)
+        in_test = int(nid in test_set)
+        in_retrieved = int(nid in retrieved_set)
+        tags: List[str] = []
+        if in_train:
+            tags.append("train")
+        if in_test:
+            tags.append("test")
+        if in_retrieved:
+            tags.append("retrieved")
+        rows.append(
+            {
+                "node_id": int(nid),
+                "in_train_files": in_train,
+                "in_test_files": in_test,
+                "in_retrieved_files": in_retrieved,
+                "sources": "|".join(tags),
+            }
+        )
+
+    out_df = pd.DataFrame(
+        rows,
+        columns=["node_id", "in_train_files", "in_test_files", "in_retrieved_files", "sources"],
+    )
+    out_df.to_csv(out_path, sep="\t", index=False)
+    print(f"[INFO] Wrote missing classification-node provenance file: {out_path}")
+
+
+def _load_original_subclass_pairs(
+    *,
+    data_dir: str,
+    subclass_rel: str,
+    neg_prefix: str = NEG_PREFIX,
+) -> Set[Tuple[int, int]]:
+    """
+    Keep-list for subclass edges considered "original", restricted to:
+      - train2id_pos.txt
+      - train2id_neg.txt
+      - test2id_pos.txt
+    """
+    keep: Set[Tuple[int, int]] = set()
+    files = ["train2id_pos.txt", "train2id_neg.txt", "test2id_pos.txt"]
+    subclass_aliases = {str(subclass_rel), "subclass_of"}
+    for fname in files:
+        path = os.path.join(data_dir, fname)
+        if not os.path.exists(path):
+            continue
+        try:
+            df = _read_edge_file(path)
+        except Exception as e:
+            print(f"[WARN] Could not read {path} for subclass keep-list: {e}")
+            continue
+        rel_base = df["edge_type"].astype(str).map(lambda r: _strip_not(r, neg_prefix=neg_prefix))
+        m = rel_base.isin(subclass_aliases)
+        if not bool(m.any()):
+            continue
+        src = pd.to_numeric(df.loc[m, "source_node"], errors="coerce").dropna().astype(np.int64).tolist()
+        tgt = pd.to_numeric(df.loc[m, "target_node"], errors="coerce").dropna().astype(np.int64).tolist()
+        for s, t in zip(src, tgt):
+            keep.add((int(s), int(t)))
+    return keep
+
+
+def _filter_rel_edges_by_allowlist(
+    *,
+    graph: HeteroData,
+    rel: str,
+    allowed_pairs: Set[Tuple[int, int]],
+) -> Tuple[int, int]:
+    """
+    In-place filter of edge type ('node', rel, 'node') so only allowed (src, tgt)
+    pairs remain. Returns (before_count, after_count).
+    """
+    key = ("node", str(rel), "node")
+    if key not in graph.edge_types:
+        return 0, 0
+    ei = graph[key].edge_index
+    if ei is None or ei.numel() == 0:
+        return 0, 0
+
+    before = int(ei.size(1))
+    if not allowed_pairs:
+        graph[key].edge_index = torch.empty((2, 0), dtype=torch.long)
+        return before, 0
+
+    src = ei[0].detach().cpu().tolist()
+    tgt = ei[1].detach().cpu().tolist()
+    keep_mask = torch.tensor(
+        [(int(s), int(t)) in allowed_pairs for s, t in zip(src, tgt)],
+        dtype=torch.bool,
+    )
+    graph[key].edge_index = ei[:, keep_mask]
+    after = int(graph[key].edge_index.size(1))
+    return before, after
+
+
+def _append_contrastive_extra_negatives_from_file(
+    *,
+    graph: HeteroData,
+    data_dir: str,
+    file_name: str = "train2id_neg_extras_for_contrastive.txt",
+) -> Dict[str, int]:
+    """
+    Append extra negative triples only to the contrastive graph.
+    File must contain: source_node,target_node,edge_type
+    """
+    path = os.path.join(data_dir, file_name)
+    if not os.path.exists(path):
+        return {"rows": 0, "added": 0}
+
+    df = _read_edge_file(path)
+    if len(df) == 0:
+        return {"rows": 0, "added": 0}
+
+    rows = int(len(df))
+    total_added = 0
+    for rel, g in df.groupby("edge_type"):
+        rel_s = str(rel)
+        src_vals = pd.to_numeric(g["source_node"], errors="coerce").dropna().astype(np.int64).tolist()
+        tgt_vals = pd.to_numeric(g["target_node"], errors="coerce").dropna().astype(np.int64).tolist()
+        if not src_vals or not tgt_vals:
+            continue
+        pairs = list(zip(src_vals, tgt_vals))
+        existing = _edge_set_from_graph(graph, rel_s)
+        new_pairs = [(int(s), int(t)) for s, t in pairs if (int(s), int(t)) not in existing]
+        if not new_pairs:
+            continue
+        src = torch.tensor([s for s, _ in new_pairs], dtype=torch.long)
+        tgt = torch.tensor([t for _, t in new_pairs], dtype=torch.long)
+        _append_edges(graph, rel_s, src, tgt)
+        total_added += int(len(new_pairs))
+
+    return {"rows": rows, "added": int(total_added)}
+
 
 # ============================================================
 # Deterministic helpers + split cache
@@ -576,13 +943,9 @@ def _make_split_cache_path(
     os.makedirs(cache_dir, exist_ok=True)
     fname = (
         f"splits_{_sanitize_component(task)}"
-        f"_testr{float(test_ratio):.3f}"
-        f"_seed{int(seed)}"
+        "_origfiles"
         f"_sub{_sanitize_component(subclass_rel)}"
         f"_inst{_sanitize_component(instance_rel)}"
-        f"_minpos{int(min_pos_per_rel)}"
-        f"_minneg{int(min_neg_per_rel)}"
-        f"_keep{float(cls_keep_frac):.3f}"
         ".pt"
     )
     return os.path.join(cache_dir, fname)
@@ -600,8 +963,14 @@ def _build_split_cache_meta(
 ) -> Dict[str, object]:
     train_pos_path = os.path.join(data_dir, "train2id_pos.txt")
     train_neg_path = os.path.join(data_dir, "train2id_neg.txt")
+    test_pos_path = os.path.join(data_dir, "test2id_pos.txt")
+    test_neg_path = os.path.join(data_dir, "test2id_neg.txt")
+
+    def _maybe_fingerprint(path: str) -> Optional[Dict[str, object]]:
+        return _file_fingerprint(path) if os.path.exists(path) else None
+
     return {
-        "version": 5,  # bumped because classification size reduction added
+        "version": 6,  # bumped: preserve original split files for classification
         "task": str(task),
         "test_ratio": float(test_ratio),
         "seed": int(seed),
@@ -611,8 +980,10 @@ def _build_split_cache_meta(
         "min_neg_per_rel": int(min_neg_per_rel),
         "cls_keep_frac": float(cls_keep_frac),
         "files": {
-            "train2id_pos": _file_fingerprint(train_pos_path),
-            "train2id_neg": _file_fingerprint(train_neg_path),
+            "train2id_pos": _maybe_fingerprint(train_pos_path),
+            "train2id_neg": _maybe_fingerprint(train_neg_path),
+            "test2id_pos": _maybe_fingerprint(test_pos_path),
+            "test2id_neg": _maybe_fingerprint(test_neg_path),
         },
     }
 
@@ -623,7 +994,7 @@ def _meta_matches(cached: Dict[str, object], current: Dict[str, object]) -> bool
             return False
     cfiles = cached.get("files", {})
     nfiles = current.get("files", {})
-    for name in ["train2id_pos", "train2id_neg"]:
+    for name in ["train2id_pos", "train2id_neg", "test2id_pos", "test2id_neg"]:
         if cfiles.get(name) != nfiles.get(name):
             return False
     return True
@@ -860,6 +1231,7 @@ def _augment_with_retrieved(
 
     neg_edges_qid: List[Tuple[str, str, str]] = []
     neg_pred_counts: Dict[str, int] = defaultdict(int)
+    neg_pred_skipped_non_p31 = 0
     if neg_path.exists():
         df_neg = pd.read_csv(
             neg_path,
@@ -879,6 +1251,11 @@ def _augment_with_retrieved(
             t = _extract_qid(row.get("object_qid", ""))
             pred = str(row.get("predicate_id", "") or "").strip()
             if not s or not t or not pred:
+                continue
+            # Retrieved negatives are restricted to NOT_P31 / NOT_<instance_rel> only.
+            base_rel = rel_map.get(pred, pred)
+            if not (str(pred) == "P31" or str(base_rel) == str(instance_rel)):
+                neg_pred_skipped_non_p31 += 1
                 continue
             neg_edges_qid.append((s, pred, t))
             neg_pred_counts[pred] += 1
@@ -1046,6 +1423,7 @@ def _augment_with_retrieved(
         "sub_edges_added": len(sub_pairs),
         "neg_edges_added": sum(neg_pairs_added.values()),
         "neg_pred_missing": missing_pred,
+        "neg_skipped_non_p31": int(neg_pred_skipped_non_p31),
     }
 
     top_preds = sorted(neg_pred_counts.items(), key=lambda x: x[1], reverse=True)[:10]
@@ -1053,6 +1431,8 @@ def _augment_with_retrieved(
         print("[INFO] Retrieved negative predicates (top 10):")
         for p, c in top_preds:
             print(f"  {p}: {c}")
+    if neg_pred_skipped_non_p31 > 0:
+        print(f"[INFO] Retrieved negatives skipped (not P31/instance_rel): {neg_pred_skipped_non_p31}")
 
     return struct_graph, base_x, num_nodes, stats
 
@@ -1430,90 +1810,76 @@ def build_classification_splits_from_train_files(
     cls_keep_frac: float = 1.0,
 ) -> Dict[str, object]:
     """
-    - Uses ONLY train2id_pos + train2id_neg.
-    - Excludes subclass_of / instance_of from classification.
-    - Balances per relation (1:1) by downsampling.
-    - Splits 80/20 per relation AND per label -> keeps balance per relation.
-    - Returns balance_stats so we can later add LEFTOVERS into encoder graph.
-    """
-    cls_keep_frac = float(cls_keep_frac)
-    if cls_keep_frac <= 0.0 or cls_keep_frac > 1.0:
-        print(f"[WARN] cls_keep_frac={cls_keep_frac} is out of (0,1]; clamping to 1.0")
-        cls_keep_frac = 1.0
+    Build classification tensors preserving the ORIGINAL file split:
+      - TRAIN from train2id_pos + train2id_neg
+      - TEST  from test2id_pos (+ optional test2id_neg if present)
+    Ontology relations are excluded from classification:
+      - subclass_of
+      - instance_of
+      - config instance_rel
 
+    NOTE:
+      min_pos_per_rel / min_neg_per_rel / cls_keep_frac are ignored here
+      because preserving original split means no balancing/downsampling.
+    """
     train_pos_path = os.path.join(data_dir, "train2id_pos.txt")
     train_neg_path = os.path.join(data_dir, "train2id_neg.txt")
+    test_pos_path = os.path.join(data_dir, "test2id_pos.txt")
+    test_neg_path = os.path.join(data_dir, "test2id_neg.txt")
 
-    df_pos_all = _read_edge_file(train_pos_path)
-    df_neg_all = _read_edge_file(train_neg_path)
+    df_train_pos = _read_edge_file(train_pos_path)
+    df_train_neg = _read_edge_file(train_neg_path)
+    df_test_pos = _read_edge_file(test_pos_path)
+    df_test_neg = (
+        _read_edge_file(test_neg_path)
+        if os.path.exists(test_neg_path)
+        else pd.DataFrame(columns=["source_node", "target_node", "edge_type"])
+    )
 
-    df_pos_all["rel_base"] = df_pos_all["edge_type"].astype(str)
-    df_pos_all["label"] = 1.0
+    df_train_pos["rel_base"] = df_train_pos["edge_type"].astype(str)
+    df_train_pos["label"] = 1.0
 
-    df_neg_all["rel_base"] = df_neg_all["edge_type"].astype(str).map(_strip_not)
-    df_neg_all["label"] = 0.0
+    df_train_neg["rel_base"] = df_train_neg["edge_type"].astype(str).map(_strip_not)
+    df_train_neg["label"] = 0.0
+
+    df_test_pos["rel_base"] = df_test_pos["edge_type"].astype(str)
+    df_test_pos["label"] = 1.0
+
+    df_test_neg["rel_base"] = df_test_neg["edge_type"].astype(str).map(_strip_not)
+    df_test_neg["label"] = 0.0
 
     excluded = {str(subclass_rel), str(instance_rel), "subclass_of", "instance_of"}
 
-    df_pos_cls = df_pos_all[~df_pos_all["rel_base"].isin(excluded)].copy()
-    df_neg_cls = df_neg_all[~df_neg_all["rel_base"].isin(excluded)].copy()
+    for frame in [df_train_pos, df_train_neg, df_test_pos, df_test_neg]:
+        if len(frame) > 0:
+            frame.drop(frame[frame["rel_base"].isin(excluded)].index, inplace=True)
 
-    if (min_pos_per_rel and int(min_pos_per_rel) > 0) or (min_neg_per_rel and int(min_neg_per_rel) > 0):
-        pos_counts = df_pos_cls["rel_base"].value_counts().to_dict()
-        neg_counts = df_neg_cls["rel_base"].value_counts().to_dict()
-        keep_rels = {
-            r for r, c in pos_counts.items()
-            if int(c) >= int(min_pos_per_rel)
-            and int(neg_counts.get(r, 0)) >= int(min_neg_per_rel)
-        }
-        before = len(df_pos_cls)
-        df_pos_cls = df_pos_cls[df_pos_cls["rel_base"].isin(keep_rels)].copy()
-        df_neg_cls = df_neg_cls[df_neg_cls["rel_base"].isin(keep_rels)].copy()
-        print(
-            f"\n[INFO] min_pos_per_rel={min_pos_per_rel}, min_neg_per_rel={min_neg_per_rel}: "
-            f"kept {len(keep_rels)} relations. pos rows: {before} -> {len(df_pos_cls)}"
-        )
+    if int(min_pos_per_rel) > 0 or int(min_neg_per_rel) > 0 or float(cls_keep_frac) < 1.0:
+        print("[INFO] Preserving original split: min_pos_per_rel/min_neg_per_rel/cls_keep_frac are ignored.")
 
-    df_balanced, balance_stats = _balanced_downsample_per_relation(
-        df_pos_cls,
-        df_neg_cls,
-        seed=int(seed),
-        min_pos_per_rel=int(min_pos_per_rel) if min_pos_per_rel else 0,
-        min_neg_per_rel=int(min_neg_per_rel) if min_neg_per_rel else 0,
-        cls_keep_frac=float(cls_keep_frac),
-    )
-    if len(df_balanced) == 0:
-        raise RuntimeError("After filtering/balancing, classification dataset is empty.")
+    df_train = pd.concat([df_train_pos, df_train_neg], ignore_index=True)
+    df_test = pd.concat([df_test_pos, df_test_neg], ignore_index=True)
+    if len(df_train) == 0:
+        raise RuntimeError("Classification TRAIN set is empty after ontology filtering.")
 
-    rels = sorted(df_balanced["rel_base"].unique().tolist())
+    rels = sorted(set(df_train["rel_base"].unique().tolist()) | set(df_test["rel_base"].unique().tolist()))
+    if not rels:
+        raise RuntimeError("No classification relations available after ontology filtering.")
+
+    df_train = df_train[df_train["rel_base"].isin(rels)].copy().reset_index(drop=True)
+    df_test = df_test[df_test["rel_base"].isin(rels)].copy().reset_index(drop=True)
     rel2id = {r: i for i, r in enumerate(rels)}
     id2rel = {i: r for r, i in rel2id.items()}
-
-    train_idx, test_idx, split_counts = _per_relation_label_split_indices(
-        df_balanced, test_ratio=float(test_ratio), seed=int(seed)
-    )
-
-    df_train = df_balanced.loc[train_idx].copy().reset_index(drop=True)
-    df_test = df_balanced.loc[test_idx].copy().reset_index(drop=True)
 
     tr_h, tr_r, tr_t, tr_y = _df_to_tensors(df_train, rel2id)
     te_h, te_r, te_t, te_y = _df_to_tensors(df_test, rel2id)
 
-    print("\n=== Classification dataset (from TRAIN files only) ===")
+    print("\n=== Classification dataset (preserved original file split) ===")
     print(f"Excluded from classification (encoder-only): {sorted(list(excluded))}")
     print(f"Relations in classification: {len(rel2id)}")
-    print(f"cls_keep_frac: {cls_keep_frac:.3f}")
-    print(f"Balanced dataset total examples: {len(df_balanced)} "
-          f"(pos={int((df_balanced['label']>0.5).sum())}, neg={int((df_balanced['label']<=0.5).sum())})")
+    print("Train source files: train2id_pos.txt + train2id_neg.txt")
+    print(f"Test source files:  test2id_pos.txt{' + test2id_neg.txt' if os.path.exists(test_neg_path) else ''}")
     print(f"Train examples: {len(df_train)} | Test examples: {len(df_test)}")
-
-    show = 20
-    print(f"\n[Split sanity] Showing first {show} relations with (train_pos, test_pos, train_neg, test_neg):")
-    for r in rels[:show]:
-        c = split_counts.get(r, {})
-        tp = c.get(1, (0, 0))
-        tn = c.get(0, (0, 0))
-        print(f"  rel={r:>20}  pos(tr={tp[0]:>5}, te={tp[1]:>5})  neg(tr={tn[0]:>5}, te={tn[1]:>5})")
 
     return {
         "train_heads": tr_h,
@@ -1527,7 +1893,7 @@ def build_classification_splits_from_train_files(
         "rel2id": rel2id,
         "id2rel": id2rel,
         "rel_list": rels,
-        "balance_stats": balance_stats,  # <-- used to compute leftovers for encoder
+        "balance_stats": {},
     }
 
 
@@ -1611,7 +1977,8 @@ def build_classification_splits_from_train_files(
 def compute_leftover_examples_for_encoder(data_dir: str, *,
     rel_list: List[str], balance_stats: Dict[str, Tuple[int, int, int]],
     seed: int, subclass_rel: str, instance_rel: str,
-    min_pos_per_rel: int = 0) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    min_pos_per_rel: int = 0,
+    keep_all_used_relations: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     train_pos_path = os.path.join(data_dir, "train2id_pos.txt")
     train_neg_path = os.path.join(data_dir, "train2id_neg.txt")
@@ -1625,7 +1992,7 @@ def compute_leftover_examples_for_encoder(data_dir: str, *,
     df_pos_cls = df_pos_all[~df_pos_all["rel_base"].isin(encoder_only_bases)].copy()
     df_neg_cls = df_neg_all[~df_neg_all["rel_base"].isin(encoder_only_bases)].copy()
 
-    used_rels = set(balance_stats.keys())
+    used_rels = set(rel_list) if keep_all_used_relations else set(balance_stats.keys())
     all_rels = sorted(set(df_pos_cls["rel_base"].unique().tolist()) |
         set(df_neg_cls["rel_base"].unique().tolist()))
 
@@ -1637,6 +2004,8 @@ def compute_leftover_examples_for_encoder(data_dir: str, *,
         pos_rows = df_pos_cls[df_pos_cls["rel_base"] == r]
         neg_rows = df_neg_cls[df_neg_cls["rel_base"] == r]
         if r in used_rels:
+            if keep_all_used_relations:
+                continue
             npos = int(len(pos_rows))
             nneg = int(len(neg_rows))
             m = int(balance_stats[r][2])
@@ -1805,8 +2174,8 @@ def main():
         choices=["hgcn", "ra_hgcn", "ra_rgcn", "ra_hgat", "sra_hgcn", "gcn", "gae", "gat", "sgnn", "sgat", "nbfnet"],
         default="hgcn",
     )
-    parser.add_argument("--epochs", type=int, default=250)
-    parser.add_argument("--batch_size", type=int, default=3024 * 2)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch_size", type=int, default=532)
     parser.add_argument("--path", type=str, default="wikidata_data")
     parser.add_argument("--output_dir", type=str, default="output/")
     parser.add_argument("--num_neg_test", type=int, default=1)
@@ -1837,7 +2206,27 @@ def main():
     parser.add_argument("--cls_keep_frac", type=float, default=1.0,
                         help="Keep fraction of balanced classification triples per relation (<=1.0).")
 
-    parser.add_argument("--cv_val_ratio", type=float, default=0.15)
+    parser.add_argument("--cv_val_ratio", type=float, default=0.0005)
+    parser.add_argument("--val_lp_eval_every", type=int, default=1,
+                        help="Compute expensive validation LP metrics every N epochs (>=1).")
+    parser.add_argument(
+        "--max_contrastive_anchors",
+        type=int,
+        default=0,
+        help="Optional cap (>0) on number of contrastive anchors sampled per batch (0 disables cap).",
+    )
+    parser.add_argument(
+        "--cv_contrastive_weight_grid",
+        type=str,
+        default="",
+        help="Optional comma-separated contrastive weights to sweep in CV (only when contrastive is enabled).",
+    )
+    parser.add_argument(
+        "--cv_contrastive_temp_grid",
+        type=str,
+        default="",
+        help="Optional comma-separated contrastive temperatures to sweep in CV (only when contrastive is enabled).",
+    )
     parser.add_argument("--split_cache_path", type=str, default=None)
     parser.add_argument("--force_resplit", action="store_true")
 
@@ -1870,9 +2259,57 @@ def main():
 
     k_folds = int(cfg.get("k_folds", 10))
     contrastive_weight = float(cfg.get("contrastive_weight", 0.1))
+    contrastive_temperature = float(cfg.get("contrastive_temperature", 0.5))
     subclass_rel = str(cfg.get("subclass_rel", "subclass_of"))
     instance_rel = str(cfg.get("instance_rel", "instance_of"))
     contrastive_k = int(cfg.get("contrastive_k", 1))
+
+    def _parse_float_grid_arg(spec: str, default_value: float, name: str) -> List[float]:
+        txt = str(spec or "").strip()
+        if not txt:
+            return [float(default_value)]
+        vals: List[float] = []
+        for piece in txt.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                vals.append(float(piece))
+            except Exception:
+                raise ValueError(f"Invalid float '{piece}' in --{name}")
+        if not vals:
+            return [float(default_value)]
+        # Stable unique, preserve input order.
+        seen = set()
+        out: List[float] = []
+        for v in vals:
+            key = float(v)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+    if args.no_contrastive:
+        cv_contrastive_weights = [float(contrastive_weight)]
+        cv_contrastive_temps = [float(contrastive_temperature)]
+    else:
+        cv_contrastive_weights = _parse_float_grid_arg(
+            args.cv_contrastive_weight_grid, contrastive_weight, "cv_contrastive_weight_grid"
+        )
+        cv_contrastive_temps = _parse_float_grid_arg(
+            args.cv_contrastive_temp_grid, contrastive_temperature, "cv_contrastive_temp_grid"
+        )
+    cv_contrastive_combos: List[Tuple[float, float]] = [
+        (float(w), float(t)) for w in cv_contrastive_weights for t in cv_contrastive_temps
+    ]
+    selected_contrastive_weight = float(contrastive_weight)
+    selected_contrastive_temperature = float(contrastive_temperature)
+    if not args.no_contrastive:
+        print(f"Contrastive weight grid (CV): {cv_contrastive_weights}")
+        print(f"Contrastive temperature grid (CV): {cv_contrastive_temps}")
+        if int(args.max_contrastive_anchors) > 0:
+            print(f"Contrastive anchors cap per batch: {int(args.max_contrastive_anchors)}")
 
     dl = DataLoader(
         args.path + "/",
@@ -1984,18 +2421,79 @@ def main():
         id2rel=id2rel,
         topk=200,
     )
+    # Global leakage audit: exact overlap between TRAIN and TEST classification examples.
+    tr_key = torch.stack(
+        [
+            cls_heads.detach().cpu().long(),
+            cls_rels.detach().cpu().long(),
+            cls_tails.detach().cpu().long(),
+            (cls_labels.detach().cpu() > 0.5).long(),
+        ],
+        dim=1,
+    )
+    te_key = torch.stack(
+        [
+            test_heads_all.detach().cpu().long(),
+            test_rels_all.detach().cpu().long(),
+            test_tails_all.detach().cpu().long(),
+            (test_labels_all.detach().cpu() > 0.5).long(),
+        ],
+        dim=1,
+    )
+    tr_set = set(map(tuple, tr_key.tolist()))
+    te_set = set(map(tuple, te_key.tolist()))
+    tr_te_overlap = len(tr_set & te_set)
+    print(
+        f"[LeakAudit] Exact TRAIN/TEST overlap on (h,r,t,label): {tr_te_overlap} "
+        f"(train_unique={len(tr_set)}, test_unique={len(te_set)})"
+    )
 
     print("\n=== Final classification dataset sizes ===")
     print(f"#TRAIN classification examples: {cls_heads.numel()}")
     print(f"#TEST  classification examples: {test_heads_all.numel()}")
     print(f"#Classification relations:      {len(rel2id)}")
 
+    run_out_dir = os.path.join("output", args.output_dir)
+    os.makedirs(run_out_dir, exist_ok=True)
+    split_payload = {
+        "train_heads": cls_heads.detach().cpu().long(),
+        "train_rels": cls_rels.detach().cpu().long(),
+        "train_tails": cls_tails.detach().cpu().long(),
+        "train_labels": cls_labels.detach().cpu().float(),
+        "test_heads": test_heads_all.detach().cpu().long(),
+        "test_rels": test_rels_all.detach().cpu().long(),
+        "test_tails": test_tails_all.detach().cpu().long(),
+        "test_labels": test_labels_all.detach().cpu().float(),
+        "rel2id": rel2id,
+        "id2rel": id2rel,
+        "rel_list": rel_list,
+        "balance_stats": balance_stats,
+    }
+    torch.save(split_payload, os.path.join(run_out_dir, "lp_labels_and_splits.pt"))
+    split_rows = []
+    for split_name, h_t, r_t, t_t, y_t in [
+        ("train", cls_heads, cls_rels, cls_tails, cls_labels),
+        ("test", test_heads_all, test_rels_all, test_tails_all, test_labels_all),
+    ]:
+        for h_i, r_i, t_i, y_i in zip(h_t.tolist(), r_t.tolist(), t_t.tolist(), y_t.tolist()):
+            r_i = int(r_i)
+            split_rows.append({
+                "split": split_name,
+                "head": int(h_i),
+                "rel_id": r_i,
+                "rel_name": id2rel.get(r_i, str(r_i)),
+                "tail": int(t_i),
+                "label": float(y_i),
+            })
+    pd.DataFrame(split_rows).to_csv(
+        os.path.join(run_out_dir, "lp_labels_and_splits.tsv"), sep="\t", index=False)
+
     # -----------------------------------------------------------------
     # Build encoder graph:
-    #   - include ALL graph relations from data_dict
+    #   - include structural relations from data_dict
     #   - add ONLY:
     #       (a) file negatives for subclass_of / instance_of (NOT_ prefixed)
-    #       (b) leftovers from balancing for classification relations (pos->rel, neg->NOT_rel)
+    #       (b) leftover non-classification relations from train files (if any)
     # -----------------------------------------------------------------
     struct_graph = HeteroData()
     struct_graph["node"].num_nodes = int(num_nodes)
@@ -2014,10 +2512,21 @@ def main():
         src, tgt = data_dict[etype]
         _append_edges(struct_graph, str(etype), src, tgt)
 
+    original_subclass_pairs = _load_original_subclass_pairs(
+        data_dir=args.path,
+        subclass_rel=subclass_rel,
+        neg_prefix=NEG_PREFIX,
+    )
+    print(
+        f"[INFO] Original-file subclass keep-list size "
+        f"(train2id_pos/train2id_neg/test2id_pos): {len(original_subclass_pairs)}"
+    )
+
     # Compute leftovers + encoder-only subclass/instance negatives from file
     leftover_pos_df, leftover_neg_df, enc_only_neg_df = compute_leftover_examples_for_encoder(
         args.path, rel_list=rel_list, balance_stats=balance_stats, seed=int(args.balanced_seed),
-        subclass_rel=subclass_rel, instance_rel=instance_rel, min_pos_per_rel=int(args.min_pos_per_rel))
+        subclass_rel=subclass_rel, instance_rel=instance_rel, min_pos_per_rel=int(args.min_pos_per_rel),
+        keep_all_used_relations=True)
 
     # (a) Add ONLY subclass/instance negatives from file
     if len(enc_only_neg_df) > 0:
@@ -2049,13 +2558,24 @@ def main():
 
     # (c) TRAIN classification triples will be added per-CV-fold (and for final training)
     #     so that each fold only sees its own train triples in the encoder graph.
-
-    if args.use_retrieved:
-        before_stats = _graph_stats(struct_graph, subclass_rel=subclass_rel, instance_rel=instance_rel, neg_prefix=NEG_PREFIX)
-        struct_graph, base_x, num_nodes, aug_stats = _augment_with_retrieved(
-            struct_graph=struct_graph,
-            base_x=base_x,
-            num_nodes=num_nodes,
+    #
+    # Contrastive graph starts as the FULL structural graph (includes non-original
+    # subclass edges). Encoder graph is filtered later to keep only original-file
+    # subclass edges for message passing.
+    contrastive_struct_graph = struct_graph.clone()
+    if args.use_retrieved and not args.no_contrastive:
+        contrastive_base_x = contrastive_struct_graph["node"].x.clone()
+        contrastive_num_nodes = int(contrastive_struct_graph["node"].num_nodes)
+        before_stats = _graph_stats(
+            contrastive_struct_graph,
+            subclass_rel=subclass_rel,
+            instance_rel=instance_rel,
+            neg_prefix=NEG_PREFIX,
+        )
+        contrastive_struct_graph, contrastive_base_x, contrastive_num_nodes, aug_stats = _augment_with_retrieved(
+            struct_graph=contrastive_struct_graph,
+            base_x=contrastive_base_x,
+            num_nodes=contrastive_num_nodes,
             data_dir=args.path,
             retrieved_dir=args.retrieved_dir,
             subclass_rel=subclass_rel,
@@ -2063,9 +2583,18 @@ def main():
             neg_prefix=NEG_PREFIX,
             map_out_name=args.retrieved_map_out,
         )
-        after_stats = _graph_stats(struct_graph, subclass_rel=subclass_rel, instance_rel=instance_rel, neg_prefix=NEG_PREFIX)
+        _assert_shared_id_alignment(
+            base_graph=struct_graph,
+            contrastive_graph=contrastive_struct_graph,
+        )
+        after_stats = _graph_stats(
+            contrastive_struct_graph,
+            subclass_rel=subclass_rel,
+            instance_rel=instance_rel,
+            neg_prefix=NEG_PREFIX,
+        )
 
-        print("\n=== Retrieved augmentation summary ===")
+        print("\n=== Retrieved augmentation summary (contrastive-only graph) ===")
         print(f"New nodes added:             {aug_stats.get('new_nodes', 0)}")
         print(f"New class nodes added:       {aug_stats.get('new_class_nodes', 0)}")
         print(f"Instance_of edges added:     {aug_stats.get('inst_edges_added', 0)}")
@@ -2073,13 +2602,30 @@ def main():
         print(f"Negative edges added:        {aug_stats.get('neg_edges_added', 0)}")
         if aug_stats.get("neg_pred_missing", 0) > 0:
             print(f"Negative predicates missing in relation2id: {aug_stats.get('neg_pred_missing', 0)}")
+        if aug_stats.get("neg_skipped_non_p31", 0) > 0:
+            print(f"Negative predicates skipped (not P31/instance_rel): {aug_stats.get('neg_skipped_non_p31', 0)}")
 
-        print("\n=== Encoder graph size (before vs after) ===")
+        print("\n=== Contrastive graph size (before vs after retrieved) ===")
         print(f"Nodes:       {before_stats['num_nodes']} -> {after_stats['num_nodes']}")
         print(f"Edges total: {before_stats['total_edges']} -> {after_stats['total_edges']}")
         print(f"Instance_of: {before_stats['instance_edges']} -> {after_stats['instance_edges']}")
         print(f"Subclass_of: {before_stats['subclass_edges']} -> {after_stats['subclass_edges']}")
         print(f"Neg edges:   {before_stats['neg_edges']} -> {after_stats['neg_edges']}")
+        print("[INFO] Retrieved contrastive graph alignment check passed (shared node ids preserved).")
+    elif args.use_retrieved and args.no_contrastive:
+        print("\n[INFO] --use_retrieved requested but --no_contrastive is active; retrieved data will not be used.")
+
+    if not args.no_contrastive:
+        extra_stats = _append_contrastive_extra_negatives_from_file(
+            graph=contrastive_struct_graph,
+            data_dir=args.path,
+            file_name="train2id_neg_extras_for_contrastive.txt",
+        )
+        print(
+            "[INFO] Contrastive-only extra negatives file "
+            f"train2id_neg_extras_for_contrastive.txt: rows={extra_stats.get('rows', 0)} "
+            f"added_edges={extra_stats.get('added', 0)}"
+        )
 
 
     # # (a) Add ONLY subclass/instance negatives from file
@@ -2133,14 +2679,42 @@ def main():
     else:
         ei = encoder_graph[CLS_EDGE_TYPE].edge_index
         if ei is None: encoder_graph[CLS_EDGE_TYPE].edge_index = torch.empty((2, 0), dtype=torch.long)
-    MP_EDGE_TYPES = [
-        et for et in encoder_graph.edge_types
-        if et != CLS_EDGE_TYPE
-        and not str(et[1]).endswith(CLS_EDGE_SUFFIX)
-    ]
-    if args.no_contrastive:
-        MP_EDGE_TYPES = [et for et in MP_EDGE_TYPES if str(et[1]) != str(subclass_rel)]
+    b, a = _filter_rel_edges_by_allowlist(
+        graph=encoder_graph,
+        rel=str(subclass_rel),
+        allowed_pairs=original_subclass_pairs,
+    )
+    removed = int(b - a)
+    print(
+        f"[INFO] Encoder subclass filtering: kept {a}/{b} '{subclass_rel}' edges "
+        f"from original files; removed {removed} non-original subclass edges "
+        f"(e.g., subclass2id/retrieved provenance)."
+    )
+
+    drop_subclass_mp_when_no_contrastive = bool(args.no_contrastive and len(original_subclass_pairs) == 0)
+    MP_EDGE_TYPES = _message_passing_edge_types(
+        encoder_graph,
+        subclass_rel=str(subclass_rel),
+        drop_subclass=drop_subclass_mp_when_no_contrastive,
+        cls_edge_suffix=CLS_EDGE_SUFFIX,
+    )
+    if drop_subclass_mp_when_no_contrastive:
+        print(f"[INFO] --no_contrastive: removed '{subclass_rel}' from message passing (no original-file subclass edges).")
     encoder_e_etypes = MP_EDGE_TYPES
+
+    # Contrastive-only graph (sampler input). Encoder graph above remains retrieval-free.
+    if args.model == "hgcn":
+        contrastive_encoder_graph = build_hgcn_encoder_graph(
+            contrastive_struct_graph, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX
+        )
+    else:
+        contrastive_encoder_graph = contrastive_struct_graph
+    if CLS_EDGE_TYPE not in contrastive_encoder_graph.edge_types:
+        contrastive_encoder_graph[CLS_EDGE_TYPE].edge_index = torch.empty((2, 0), dtype=torch.long)
+    else:
+        cei = contrastive_encoder_graph[CLS_EDGE_TYPE].edge_index
+        if cei is None:
+            contrastive_encoder_graph[CLS_EDGE_TYPE].edge_index = torch.empty((2, 0), dtype=torch.long)
 
     print_encoder_and_cls_totals(
         encoder_graph=encoder_graph,
@@ -2169,7 +2743,7 @@ def main():
         topk=25,
     )
 
-    report_cls_nodes_not_in_encoder(
+    cls_cov = report_cls_nodes_not_in_encoder(
         train_heads=cls_heads,
         train_tails=cls_tails,
         test_heads=test_heads_all,
@@ -2177,6 +2751,19 @@ def main():
         encoder_graph=encoder_graph,
         num_nodes=num_nodes,
         topk=25)
+    retrieved_nodes_for_report: Set[int] = set()
+    if args.use_retrieved:
+        retrieved_nodes_for_report = _load_retrieved_node_idx_set(
+            retrieved_dir=args.retrieved_dir,
+            map_out_name=args.retrieved_map_out,
+        )
+    write_missing_cls_nodes_with_sources(
+        missing_nodes=cls_cov["missing_all"],
+        train_nodes=cls_cov["train_nodes"],
+        test_nodes=cls_cov["test_nodes"],
+        retrieved_node_ids=retrieved_nodes_for_report,
+        out_path=os.path.join(run_out_dir, "missing_cls_nodes_with_sources.tsv"),
+    )
 
 
     neighbor_sizes = [10, 7]
@@ -2185,10 +2772,11 @@ def main():
     # cv_metrics: List[torch.Tensor] = []
     sampler_stats_printed = False
 
-    lr_to_fold_losses = defaultdict(list)
-    lr_to_fold_epochs = defaultdict(list)
-    lr_to_fold_metrics = defaultdict(list)
     cv_metrics: List[torch.Tensor] = []
+    cv_fold_splits = []
+    cv_summary_rows = []
+    cv_combo_summary_rows = []
+    cv_combo_lr_summary_rows = []
 
     final_model = None
     final_contrastive_sampler = None
@@ -2205,15 +2793,29 @@ def main():
         model_path = os.path.join("output/" + args.output_dir, f"final_model_{args.model}.pt")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file for testing not found: {model_path}")
+        test_encoder_graph_for_mp = _with_cls_edges(encoder_graph, cls_heads, cls_tails)
+        _add_cls_edges_for_sampler(
+            test_encoder_graph_for_mp,
+            heads=cls_heads,
+            tails=cls_tails,
+            rels=cls_rels,
+            labels=cls_labels,
+            id2rel=id2rel,
+        )
 
         final_base_kwargs = dict(
             in_dim=in_dim,
             hidden_dim=mcfg["hidden_dim"],
             out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
-            e_etypes=encoder_e_etypes,
+            e_etypes=_message_passing_edge_types(
+                test_encoder_graph_for_mp,
+                subclass_rel=str(subclass_rel),
+                drop_subclass=drop_subclass_mp_when_no_contrastive,
+                cls_edge_suffix=CLS_EDGE_SUFFIX,
+            ),
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
         )
-        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat", "nbfnet"):
+        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat", "sgat", "nbfnet"):
             final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
         else:
             final_model = ModelCls(**final_base_kwargs).to(device)
@@ -2226,7 +2828,7 @@ def main():
 
     else:
         val_ratio = float(args.cv_val_ratio)
-        val_ratio = max(0.01, min(0.49, val_ratio))
+        val_ratio = max(0.0005, min(0.49, val_ratio))
 
         y = make_rel_label_strat_y(cls_rels, cls_labels)
 
@@ -2243,208 +2845,382 @@ def main():
             main_idx = np.arange(len(y), dtype=np.int64)
 
         splitter = StratifiedShuffleSplit(n_splits=int(k_folds), test_size=val_ratio, random_state=42)
-        split_iter = splitter.split(np.zeros(len(main_idx), dtype=np.int64), y[main_idx]) if len(main_idx) else []
+        split_indices = list(splitter.split(np.zeros(len(main_idx), dtype=np.int64), y[main_idx])) if len(main_idx) else []
+        combo_best_key = None
+        selected_lr_summary_rows: List[Dict[str, object]] = []
 
-        for fold, (tr_sub, va_sub) in enumerate(split_iter, start=1):
-            train_idx_np = main_idx[tr_sub]
-            val_idx_np = main_idx[va_sub]
-            if rare_idx.size:
-                train_idx_np = np.concatenate([train_idx_np, rare_idx], axis=0)
-
-            train_idx = torch.tensor(train_idx_np, dtype=torch.long)
-            val_idx = torch.tensor(val_idx_np, dtype=torch.long)
-
-            # train_nodes = torch.unique(torch.cat([cls_heads[train_idx], cls_tails[train_idx]], dim=0))
-            # val_nodes = torch.unique(torch.cat([cls_heads[val_idx], cls_tails[val_idx]], dim=0))
-            # num_neighbors = [20, 10]
-            # train_loader = NeighborLoader(
-            #     encoder_graph,
-            #     input_nodes=("node", train_nodes),
-            #     num_neighbors=num_neighbors,
-            #     batch_size=args.batch_size,
-            #     shuffle=True,
-            #     num_workers=2,
-            #     persistent_workers=True,
-            #     pin_memory=(device.type == "cuda"),
-            # )
-            # val_loader = NeighborLoader(
-            #     encoder_graph,
-            #     input_nodes=("node", val_nodes),
-            #     num_neighbors=num_neighbors,
-            #     batch_size=args.batch_size,
-            #     shuffle=False,
-            #     num_workers=2,
-            #     persistent_workers=True,
-            #     pin_memory=(device.type == "cuda"),
-            # )
-
-            train_edge_label_index = torch.stack([cls_heads[train_idx], cls_tails[train_idx]], dim=0)
-            train_edge_label = cls_labels[train_idx].to(torch.float)
-            val_edge_label_index = torch.stack([cls_heads[val_idx], cls_tails[val_idx]], dim=0)
-            val_edge_label = cls_labels[val_idx].to(torch.float)
-
-            fold_encoder_graph = _with_cls_edges(
-                encoder_graph,
-                cls_heads[train_idx],
-                cls_tails[train_idx],
+        for combo_idx, (combo_weight, combo_temp) in enumerate(cv_contrastive_combos, start=1):
+            combo_weight = float(combo_weight)
+            combo_temp = float(combo_temp)
+            combo_tag = _sanitize_component(f"cw{combo_weight:.6g}_ct{combo_temp:.6g}")
+            print(
+                f"\n=== CV Contrastive Combo {combo_idx}/{len(cv_contrastive_combos)} "
+                f"(weight={combo_weight:.6g}, temp={combo_temp:.6g}) ==="
             )
-            n_cls_pos_fold, n_cls_neg_fold = _add_cls_edges_for_sampler(
-                fold_encoder_graph,
-                heads=cls_heads[train_idx],
-                tails=cls_tails[train_idx],
-                rels=cls_rels[train_idx],
-                labels=cls_labels[train_idx],
-                id2rel=id2rel,
-            )
-            if fold == 1:
-                print(f"\n[INFO] Fold {fold} encoder got TRAIN cls edges (sampler-only): "
-                      f"pos={n_cls_pos_fold} neg={n_cls_neg_fold}")
 
-            # num_neighbors = {et: [20, 10] for et in encoder_graph.edge_types}
-            num_neighbors = {et: [12, 8] for et in MP_EDGE_TYPES}
-            num_neighbors[CLS_EDGE_TYPE] = [0, 0]   # <-- IMPORTANT: don't sample along cls_link
-            if args.no_contrastive:
-                num_neighbors[("node", str(subclass_rel), "node")] = [0, 0]
-            for et in fold_encoder_graph.edge_types:
-                if str(et[1]).endswith(CLS_EDGE_SUFFIX):
-                    num_neighbors[et] = [0, 0]
+            lr_to_fold_losses = defaultdict(list)
+            lr_to_fold_epochs = defaultdict(list)
+            lr_to_fold_metrics = defaultdict(list)
 
-            train_loader = LinkNeighborLoader(fold_encoder_graph, num_neighbors=num_neighbors,
-                edge_label_index=(CLS_EDGE_TYPE, train_edge_label_index), edge_label=train_edge_label,
-                batch_size=args.batch_size, shuffle=True, num_workers=2, persistent_workers=True,
-                pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0)
+            for fold, (tr_sub, va_sub) in enumerate(split_indices, start=1):
+                train_idx_np = main_idx[tr_sub]
+                val_idx_np = main_idx[va_sub]
+                if rare_idx.size:
+                    train_idx_np = np.concatenate([train_idx_np, rare_idx], axis=0)
 
-            val_loader = LinkNeighborLoader(fold_encoder_graph, num_neighbors=num_neighbors,
-                edge_label_index=(CLS_EDGE_TYPE, val_edge_label_index), edge_label=val_edge_label,
-                batch_size=args.batch_size, shuffle=False, num_workers=2, persistent_workers=True,
-                pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0,)
-
-
-            print(f"\n=== CV Split {fold}/{k_folds} ===")
-            print(f"  Train cls examples: {train_idx.numel()} | Val cls examples: {val_idx.numel()}")
-
-            base_model_kwargs = dict(
-                in_dim=in_dim,
-                hidden_dim=mcfg["hidden_dim"],
-                out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
-                # e_etypes=list(encoder_graph.edge_types),
-                e_etypes=encoder_e_etypes,
-                n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
-            )
-            if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat", "nbfnet"):
-                model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
-            else:
-                model_fold = ModelCls(**base_model_kwargs).to(device)
-
-            sampler_graph = fold_encoder_graph
-            if not args.no_contrastive:
-                if use_typed_sampler:
-                    neg_stmt_sampler = TypedInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                    neg_stmt_sampler.prepare_global(sampler_graph)
-                elif use_random_sampler:
-                    neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                    neg_stmt_sampler.prepare_global(sampler_graph)
-                elif use_partial_sampler:
-                    edges_are_negative = nflag
-                    neg_stmt_sampler = PartialInstanceSampler(
-                        k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                train_idx = torch.tensor(train_idx_np, dtype=torch.long)
+                val_idx = torch.tensor(val_idx_np, dtype=torch.long)
+                val_idx, val_guard_stats = _drop_val_examples_seen_in_train(
+                    heads=cls_heads,
+                    rels=cls_rels,
+                    tails=cls_tails,
+                    labels=cls_labels,
+                    train_idx=train_idx,
+                    val_idx=val_idx,
+                )
+                if val_idx.numel() == 0:
+                    raise RuntimeError(
+                        f"Fold {fold}: validation set became empty after removing examples also present in train."
                     )
-                    neg_stmt_sampler.prepare_global(sampler_graph)
+                paired_train_idx, pair_stats = _build_hr_paired_train_indices(
+                    heads=cls_heads,
+                    rels=cls_rels,
+                    labels=cls_labels,
+                    candidate_idx=train_idx,
+                    seed=42 + int(combo_idx) * 1000 + int(fold),
+                )
+                if paired_train_idx.numel() == 0:
+                    raise RuntimeError(
+                        f"Fold {fold}: no (head,relation)-matched pos/neg pairs could be built "
+                        "for training supervision."
+                    )
+                cv_fold_splits.append({
+                    "fold": int(fold),
+                    "combo_index": int(combo_idx),
+                    "contrastive_weight": float(combo_weight),
+                    "contrastive_temperature": float(combo_temp),
+                    "train_idx": train_idx.detach().cpu().long(),
+                    "train_idx_paired_hr": paired_train_idx.detach().cpu().long(),
+                    "val_idx": val_idx.detach().cpu().long(),
+                    "train_heads": cls_heads[train_idx].detach().cpu().long(),
+                    "train_rels": cls_rels[train_idx].detach().cpu().long(),
+                    "train_tails": cls_tails[train_idx].detach().cpu().long(),
+                    "train_labels": cls_labels[train_idx].detach().cpu().float(),
+                    "val_heads": cls_heads[val_idx].detach().cpu().long(),
+                    "val_rels": cls_rels[val_idx].detach().cpu().long(),
+                    "val_tails": cls_tails[val_idx].detach().cpu().long(),
+                    "val_labels": cls_labels[val_idx].detach().cpu().float(),
+                })
+
+                train_edge_label_index = torch.stack([cls_heads[paired_train_idx], cls_tails[paired_train_idx]], dim=0)
+                train_edge_label = cls_labels[paired_train_idx].to(torch.float)
+                val_edge_label_index = torch.stack([cls_heads[val_idx], cls_tails[val_idx]], dim=0)
+                val_edge_label = cls_labels[val_idx].to(torch.float)
+
+                fold_encoder_graph = _with_cls_edges(
+                    encoder_graph,
+                    cls_heads[train_idx],
+                    cls_tails[train_idx],
+                )
+                n_cls_pos_fold, n_cls_neg_fold = _add_cls_edges_for_sampler(
+                    fold_encoder_graph,
+                    heads=cls_heads[train_idx],
+                    tails=cls_tails[train_idx],
+                    rels=cls_rels[train_idx],
+                    labels=cls_labels[train_idx],
+                    id2rel=id2rel,
+                )
+                if fold == 1:
+                    print(
+                        f"\n[INFO] Fold {fold} encoder got TRAIN cls edges: "
+                        f"pos={n_cls_pos_fold} neg={n_cls_neg_fold}"
+                    )
+                print(f"[INFO] Fold {fold} encoder summary after adding TRAIN cls edges:")
+                print_final_train_encoder_statement_counts(
+                    encoder_graph=fold_encoder_graph,
+                    subclass_rel=subclass_rel,
+                    neg_prefix=NEG_PREFIX,
+                )
+
+                fold_mp_edge_types = _message_passing_edge_types(
+                    fold_encoder_graph,
+                    subclass_rel=str(subclass_rel),
+                    drop_subclass=drop_subclass_mp_when_no_contrastive,
+                    cls_edge_suffix=CLS_EDGE_SUFFIX,
+                )
+                # Include train classification edges in message passing for this fold.
+                num_neighbors = {et: [12, 8] for et in fold_encoder_graph.edge_types}
+                num_neighbors[CLS_EDGE_TYPE] = [0, 0]
+                for et in fold_encoder_graph.edge_types:
+                    if str(et[1]).endswith(CLS_EDGE_SUFFIX):
+                        num_neighbors[et] = [0, 0]
+                if drop_subclass_mp_when_no_contrastive:
+                    num_neighbors[("node", str(subclass_rel), "node")] = [0, 0]
+
+                train_loader = LinkNeighborLoader(
+                    fold_encoder_graph, num_neighbors=num_neighbors,
+                    edge_label_index=(CLS_EDGE_TYPE, train_edge_label_index), edge_label=train_edge_label,
+                    batch_size=args.batch_size, shuffle=True, num_workers=2, persistent_workers=True,
+                    pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0
+                )
+                val_loader = LinkNeighborLoader(
+                    fold_encoder_graph, num_neighbors=num_neighbors,
+                    edge_label_index=(CLS_EDGE_TYPE, val_edge_label_index), edge_label=val_edge_label,
+                    batch_size=args.batch_size, shuffle=False, num_workers=2, persistent_workers=True,
+                    pin_memory=(device.type == "cuda"), neg_sampling_ratio=0.0,
+                )
+
+                print(f"\n=== CV Split {fold}/{k_folds} ===")
+                print(f"  Train cls examples: {train_idx.numel()} | Val cls examples: {val_idx.numel()}")
+                if val_guard_stats["val_removed_seen_in_train"] > 0:
+                    print(
+                        "  [LeakGuard] Removed val examples that exactly matched train examples: "
+                        f"{val_guard_stats['val_removed_seen_in_train']} "
+                        f"(before={val_guard_stats['val_before']}, after={val_guard_stats['val_after']})"
+                    )
+                print(
+                    "  Paired train supervision: "
+                    f"raw_pos={pair_stats['raw_pos']} raw_neg={pair_stats['raw_neg']} "
+                    f"-> paired_pos={pair_stats['paired_pos']} paired_neg={pair_stats['paired_neg']} "
+                    f"(dropped_pos_no_hr_neg={pair_stats['dropped_pos_no_hr_neg']})"
+                )
+
+                base_model_kwargs = dict(
+                    in_dim=in_dim,
+                    hidden_dim=mcfg["hidden_dim"],
+                    out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
+                    e_etypes=fold_mp_edge_types,
+                    n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
+                )
+                if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gae", "gat", "sgat", "nbfnet"):
+                    model_fold = ModelCls(**base_model_kwargs, rel2id=rel2id).to(device)
                 else:
-                    SamplerCls = NegativeInstanceSampler_NEWER if args.alt_contrastive_sampler else NegativeInstanceSampler_NEW
-                    neg_stmt_sampler = SamplerCls(
-                        k=contrastive_k,
-                        subclass_rel=subclass_rel,
-                        neg_prefix=NEG_PREFIX,
-                        instance_rel=instance_rel,
-                        cache_dir="data/cache",
-                        cache_key=f"{args.path}|{args.output_dir}|fold{fold}|clsedge=1",
+                    model_fold = ModelCls(**base_model_kwargs).to(device)
+
+                sampler_graph = fold_encoder_graph
+                if not args.no_contrastive:
+                    sampler_graph = _with_cls_edges(
+                        contrastive_encoder_graph, cls_heads[train_idx], cls_tails[train_idx]
                     )
-                    neg_stmt_sampler.prepare_global(sampler_graph)
-                if (args.print_sampler_stats or args.use_retrieved) and not sampler_stats_printed:
-                    if hasattr(neg_stmt_sampler, "print_pool_stats"):
-                        neg_stmt_sampler.print_pool_stats(prefix="[NegSamplerStats]")
-                        sampler_stats_printed = True
-            else:
-                neg_stmt_sampler = None
+                    _add_cls_edges_for_sampler(
+                        sampler_graph,
+                        heads=cls_heads[train_idx],
+                        tails=cls_tails[train_idx],
+                        rels=cls_rels[train_idx],
+                        labels=cls_labels[train_idx],
+                        id2rel=id2rel,
+                    )
+                    if args.use_retrieved:
+                        print(f"[INFO] Fold {fold} sampler uses contrastive graph (full subclass + retrieved edges).")
+                    else:
+                        print(f"[INFO] Fold {fold} sampler uses contrastive graph (full subclass edges).")
 
-            log_fold = Logger(f"train_cv_split{fold}", dir=args.output_dir)
-            trainer_fold = Train(
-                model=model_fold,
-                graph=fold_encoder_graph,
-                heads=cls_heads,
-                rel_ids=cls_rels,
-                tails=cls_tails,
-                labels=cls_labels,
-                lr_candidates=lr_candidates,
-                epochs=args.epochs,
-                device=device,
-                log=log_fold,
-                batch_size=args.batch_size,
-                val_ratio=0.0,
-                early_stopping_patience=cfg.get("patience", 15),
-                train_idx=train_idx,
-                val_idx=val_idx,
-                contrastive_sampler=neg_stmt_sampler,
-                contrastive_weight=contrastive_weight,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                no_contrastive=args.no_contrastive,
-            )
+                if not args.no_contrastive:
+                    if use_typed_sampler:
+                        neg_stmt_sampler = TypedInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    elif use_random_sampler:
+                        neg_stmt_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    elif use_partial_sampler:
+                        edges_are_negative = nflag
+                        neg_stmt_sampler = PartialInstanceSampler(
+                            k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
+                        )
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    else:
+                        SamplerCls = NegativeInstanceSampler_NEWER if args.alt_contrastive_sampler else NegativeInstanceSampler_NEW
+                        neg_stmt_sampler = SamplerCls(
+                            k=contrastive_k,
+                            subclass_rel=subclass_rel,
+                            neg_prefix=NEG_PREFIX,
+                            instance_rel=instance_rel,
+                            max_contrastive_anchors=int(args.max_contrastive_anchors),
+                            cache_dir="data/cache",
+                            cache_key=(
+                                f"{args.path}|{combo_tag}|fold{fold}|clsedge=1|"
+                                f"retrieved_contrastive={int(args.use_retrieved and not args.no_contrastive)}|"
+                                f"sampler={SamplerCls.__name__}"
+                            ),
+                        )
+                        neg_stmt_sampler.prepare_global(sampler_graph)
+                    if (args.print_sampler_stats or args.use_retrieved) and not sampler_stats_printed:
+                        if hasattr(neg_stmt_sampler, "print_pool_stats"):
+                            neg_stmt_sampler.print_pool_stats(prefix="[NegSamplerStats]")
+                            sampler_stats_printed = True
+                else:
+                    neg_stmt_sampler = None
 
-            # best_val_loss, best_epoch, best_metrics, best_lr = trainer_fold.run()
-            # best_epochs.append(int(best_epoch if best_epoch is not None else args.epochs))
-            # best_lrs.append(float(best_lr if best_lr is not None else lr_candidates[0]))
-            # if best_metrics is not None:
-            #     cv_metrics.append(best_metrics)
-            best_val_loss, best_epoch, best_metrics, best_lr, per_lr = trainer_fold.run()
+                log_name = f"train_cv_split{fold}" if len(cv_contrastive_combos) == 1 else f"train_cv_split{fold}_{combo_tag}"
+                log_fold = Logger(log_name, dir=args.output_dir)
+                trainer_fold = Train(
+                    model=model_fold,
+                    graph=fold_encoder_graph,
+                    heads=cls_heads,
+                    rel_ids=cls_rels,
+                    tails=cls_tails,
+                    labels=cls_labels,
+                    lr_candidates=lr_candidates,
+                    epochs=args.epochs,
+                    device=device,
+                    log=log_fold,
+                    batch_size=args.batch_size,
+                    val_ratio=0.0,
+                    early_stopping_patience=cfg.get("patience", 15),
+                    train_idx=paired_train_idx,
+                    val_idx=val_idx,
+                    contrastive_sampler=neg_stmt_sampler,
+                    contrastive_weight=combo_weight,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    no_contrastive=args.no_contrastive,
+                    val_lp_eval_every=int(args.val_lp_eval_every),
+                    contrastive_temperature=combo_temp,
+                )
+
+                best_val_loss, best_epoch, best_metrics, best_lr, per_lr = trainer_fold.run()
+                for lr in lr_candidates:
+                    lr = float(lr)
+                    rec = per_lr.get(lr, None)
+                    if rec is None:
+                        continue
+                    loss = float(rec["best_val_loss"])
+                    ep = int(rec["best_epoch"])
+                    row = {
+                        "fold": int(fold),
+                        "combo_index": int(combo_idx),
+                        "contrastive_weight": float(combo_weight),
+                        "contrastive_temperature": float(combo_temp),
+                        "lr": lr,
+                        "best_epoch": ep,
+                        "best_val_loss": loss,
+                        "is_best_lr_for_fold": int(best_lr is not None and float(best_lr) == lr),
+                    }
+                    metrics_for_lr = rec.get("best_metrics", None)
+                    if metrics_for_lr is not None:
+                        for metric_name, metric_value in metrics_for_lr.items():
+                            row[f"best_{metric_name.replace('@', 'at')}"] = float(metric_value)
+                    cv_summary_rows.append(row)
+
+                    if loss != float("inf"):
+                        lr_to_fold_losses[lr].append(loss)
+                    if ep > 0:
+                        lr_to_fold_epochs[lr].append(ep)
+                    if rec.get("best_metrics", None) is not None:
+                        lr_to_fold_metrics[lr].append(rec["best_metrics"])
+                if best_metrics is not None:
+                    cv_metrics.append(best_metrics)
+
+            lr_summary = []
             for lr in lr_candidates:
                 lr = float(lr)
-                rec = per_lr.get(lr, None)
-                if rec is None: continue
-                loss = float(rec["best_val_loss"])
-                ep = int(rec["best_epoch"])
+                losses = lr_to_fold_losses.get(lr, [])
+                if not losses:
+                    continue
+                mean_loss = statistics.mean(losses)
+                std_loss = statistics.pstdev(losses) if len(losses) > 1 else 0.0
+                n = len(losses)
+                lr_summary.append((mean_loss, std_loss, n, lr))
 
-                if loss != float("inf"): lr_to_fold_losses[lr].append(loss)
-                if ep > 0: lr_to_fold_epochs[lr].append(ep)
-                if rec.get("best_metrics", None) is not None: lr_to_fold_metrics[lr].append(rec["best_metrics"])
-            if best_metrics is not None:
-                cv_metrics.append(best_metrics)
+            if not lr_summary:
+                combo_final_lr = float(lr_candidates[0])
+                combo_final_epochs = int(args.epochs)
+                combo_best_mean = float("inf")
+                combo_best_std = float("inf")
+            else:
+                lr_summary.sort(key=lambda x: (x[0], x[1], x[3]))
+                combo_best_mean, combo_best_std, combo_best_n, combo_final_lr = lr_summary[0]
+                epochs_for_lr = lr_to_fold_epochs.get(combo_final_lr, [])
+                combo_final_epochs = int(statistics.median(epochs_for_lr)) if epochs_for_lr else int(args.epochs)
 
+            print(
+                f"\n[CV Combo Summary] weight={combo_weight:.6g}, temp={combo_temp:.6g} | "
+                f"chosen_lr={combo_final_lr:.6g}, chosen_epochs={combo_final_epochs}"
+            )
+            for mean_loss, std_loss, n, lr in sorted(lr_summary, key=lambda x: (x[0], x[1], x[3])):
+                print(f"  lr={lr:.3g} | mean={mean_loss:.6f} | std={std_loss:.6f} | folds={n}")
 
-        # final_epochs = int(statistics.median(best_epochs)) if best_epochs else int(args.epochs)
-        # final_lr = float(statistics.mode(best_lrs)) if best_lrs else float(lr_candidates[0])
+            cv_combo_summary_rows.append(
+                {
+                    "combo_index": int(combo_idx),
+                    "contrastive_weight": float(combo_weight),
+                    "contrastive_temperature": float(combo_temp),
+                    "chosen_lr": float(combo_final_lr),
+                    "chosen_epochs": int(combo_final_epochs),
+                    "best_mean_val_loss": float(combo_best_mean),
+                    "best_std_val_loss": float(combo_best_std),
+                }
+            )
+            for mean_loss, std_loss, n, lr in sorted(lr_summary, key=lambda x: (x[0], x[1], x[3])):
+                cv_combo_lr_summary_rows.append(
+                    {
+                        "combo_index": int(combo_idx),
+                        "contrastive_weight": float(combo_weight),
+                        "contrastive_temperature": float(combo_temp),
+                        "lr": float(lr),
+                        "mean_val_loss": float(mean_loss),
+                        "std_val_loss": float(std_loss),
+                        "folds": int(n),
+                        "chosen_for_combo": int(float(lr) == float(combo_final_lr)),
+                    }
+                )
 
-        # print("\n=== Cross-validation summary (TRAIN split only) ===")
-        # print(f"Per-split best epochs: {best_epochs}")
-        # print(f"Per-split best learning rates: {best_lrs}")
-        # print(f"Chosen final_epochs (median): {final_epochs}")
-        # print(f"Chosen final_lr (mode):       {final_lr}")
+            combo_key = (float(combo_best_mean), float(combo_best_std), float(combo_weight), float(combo_temp))
+            if combo_best_key is None or combo_key < combo_best_key:
+                combo_best_key = combo_key
+                final_lr = float(combo_final_lr)
+                final_epochs = int(combo_final_epochs)
+                selected_contrastive_weight = float(combo_weight)
+                selected_contrastive_temperature = float(combo_temp)
+                selected_lr_summary_rows = [
+                    {
+                        "lr": float(lr),
+                        "mean_val_loss": float(mean_loss),
+                        "std_val_loss": float(std_loss),
+                        "folds": int(n),
+                        "chosen_final_lr": int(float(lr) == float(combo_final_lr)),
+                    }
+                    for mean_loss, std_loss, n, lr in sorted(lr_summary, key=lambda x: (x[0], x[1], x[3]))
+                ]
 
-        lr_summary = []
-        for lr in lr_candidates:
-            lr = float(lr)
-            losses = lr_to_fold_losses.get(lr, [])
-            if not losses: continue
-            mean_loss = statistics.mean(losses)
-            std_loss = statistics.pstdev(losses) if len(losses) > 1 else 0.0
-            n = len(losses)
-            lr_summary.append((mean_loss, std_loss, n, lr))
-        if not lr_summary:
-            final_lr = float(lr_candidates[0])
-            final_epochs = int(args.epochs)
-        else:
-            lr_summary.sort(key=lambda x: (x[0], x[1], x[3]))
-            best_mean, best_std, best_n, final_lr = lr_summary[0]
-            epochs_for_lr = lr_to_fold_epochs.get(final_lr, [])
-            final_epochs = int(statistics.median(epochs_for_lr)) if epochs_for_lr else int(args.epochs)
         print("\n=== Cross-validation summary (TRAIN split only) ===")
-        print("LR aggregates (mean_val_loss ± std over folds):")
-        for mean_loss, std_loss, n, lr in sorted(lr_summary, key=lambda x: (x[0], x[1], x[3])):
-            print(f"  lr={lr:.3g} | mean={mean_loss:.6f} | std={std_loss:.6f} | folds={n}")
-        print(f"\nChosen final_lr (best mean over folds): {final_lr:.6g}")
-        print(f"Epochs for chosen LR across folds:      {lr_to_fold_epochs.get(final_lr, [])}")
-        print(f"Chosen final_epochs (median for LR):    {final_epochs}")
+        if not args.no_contrastive:
+            print(
+                f"Selected contrastive combo: weight={selected_contrastive_weight:.6g}, "
+                f"temperature={selected_contrastive_temperature:.6g}"
+            )
+        print(f"Chosen final_lr: {final_lr:.6g}")
+        print(f"Chosen final_epochs: {final_epochs}")
+
+        torch.save(
+            {
+                "folds": cv_fold_splits,
+                "rel2id": rel2id,
+                "id2rel": id2rel,
+                "cv_val_ratio": val_ratio,
+                "chosen_final_lr": float(final_lr),
+                "chosen_final_epochs": int(final_epochs),
+                "chosen_contrastive_weight": float(selected_contrastive_weight),
+                "chosen_contrastive_temperature": float(selected_contrastive_temperature),
+            },
+            os.path.join(run_out_dir, "cv_fold_splits.pt"),
+        )
+        if cv_summary_rows:
+            pd.DataFrame(cv_summary_rows).to_csv(
+                os.path.join(run_out_dir, "cv_fold_summary.tsv"), sep="\t", index=False
+            )
+        if selected_lr_summary_rows:
+            pd.DataFrame(selected_lr_summary_rows).to_csv(
+                os.path.join(run_out_dir, "cv_lr_summary.tsv"), sep="\t", index=False
+            )
+        if cv_combo_summary_rows:
+            pd.DataFrame(cv_combo_summary_rows).to_csv(
+                os.path.join(run_out_dir, "cv_contrastive_combo_summary.tsv"), sep="\t", index=False
+            )
+        if cv_combo_lr_summary_rows:
+            pd.DataFrame(cv_combo_lr_summary_rows).to_csv(
+                os.path.join(run_out_dir, "cv_contrastive_lr_summary.tsv"), sep="\t", index=False
+            )
 
 
     # -----------------------------------------------------------------
@@ -2460,7 +3236,7 @@ def main():
             labels=cls_labels,
             id2rel=id2rel,
         )
-        print(f"\n[INFO] Final encoder got ALL TRAIN cls edges (sampler-only): "
+        print(f"\n[INFO] Final encoder got ALL TRAIN cls edges: "
               f"pos={n_cls_pos_all} neg={n_cls_neg_all}")
         print_final_train_encoder_statement_counts(
             encoder_graph=train_encoder_graph,
@@ -2468,16 +3244,63 @@ def main():
             neg_prefix=NEG_PREFIX,
         )
 
-        final_edge_label_index = torch.stack([cls_heads, cls_tails], dim=0)
-        final_edge_label = cls_labels.to(torch.float)
+        contrastive_train_graph = train_encoder_graph
+        if not args.no_contrastive:
+            contrastive_train_graph = _with_cls_edges(contrastive_encoder_graph, cls_heads, cls_tails)
+            _add_cls_edges_for_sampler(
+                contrastive_train_graph,
+                heads=cls_heads,
+                tails=cls_tails,
+                rels=cls_rels,
+                labels=cls_labels,
+                id2rel=id2rel,
+            )
+            if args.use_retrieved:
+                print("[INFO] Final contrastive sampler uses contrastive graph (full subclass + retrieved edges).")
+            else:
+                print("[INFO] Final contrastive sampler uses contrastive graph (full subclass edges).")
+
+        final_candidate_idx = torch.arange(cls_labels.numel(), dtype=torch.long)
+        final_paired_idx, final_pair_stats = _build_hr_paired_train_indices(
+            heads=cls_heads,
+            rels=cls_rels,
+            labels=cls_labels,
+            candidate_idx=final_candidate_idx,
+            seed=777,
+        )
+        if final_paired_idx.numel() == 0:
+            raise RuntimeError(
+                "Final training: no (head,relation)-matched pos/neg pairs could be built for supervision."
+            )
+        print(
+            "[Final Train] Paired supervision: "
+            f"raw_pos={final_pair_stats['raw_pos']} raw_neg={final_pair_stats['raw_neg']} "
+            f"-> paired_pos={final_pair_stats['paired_pos']} paired_neg={final_pair_stats['paired_neg']} "
+            f"(dropped_pos_no_hr_neg={final_pair_stats['dropped_pos_no_hr_neg']})"
+        )
+
+        final_heads_sup = cls_heads[final_paired_idx]
+        final_rels_sup = cls_rels[final_paired_idx]
+        final_tails_sup = cls_tails[final_paired_idx]
+        final_labels_sup = cls_labels[final_paired_idx]
+
+        final_edge_label_index = torch.stack([final_heads_sup, final_tails_sup], dim=0)
+        final_edge_label = final_labels_sup.to(torch.float)
         # num_neighbors = {et: neighbor_sizes for et in encoder_graph.edge_types}
-        num_neighbors = {et: neighbor_sizes for et in MP_EDGE_TYPES}
+        # Include train classification edges in message passing for final training.
+        final_mp_edge_types = _message_passing_edge_types(
+            train_encoder_graph,
+            subclass_rel=str(subclass_rel),
+            drop_subclass=drop_subclass_mp_when_no_contrastive,
+            cls_edge_suffix=CLS_EDGE_SUFFIX,
+        )
+        num_neighbors = {et: neighbor_sizes for et in train_encoder_graph.edge_types}
         num_neighbors[CLS_EDGE_TYPE] = [0, 0]
-        if args.no_contrastive:
-            num_neighbors[("node", str(subclass_rel), "node")] = [0, 0]
         for et in train_encoder_graph.edge_types:
             if str(et[1]).endswith(CLS_EDGE_SUFFIX):
                 num_neighbors[et] = [0, 0]
+        if drop_subclass_mp_when_no_contrastive:
+            num_neighbors[("node", str(subclass_rel), "node")] = [0, 0]
         
         final_loader = LinkNeighborLoader(train_encoder_graph, num_neighbors=num_neighbors,
             edge_label_index=(CLS_EDGE_TYPE, final_edge_label_index),neg_sampling_ratio=0.0,
@@ -2500,10 +3323,10 @@ def main():
             in_dim=in_dim,
             hidden_dim=mcfg["hidden_dim"],
             out_dim=mcfg.get("out_dim", mcfg["hidden_dim"]),
-            e_etypes=encoder_e_etypes,
+            e_etypes=final_mp_edge_types,
             n_type=(mcfg.get("n_type", "node") if isinstance(mcfg, dict) else "node"),
         )
-        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gat", "gae", "nbfnet"):
+        if args.model in ("ra_hgcn", "ra_rgcn", "sra_hgcn", "ra_hgat", "gcn", "gat", "gae", "sgat", "nbfnet"):
             final_model = ModelCls(**final_base_kwargs, rel2id=rel2id).to(device)
         else:
             final_model = ModelCls(**final_base_kwargs).to(device)
@@ -2513,23 +3336,29 @@ def main():
         if not args.no_contrastive:
             if use_typed_sampler:
                 final_contrastive_sampler = TypedInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                final_contrastive_sampler.prepare_global(train_encoder_graph)
+                final_contrastive_sampler.prepare_global(contrastive_train_graph)
             elif use_random_sampler:
                 final_contrastive_sampler = RandomInstanceSampler(k=contrastive_k, external_negs=external_edges)
-                final_contrastive_sampler.prepare_global(train_encoder_graph)
+                final_contrastive_sampler.prepare_global(contrastive_train_graph)
             elif use_partial_sampler:
                 edges_are_negative = nflag
                 final_contrastive_sampler = PartialInstanceSampler(
                     k=contrastive_k, neg_edges=external_edges, edges_are_negative=edges_are_negative
                 )
-                final_contrastive_sampler.prepare_global(train_encoder_graph)
+                final_contrastive_sampler.prepare_global(contrastive_train_graph)
             else:
                 SamplerCls = NegativeInstanceSampler_NEWER if args.alt_contrastive_sampler else NegativeInstanceSampler_NEW
                 final_contrastive_sampler = SamplerCls(
                     k=contrastive_k, subclass_rel=subclass_rel, neg_prefix=NEG_PREFIX, instance_rel=instance_rel,
-                    cache_dir="data/cache", cache_key=f"{args.path}|{args.output_dir}|final|clsedge=1"
+                    max_contrastive_anchors=int(args.max_contrastive_anchors),
+                    cache_dir="data/cache",
+                    cache_key=(
+                        f"{args.path}|final|clsedge=1|"
+                        f"retrieved_contrastive={int(args.use_retrieved and not args.no_contrastive)}|"
+                        f"sampler={SamplerCls.__name__}"
+                    )
                 )
-                final_contrastive_sampler.prepare_global(train_encoder_graph)
+                final_contrastive_sampler.prepare_global(contrastive_train_graph)
             if (args.print_sampler_stats or args.use_retrieved) and not sampler_stats_printed:
                 if hasattr(final_contrastive_sampler, "print_pool_stats"):
                     final_contrastive_sampler.print_pool_stats(prefix="[NegSamplerStats]")
@@ -2540,29 +3369,52 @@ def main():
         if args.finaltrain_only:
             final_lr = float(args.final_lr)
             final_epochs = int(args.final_epochs)
+            selected_contrastive_weight = float(contrastive_weight)
+            selected_contrastive_temperature = float(contrastive_temperature)
+
+        if not args.no_contrastive:
+            print(
+                f"[Final Train] Using contrastive weight={selected_contrastive_weight:.6g}, "
+                f"temperature={selected_contrastive_temperature:.6g}"
+            )
 
         final_trainer = Train_BestModel(
             final_model,
             graph=train_encoder_graph,
-            heads=cls_heads,
-            rel_ids=cls_rels,
-            tails=cls_tails,
-            labels=cls_labels,
+            heads=final_heads_sup,
+            rel_ids=final_rels_sup,
+            tails=final_tails_sup,
+            labels=final_labels_sup,
             lr=float(final_lr),
             epochs=int(final_epochs),
             device=device,
             log=final_log,
             batch_size=args.batch_size,
             contrastive_sampler=final_contrastive_sampler,
-            contrastive_weight=contrastive_weight,
+            contrastive_weight=selected_contrastive_weight,
             loader=final_loader,
             no_contrastive=args.no_contrastive,
+            contrastive_temperature=selected_contrastive_temperature,
         )
         final_loss = final_trainer.run()
         print(f"[Final Train] Loss after {final_epochs} epochs (lr={final_lr:.3g}): {final_loss:.4f}")
+        pd.DataFrame([{
+            "model": args.model,
+            "final_lr": float(final_lr),
+            "final_epochs": int(final_epochs),
+            "final_train_bce_loss": float(final_loss),
+        }]).to_csv(os.path.join(run_out_dir, "final_train_summary.tsv"), sep="\t", index=False)
     test_log = Logger("test_global", dir=args.output_dir)
 
     train_encoder_graph = _with_cls_edges(encoder_graph, cls_heads, cls_tails)
+    _add_cls_edges_for_sampler(
+        train_encoder_graph,
+        heads=cls_heads,
+        tails=cls_tails,
+        rels=cls_rels,
+        labels=cls_labels,
+        id2rel=id2rel,
+    )
 
     import gc
     gc.collect()
@@ -2591,44 +3443,55 @@ def main():
     test_rels = test_rels_all[test_pos_mask]
     test_tails = test_tails_all[test_pos_mask]
 
-    test_neg_mask = (test_labels_all <= 0.5)
-    neg_heads_all = test_heads_all[test_neg_mask]
-    neg_rels_all = test_rels_all[test_neg_mask]
-    neg_tails_all = test_tails_all[test_neg_mask]
+    # Build filtered-LP "known true" positives from the authoritative source
+    # (train2id_pos) instead of reconstructed leftovers.
+    known_h_parts = [test_heads]
+    known_r_parts = [test_rels]
+    known_t_parts = [test_tails]
 
-    neg_samplers: Dict[str, FileNegativeSampler] = {}
-    if neg_rels_all.numel() > 0:
-        for rid in torch.unique(neg_rels_all).detach().cpu().long().tolist():
-            rid = int(rid)
-            m = (neg_rels_all == rid)
-            rel_name = id2rel.get(rid, str(rid))
-            neg_samplers[rel_name] = FileNegativeSampler(
-                neg_heads=neg_heads_all[m],
-                neg_tails=neg_tails_all[m],
-                num_nodes=num_nodes,
-                seed=int(args.balanced_seed) + 17 + rid,
-                device=torch.device("cpu"))
+    train_pos_path = os.path.join(args.path, "train2id_pos.txt")
+    df_train_pos_all = _read_edge_file(train_pos_path)
+    df_train_pos_all["rel_base"] = df_train_pos_all["edge_type"].astype(str)
+    df_train_pos_cls = df_train_pos_all[df_train_pos_all["rel_base"].isin(set(rel2id.keys()))].copy()
+    if len(df_train_pos_cls) > 0:
+        tr_h = torch.tensor(df_train_pos_cls["source_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+        tr_t = torch.tensor(df_train_pos_cls["target_node"].to_numpy(dtype=np.int64), dtype=torch.long)
+        tr_r = torch.tensor(df_train_pos_cls["rel_base"].map(rel2id).to_numpy(dtype=np.int64), dtype=torch.long)
+        known_h_parts.append(tr_h)
+        known_r_parts.append(tr_r)
+        known_t_parts.append(tr_t)
 
-    else:
-        print("[WARN] No TEST negatives found; Test_BestModel may not be able to evaluate properly.")
+    known_h = torch.cat(known_h_parts, dim=0).detach().cpu().long()
+    known_r = torch.cat(known_r_parts, dim=0).detach().cpu().long()
+    known_t = torch.cat(known_t_parts, dim=0).detach().cpu().long()
 
-    cache_path = os.path.join("data/neg_cache", f"test_negs_{args.task}_numneg{args.num_neg_test}.pt")
-    print("neg cache abs path:", os.path.abspath(cache_path))
+    known_true_tails: Dict[Tuple[int, int], Set[int]] = defaultdict(set)
+    known_true_heads: Dict[Tuple[int, int], Set[int]] = defaultdict(set)
+    for h, r, t in zip(known_h.tolist(), known_r.tolist(), known_t.tolist()):
+        h_i = int(h)
+        r_i = int(r)
+        t_i = int(t)
+        known_true_tails[(h_i, r_i)].add(t_i)
+        known_true_heads[(t_i, r_i)].add(h_i)
 
-    tester = Test_BestModel(
+    tester = LinkPredictionEvaluator(
         model=final_model,
         graph=train_encoder_graph,
         test_heads=test_heads,
         test_rels=test_rels,
         test_tails=test_tails,
+        known_true_tails=dict(known_true_tails),
+        known_true_heads=dict(known_true_heads),
         id2rel=id2rel,
-        neg_samplers=neg_samplers,
-        num_neg_per_pos=args.num_neg_test,
         device=device,
         log=test_log,
         batch_size=args.batch_size,
-        neg_cache_path=cache_path,
         save_embeddings_path=os.path.join("output", args.output_dir, "embeddings.pt"),
+        rankings_save_path=os.path.join(out_dir, "test_lp_rankings.pt"),
+        rankings_tsv_path=os.path.join(out_dir, "test_lp_rankings.tsv"),
+        metrics_save_path=os.path.join(out_dir, "test_lp_metrics.pt"),
+        metrics_tsv_path=os.path.join(out_dir, "test_lp_metrics.tsv"),
+        predictions_save_path=os.path.join(out_dir, "test_predictions.pt"),
     )
     tester.run()
 

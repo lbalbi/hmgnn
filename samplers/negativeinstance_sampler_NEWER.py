@@ -16,7 +16,7 @@ class NegativeInstanceSampler_NEWER:
     def __init__(self, k: int = 2, subclass_rel: str = "subclass_of",
         neg_prefix: str = "NOT_", instance_rel: str = "2", neg_expansion_hops: int = 3,
         max_pool_size: int = 100, cache_dir: Optional[str] = None,
-        cache_key: Optional[str] = None):
+        cache_key: Optional[str] = None, max_contrastive_anchors: int = 0):
         self.k = int(k)
         self.subclass_rel = subclass_rel
         self.neg_prefix = neg_prefix
@@ -61,6 +61,7 @@ class NegativeInstanceSampler_NEWER:
         self.cls_edge_suffix = "__cls"
         self._dbg_ctr = 0
         self._dbg_every = 20
+        self.max_contrastive_anchors = int(max(0, int(max_contrastive_anchors)))
 
     def print_pool_stats(self, prefix: str = "[NegativeInstanceSampler_NEWER]") -> None:
         if not self.anchors:
@@ -726,6 +727,9 @@ class NegativeInstanceSampler_NEWER:
                 anchor_globals_cpu = torch.tensor(self.anchors_valid or self.anchors, dtype=torch.long)
             else: anchor_globals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
             anchor_globals_cpu = anchor_globals_cpu[(anchor_globals_cpu >= 0) & (anchor_globals_cpu < self.num_nodes)]
+            if self.max_contrastive_anchors > 0 and anchor_globals_cpu.numel() > self.max_contrastive_anchors:
+                perm = torch.randperm(anchor_globals_cpu.numel())[: self.max_contrastive_anchors]
+                anchor_globals_cpu = anchor_globals_cpu[perm]
             t_select = time.time() - t_select
 
             anchors_cpu: List[int] = []
@@ -813,6 +817,9 @@ class NegativeInstanceSampler_NEWER:
             anchor_locals_cpu = torch.unique(anchor_nodes.detach().long().cpu())
             # safety filter
             anchor_locals_cpu = anchor_locals_cpu[(anchor_locals_cpu >= 0) & (anchor_locals_cpu < n_id_cpu.numel())]
+            if self.max_contrastive_anchors > 0 and anchor_locals_cpu.numel() > self.max_contrastive_anchors:
+                perm = torch.randperm(anchor_locals_cpu.numel())[: self.max_contrastive_anchors]
+                anchor_locals_cpu = anchor_locals_cpu[perm]
             anchor_globals_cpu = n_id_cpu[anchor_locals_cpu]
         t_select = time.time() - t_select
 

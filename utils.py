@@ -17,7 +17,7 @@ class Logger:
         ensure_dir(self.dir)
         self.log_file = f"{name}.log"
         if not self.non_verbose:
-            self.file = open(self.dir + self.log_file, 'a')
+            self.file = open(self.dir + self.log_file, 'w')
             self.file.write(f"Results for {name}\n")
             self.file.write("=" * 50 + "\n")
             self.file.close()
@@ -41,7 +41,7 @@ class EarlyStopping:
         mode (str): 'min' to stop when metric stops decreasing, 'max' for increasing.
         delta (float): minimum change in the monitored metric to qualify as an improvement.
     """
-    def __init__(self, patience: int = 15, mode: str = 'min', delta: float = 0.0):
+    def __init__(self, patience: int = 5, mode: str = 'min', delta: float = 0.0):
         self.patience = patience
         self.mode = mode
         self.delta = delta

@@ -8,6 +8,34 @@ RESULT_TSV_PATH = "experiment_results.tsv"
 N_RUNS = 10  # number of runs
 FINAL_TEST_FILENAMES = ["final_test.log", "test_global.log"]
 
+CLASSIFICATION_METRIC_KEYS = [
+    "accuracy",
+    "f1 score",
+    "precision (pos)",
+    "recall (pos)",
+    "precision (neg)",
+    "recall (neg)",
+    "roc auc",
+]
+
+LP_METRIC_KEYS = [
+    "mr",
+    "mrr",
+    "hits@1",
+    "hits@3",
+    "hits@10",
+    "head_mr",
+    "head_mrr",
+    "head_hits@1",
+    "head_hits@3",
+    "head_hits@10",
+    "tail_mr",
+    "tail_mrr",
+    "tail_hits@1",
+    "tail_hits@3",
+    "tail_hits@10",
+]
+
 
 def find_final_test_file(run_dir: str) -> str | None:
     """Return the path to the first known test log present in run_dir."""
@@ -18,7 +46,7 @@ def find_final_test_file(run_dir: str) -> str | None:
     return None
 
 
-def _parse_metrics_from_final_test_style(text: str, file_path: str) -> list[float]:
+def _parse_metrics_from_final_test_style(text: str, file_path: str) -> tuple[str, list[str], list[float]]:
     """Parse the comma-separated 'Test, final,...' line format."""
     last_test_final_line = None
     for line in text.splitlines():
@@ -40,10 +68,10 @@ def _parse_metrics_from_final_test_style(text: str, file_path: str) -> list[floa
 
     if len(metrics) != 7:
         raise ValueError(f"Expected 7 metrics in {file_path}, got {len(metrics)}")
-    return metrics
+    return "classification", CLASSIFICATION_METRIC_KEYS, metrics
 
 
-def _parse_metrics_from_test_global_style(text: str, file_path: str) -> list[float]:
+def _parse_metrics_from_test_global_style(text: str, file_path: str) -> tuple[str, list[str], list[float]]:
     """Parse key:value metric logs like test_global.log."""
     # Example lines:
     # accuracy: 0.4268
@@ -63,23 +91,21 @@ def _parse_metrics_from_test_global_style(text: str, file_path: str) -> list[flo
         val = float(m.group(2))
         metrics_map[key] = val  # keep last occurrence if repeated
 
-    required_keys = [
-        "accuracy",
-        "f1 score",
-        "precision (pos)",
-        "recall (pos)",
-        "precision (neg)",
-        "recall (neg)",
-        "roc auc",
-    ]
+    if "mrr" in metrics_map and "hits@10" in metrics_map:
+        required_keys = LP_METRIC_KEYS
+        metric_set = "link_prediction"
+    else:
+        required_keys = CLASSIFICATION_METRIC_KEYS
+        metric_set = "classification"
+
     missing = [k for k in required_keys if k not in metrics_map]
     if missing:
         raise ValueError(f"Missing metrics in {file_path}: {', '.join(missing)}")
 
-    return [metrics_map[k] for k in required_keys]
+    return metric_set, required_keys, [metrics_map[k] for k in required_keys]
 
 
-def parse_metrics_from_final_test(file_path: str) -> list[float]:
+def parse_metrics_from_final_test(file_path: str) -> tuple[str, list[str], list[float]]:
     """Parse either final_test.log style or test_global.log style logs."""
     with open(file_path, "r", encoding="utf-8") as f:
         text = f.read()
@@ -124,14 +150,11 @@ def compute_mean_and_std(metrics_per_run: list[list[float]]) -> tuple[list[float
 def ensure_tsv_header(path: str) -> None:
     header = [
         "Experiment",
-        "Heuristic",
-        "Accuracy",
-        "F1 Score (W)",
-        "Precision (+)",
-        "Recall (+)",
-        "Precision (-)",
-        "Recall (-)",
-        "Roc Auc",
+        "Metric Set",
+        "Metric",
+        "Mean",
+        "Std. Dev",
+        "Runs",
     ]
 
     if (not os.path.exists(path)) or os.path.getsize(path) == 0:
@@ -140,17 +163,26 @@ def ensure_tsv_header(path: str) -> None:
             writer.writerow(header)
 
 
-def append_experiment_stats_to_tsv(experiment_name: str, means: list[float], stds: list[float], tsv_path: str) -> None:
+def append_experiment_stats_to_tsv(
+    experiment_name: str,
+    metric_set: str,
+    metric_names: list[str],
+    means: list[float],
+    stds: list[float],
+    n_runs: int,
+    tsv_path: str,
+) -> None:
     ensure_tsv_header(tsv_path)
 
     fmt = lambda x: f"{x:.6f}"
-    mean_row = [experiment_name, "mean"] + [fmt(v) for v in means]
-    std_row = [experiment_name, "std. dev"] + [fmt(v) for v in stds]
+    rows = [
+        [experiment_name, metric_set, metric_name, fmt(mean), fmt(std), str(n_runs)]
+        for metric_name, mean, std in zip(metric_names, means, stds)
+    ]
 
     with open(tsv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter="\t")
-        writer.writerow(mean_row)
-        writer.writerow(std_row)
+        writer.writerows(rows)
 
 
 def process_all_experiments(base_output_dir: str = BASE_OUTPUT_DIR, result_tsv_path: str = RESULT_TSV_PATH) -> None:
@@ -173,6 +205,8 @@ def process_all_experiments(base_output_dir: str = BASE_OUTPUT_DIR, result_tsv_p
                 f"(expected {N_RUNS}). Using available runs."
             )
 
+        metric_set: str | None = None
+        metric_names: list[str] | None = None
         metrics_per_run: list[list[float]] = []
         for run_dir in run_dirs:
             test_file = find_final_test_file(run_dir)
@@ -181,7 +215,16 @@ def process_all_experiments(base_output_dir: str = BASE_OUTPUT_DIR, result_tsv_p
                 continue
 
             try:
-                metrics = parse_metrics_from_final_test(test_file)
+                parsed_metric_set, parsed_metric_names, metrics = parse_metrics_from_final_test(test_file)
+                if metric_set is None:
+                    metric_set = parsed_metric_set
+                    metric_names = parsed_metric_names
+                elif metric_set != parsed_metric_set or metric_names != parsed_metric_names:
+                    raise ValueError(
+                        f"Mixed metric schemas for experiment '{experiment_name}': "
+                        f"expected {metric_set}/{metric_names}, got "
+                        f"{parsed_metric_set}/{parsed_metric_names}"
+                    )
                 metrics_per_run.append(metrics)
             except Exception as e:
                 print(f"[ERROR] Failed to parse '{test_file}': {e}")
@@ -195,7 +238,15 @@ def process_all_experiments(base_output_dir: str = BASE_OUTPUT_DIR, result_tsv_p
             continue
 
         means, stds = compute_mean_and_std(metrics_per_run)
-        append_experiment_stats_to_tsv(experiment_name, means, stds, result_tsv_path)
+        append_experiment_stats_to_tsv(
+            experiment_name,
+            metric_set or "unknown",
+            metric_names or [],
+            means,
+            stds,
+            len(metrics_per_run),
+            result_tsv_path,
+        )
         print(f"[INFO] Processed experiment '{experiment_name}' with {len(metrics_per_run)} runs.")
 
 

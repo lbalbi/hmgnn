@@ -21,8 +21,8 @@ python3 -u main_NEW.py \
   --print_sampler_stats \
   --task "wikidata" \
   --model "ra_rgcn" \
-  --batch_size 8258 \
-  --cv_val_ratio 0.0013 \
+  --batch_size 12264 \
+  --cv_val_ratio 0.002 \
   --val_lp_eval_every 5 \
   --no_contrastive \
   --output_dir "LP/output_LP_RGCN_NEW_${RUN_TAG}/" \
